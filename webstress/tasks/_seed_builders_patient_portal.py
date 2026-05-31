@@ -2862,6 +2862,13 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     near_appeal_deadline = params.get("near_appeal_deadline", False)
     approved_no_eob_count = params.get("approved_no_eob_count", 0)
     approved_zero_resp_count = params.get("approved_zero_resp_count", 0)
+    # Optional: denied claims that look like appeal candidates but are NOT
+    # eligible (deadline already passed, or no EOB issued). These are decoys
+    # that force the agent to apply the full eligibility filter
+    # (status==denied AND eob_available AND appeal_deadline >= now) rather
+    # than acting on every denied claim. Backward-compatible: defaults to 0.
+    expired_denied_count = params.get("expired_denied_count", 0)
+    no_eob_denied_count = params.get("no_eob_denied_count", 0)
 
     if "claims" not in ctx.base:
         ctx.base["claims"] = []
@@ -3029,6 +3036,23 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         if is_near:
             appealable_claim_id = claim["id"]
 
+    # Ineligible denied claims (decoys): denied but NOT appealable.
+    # Past-deadline claims use a negative appeal_days so appeal_deadline < now;
+    # no-EOB claims carry eob_available=False. Both still count as denied
+    # (added to denied_claim_ids) so they exercise the eligibility filter and
+    # the invariant that forbids touching out-of-scope denied claims.
+    ineligible_denied_ids: list[str] = []
+    for _ in range(expired_denied_count):
+        claim = _make_claim("denied", -ctx.rng.randint(10, 60), eob=with_eob)
+        ctx.base["claims"].append(claim)
+        denied_claim_ids.append(claim["id"])
+        ineligible_denied_ids.append(claim["id"])
+    for _ in range(no_eob_denied_count):
+        claim = _make_claim("denied", ctx.rng.randint(30, 60), eob=False)
+        ctx.base["claims"].append(claim)
+        denied_claim_ids.append(claim["id"])
+        ineligible_denied_ids.append(claim["id"])
+
     # Processing claims
     for _ in range(processing_count):
         claim = _make_claim("processing", ctx.rng.randint(60, 120))
@@ -3162,6 +3186,21 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # membership computed above for top_k_payable_claim_ids).
     payable_approved_claim_ids = sorted(payable_ids)
 
+    # Derived: the N most-RECENT appealable denied claims, ordered by
+    # service_date descending (most recent first), claim-id descending as the
+    # tiebreaker so the newest id wins on a service-date tie. Distinct from
+    # top_3_appealable_claim_ids (which orders by patient responsibility): this
+    # is the recency-based set used by the dispute-claim task. Computed in the
+    # builder so the canonical_diff bijection can target a scalar list without
+    # pushing date/sort math into the where/filter scope.
+    recent_appealable_n = params.get("recent_appealable_n", 2)
+    recent_appealable_sorted = sorted(
+        appealable_ids,
+        key=lambda cid: (_claim_by_id(cid)["service_date"], cid),
+        reverse=True,
+    )
+    recent_appealable_claim_ids = recent_appealable_sorted[:recent_appealable_n]
+
     return {
         "approved_claim_ids": approved_claim_ids,
         "denied_claim_ids": denied_claim_ids,
@@ -3177,6 +3216,9 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         "top_k_payable_claim_ids": top_k_payable_claim_ids,
         "payable_cutoff_amount": payable_cutoff_amount,
         "payable_approved_claim_ids": payable_approved_claim_ids,
+        "recent_appealable_claim_ids": recent_appealable_claim_ids,
+        "appealable_claim_ids": appealable_ids_sorted,
+        "ineligible_denied_ids": ineligible_denied_ids,
         "total_patient_responsibility": str(total_patient_responsibility),
     }
 

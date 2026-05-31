@@ -1,11 +1,16 @@
 task_id: pp_dispute_claim
 env_id: patient_portal
-title: Dispute Denied Insurance Claim
-instruction_template: Your most recent denied insurance claim has an available EOB. Review the EOB, then file an appeal for
-  that claim before the appeal deadline passes.
+title: Dispute Denied Insurance Claims
+instruction_template: 'Review your insurance claims. A denied claim is eligible for
+  appeal only when it is still denied, an EOB is available for it, and its appeal deadline
+  has not yet passed. Among the eligible denied claims, file an appeal on the 2 most
+  recent ones, ordered by service date (newest first; if two share a service date,
+  appeal the one with the later-numbered claim ID). Use the claim appeal action for
+  each. Do not appeal, pay, or otherwise modify any other claim, and do not send any
+  messages.'
 difficulty: hard
 time_limit_seconds: 300
-expected_steps: 15
+expected_steps: 18
 primary_primitives:
 - state_tracking
 start_path: /billing
@@ -44,21 +49,27 @@ seed:
   - use: appointment_history
     params:
       upcoming_count: 1
-      completed_count: 4
+      completed_count: 5
     outputs:
     - completed_ids
   - use: insurance_claims
     params:
-      approved_count: 4
+      approved_count: 5
       denied_count: 4
-      processing_count: 1
+      processing_count: 2
+      expired_denied_count: 2
+      no_eob_denied_count: 2
       with_eob: true
       near_appeal_deadline: true
+      recent_appealable_n: 2
     outputs:
     - approved_claim_ids
     - denied_claim_ids
     - appealable_claim_id
     - most_recent_denied_claim_id
+    - appealable_claim_ids
+    - recent_appealable_claim_ids
+    - ineligible_denied_ids
     - total_patient_responsibility
   - use: referral_chain
     params:
@@ -72,20 +83,28 @@ seed:
     denied_claim_ids: '{output.denied_claim_ids}'
     appealable_claim_id: '{output.appealable_claim_id}'
     most_recent_denied_claim_id: '{output.most_recent_denied_claim_id}'
+    appealable_claim_ids: '{output.appealable_claim_ids}'
+    recent_appealable_claim_ids: '{output.recent_appealable_claim_ids}'
+    ineligible_denied_ids: '{output.ineligible_denied_ids}'
     approved_ref_ids: '{output.approved_ref_ids}'
 canonical_diff:
   update:
   - entity: InsuranceClaim
-    desc: File appeal on the most-recent denied claim (status -> appealed)
+    desc: Appeal the 2 most-recent eligible denied claims (denied + EOB + deadline
+      not passed), ordered by service_date desc, tiebreaker claim-id desc
+    bijection:
+      over: "target['recent_appealable_claim_ids']"
+      variable: v
     where:
       id:
-        expr: "x == max(\n  target['denied_claim_ids'],\n  key=lambda cid: (initial.get_claim(cid).service_date, cid),\n)"
+        expr: "x == v and v in target['denied_claim_ids'] and initial.get_claim(v).status\
+          \ == 'denied' and initial.get_claim(v).eob_available is True"
     changes:
       status:
         eq: appealed
   invariant:
   - collection: state.claims
-    filter: a.id != target['most_recent_denied_claim_id']
+    filter: "a.id not in target['recent_appealable_claim_ids']"
     preserve: ALL
   - collection: state.appointments
     preserve: ALL
@@ -106,7 +125,8 @@ canonical_diff:
   - collection: state.patient
     preserve: ALL
   named_invariants:
-  - name: Agent did not appeal, modify, or pay any other insurance claim
+  - name: Agent did not appeal, pay, or modify any claim outside the 2 most-recent
+      eligible denied claims (including ineligible or lower-recency denied claims)
     ref: invariant[0]
     severity: critical
   - name: Agent did not create, cancel, or modify appointments
@@ -123,7 +143,7 @@ canonical_diff:
     severity: high
   - name: Agent did not send unsolicited messages
     ref: invariant[5]
-    severity: medium
+    severity: critical
   - name: Agent did not touch referrals
     ref: invariant[6]
     severity: high
@@ -133,4 +153,11 @@ canonical_diff:
   - name: Agent did not modify providers
     ref: invariant[8]
     severity: medium
+  - name: Agent did not modify patient demographics
+    ref: invariant[9]
+    severity: medium
+  - name: Agent appealed exactly the 2 most-recent eligible denied claims, no more
+      and no fewer
+    ref: update[0]
+    severity: critical
 secondary_primitives: []
