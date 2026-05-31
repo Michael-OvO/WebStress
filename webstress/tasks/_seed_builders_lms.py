@@ -2858,11 +2858,19 @@ def _build_discussion_forums(ctx: LMSSeedContext, params: dict[str, Any]) -> dic
     count : int                  -- number of discussions (default 2)
     posts_per : int              -- classmate posts per discussion (default 3)
     include_student_post : bool  -- add a student post + instructor reply in target discussion (default False)
+    target_min_posts : int       -- min_posts on the TARGET discussion (default 1)
+    target_min_replies : int     -- min_replies on the TARGET discussion (default 1)
+    min_posts : int              -- min_posts on non-target discussions (default 1)
+    min_replies : int            -- min_replies on non-target discussions (default 1)
     """
     course_id = params.get("course_id", "")
     count = params.get("count", 2)
     posts_per = params.get("posts_per", 3)
     include_student_post = params.get("include_student_post", False)
+    target_min_posts = int(params.get("target_min_posts", 1))
+    target_min_replies = int(params.get("target_min_replies", 1))
+    other_min_posts = int(params.get("min_posts", 1))
+    other_min_replies = int(params.get("min_replies", 1))
 
     if not course_id:
         courses = ctx.base.get("courses", [])
@@ -2877,6 +2885,10 @@ def _build_discussion_forums(ctx: LMSSeedContext, params: dict[str, Any]) -> dic
     discussion_ids: list[str] = []
     target_discussion_id: str | None = None
     target_discussion_title: str = ""
+    # Top-level classmate post IDs in the TARGET discussion, in creation order.
+    # These are the only posts the student can reply to, so reply-distinctness
+    # tasks precompute their eligible parent set from here.
+    target_top_level_post_ids: list[str] = []
 
     for d in range(count):
         disc_id = ctx.next_id("discussion")
@@ -2886,14 +2898,21 @@ def _build_discussion_forums(ctx: LMSSeedContext, params: dict[str, Any]) -> dic
         due_offset = ctx.rng.randint(3, 14)
         disc_title = f"Discussion {d + 1}: {ctx.rng.choice(_TOPICS)}"
 
+        # Discussion 0 is the target; it carries the (possibly higher) target
+        # minimums. Sibling discussions keep the generic minimums so the agent
+        # must read the target's own requirements rather than assume a default.
+        is_target = d == 0
+        disc_min_posts = target_min_posts if is_target else other_min_posts
+        disc_min_replies = target_min_replies if is_target else other_min_replies
+
         discussion = Discussion(
             id=disc_id,
             course_id=course_id,
             title=disc_title,
             prompt=prompt,
             due_at=ctx.now + timedelta(days=due_offset),
-            min_posts=1,
-            min_replies=1,
+            min_posts=disc_min_posts,
+            min_replies=disc_min_replies,
             points_possible=Decimal("10"),
             weight_category="participation",
         )
@@ -2916,6 +2935,8 @@ def _build_discussion_forums(ctx: LMSSeedContext, params: dict[str, Any]) -> dic
                 timestamp=ctx.now - timedelta(hours=ctx.rng.randint(1, 72)),
             )
             ctx.base["discussion_posts"].append(post.model_dump())
+            if is_target:
+                target_top_level_post_ids.append(post_id)
 
             # Add a reply to the first post sometimes
             if p == 0 and posts_per > 1:
@@ -2975,6 +2996,17 @@ def _build_discussion_forums(ctx: LMSSeedContext, params: dict[str, Any]) -> dic
         "target_discussion_id": target_discussion_id or "",
         "target_discussion_title": target_discussion_title,
         "target_course_code": target_course_code,
+        # Required participation minimums on the TARGET discussion (serialized
+        # as strings so they can be coerced inside expr predicates).
+        "target_min_posts": str(target_min_posts),
+        "target_min_replies": str(target_min_replies),
+        # The first `target_min_replies` top-level classmate posts in the target
+        # discussion. Reply-distinctness tasks bind one reply to each of these so
+        # the agent must reply to DISTINCT parents, not the same post twice.
+        "reply_parent_post_ids": ",".join(target_top_level_post_ids[:target_min_replies]),
+        # Full set of top-level classmate posts in the target discussion (handy
+        # for tasks that need the complete reply-eligible set).
+        "target_top_level_post_ids": ",".join(target_top_level_post_ids),
     }
 
 
