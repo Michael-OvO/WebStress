@@ -1,14 +1,19 @@
 task_id: pp_message_pcp
 env_id: patient_portal
-title: Schedule PCP Medication Review
-instruction_template: Review your medication list, then schedule exactly one follow-up appointment with your primary care
-  physician using the next available PCP slot. Use the appointment reason exactly "Medication side effect review". Do not
-  send any messages.
-difficulty: easy
-time_limit_seconds: 120
-expected_steps: 5
+title: Schedule and Confirm PCP Medication Review
+instruction_template: Review your medication list, then schedule exactly one follow-up appointment with your assigned primary
+  care physician (the PCP your patient profile is registered to, provider id {target.pcp_id}) at the earliest available slot
+  on that physician's own calendar. Use the appointment reason exactly "Medication side effect review". This clinic requires
+  a two-step booking workflow, so after scheduling you must also complete the confirmation step on that appointment. Do not
+  send any messages. Do not book with any other physician, and do not cancel, reschedule, modify, or confirm any appointment
+  that already exists on your calendar.
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 9
 primary_primitives:
 - backtracking
+secondary_primitives:
+- grounding
 start_path: /medications
 seed:
   distractors: 13
@@ -17,40 +22,60 @@ seed:
     params:
       conditions:
       - Hypertension
+      - Hyperlipidemia
       insurance_tier: standard
+      auto_confirm_specialties:
+      - pcp
     outputs:
     - pcp_id
     - pcp_name
   - use: provider_directory
     params:
-      count: 8
       specialties:
       - pcp
       - cardiology
       - dermatology
+      - endocrinology
+      - orthopedics
       - billing
+      count_per_specialty:
+        pcp: 2
       must_include:
       - pcp
     outputs:
     - provider_ids
   - use: pharmacy_list
     params:
-      count: 2
+      count: 3
     outputs:
     - default_pharmacy_id
   - use: prescription_cabinet
     params:
-      active_count: 3
+      active_count: 5
+      expired_count: 2
     outputs:
     - active_rx_ids
+  - use: appointment_history
+    params:
+      upcoming_count: 3
+      completed_count: 2
+      cancelled_count: 1
+      include_specialist: true
+    outputs:
+    - upcoming_ids
+    - pcp_apt_id
+    - next_appointment_id
   targets:
     pcp_id: '{output.pcp_id}'
     pcp_name: '{output.pcp_name}'
     active_rx_ids: '{output.active_rx_ids}'
+    pcp_apt_id: '{output.pcp_apt_id}'
+    existing_upcoming_apt_ids: '{output.upcoming_ids}'
 canonical_diff:
   create:
   - entity: Appointment
-    desc: Schedule one PCP appointment at the next available slot for medication side effect review
+    desc: Schedule and confirm one appointment with the assigned PCP at that PCP's earliest available slot for a medication
+      side effect review
     properties:
       status:
         eq: scheduled
@@ -60,6 +85,10 @@ canonical_diff:
         eq: Medication side effect review
       datetime:
         expr: "x == min(s.datetime for p in initial.providers\n         if p.id == target['pcp_id'] for s in p.available_slots)\n"
+      confirmation_state:
+        eq: confirmed
+      confirmed_at:
+        expr: x is not None
   invariant:
   - collection: state.messages
     preserve: ALL
@@ -76,6 +105,7 @@ canonical_diff:
   - collection: state.appointments
     filter: a.id in {x.id for x in initial.appointments}
     preserve: ALL
+    comprehensive: true
   - collection: state.pharmacies
     preserve: ALL
   - collection: state.providers
@@ -101,7 +131,6 @@ canonical_diff:
   - name: Agent did not touch referrals
     ref: invariant[5]
     severity: high
-  - name: Agent did not cancel or modify pre-existing appointments
+  - name: Agent did not cancel, reschedule, modify, or confirm any pre-existing appointment
     ref: invariant[6]
-    severity: high
-secondary_primitives: []
+    severity: critical
