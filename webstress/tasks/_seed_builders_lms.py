@@ -2598,7 +2598,15 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
         for c in courses
         if _weighted_score(c["id"]) != Decimal("0")
     }
-    if final_exam_assignment_id:
+    # Recompute grade_below_80 against the FINAL weighted score so the flag the
+    # oneof discriminator reads agrees with what the agent computes from the
+    # grades page (state.weighted_score_for_course). The earlier pass that set
+    # grade_below_80 ran before this final recompute and could be stale.
+    grade_below_80 = "false"
+    if target_cid:
+        _final_sc = current_weighted_scores.get(target_cid)
+        if _final_sc and Decimal(_final_sc) < Decimal("80"):
+            grade_below_80 = "true"
         minimum_final_score_for_b = _minimum_final_exam_score_for_b(final_exam_assignment_id)
         min_score_achievable = "true" if minimum_final_score_for_b else "false"
     if _hw_target_cid:
@@ -2941,6 +2949,12 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     count = params.get("count", 6)
     unread_count = params.get("unread_count", 2)
     urgent_count = params.get("urgent_count", 1)
+    # target_course_unread_min: guarantee at least this many unread announcements
+    # land in the catalog-level target course so course-scoped bijection tasks
+    # (e.g. "mark every unread announcement in your course as read") are non-vacuous.
+    # Defaults to 0 so existing tasks keep their round-robin behaviour unchanged.
+    target_course_unread_min = int(params.get("target_course_unread_min", 0))
+    _tc_target_cid = ctx.outputs.get("target_course_id", "")
 
     courses = ctx.base.get("courses", [])
     if "announcements" not in ctx.base:
@@ -2981,6 +2995,37 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     # ── latest_announcement_id: most recent UNREAD by posted_at (fallback to any) ──
     latest_announcement_id = ""
     all_announcements = ctx.base.get("announcements", [])
+
+    # ── Guarantee target-course unread coverage for course-scoped bijection tasks ──
+    # If the catalog target course has fewer than target_course_unread_min unread
+    # announcements, reassign read announcements belonging to the target course to
+    # unread (preferred), otherwise re-home other-course announcements onto the
+    # target course and mark them unread. This never changes the total announcement
+    # count, only course_id / is_read on a deterministic subset.
+    if target_course_unread_min > 0 and _tc_target_cid:
+        def _tc_unread() -> list[dict[str, Any]]:
+            return [
+                a for a in all_announcements
+                if a.get("course_id") == _tc_target_cid and not a.get("is_read", True)
+            ]
+        # First, flip read target-course announcements to unread.
+        for a in all_announcements:
+            if len(_tc_unread()) >= target_course_unread_min:
+                break
+            if a.get("course_id") == _tc_target_cid and a.get("is_read", True):
+                a["is_read"] = False
+                if a["id"] not in unread_ids:
+                    unread_ids.append(a["id"])
+        # Then, re-home other-course announcements onto the target course as unread.
+        for a in all_announcements:
+            if len(_tc_unread()) >= target_course_unread_min:
+                break
+            if a.get("course_id") != _tc_target_cid:
+                a["course_id"] = _tc_target_cid
+                a["is_read"] = False
+                if a["id"] not in unread_ids:
+                    unread_ids.append(a["id"])
+
     if all_announcements:
         sorted_ann = sorted(
             all_announcements,
@@ -3003,12 +3048,30 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         f"{cid}:{','.join(aids)}" for cid, aids in course_ann_map.items()
     )
 
+    # ── target_course_unread_announcement_ids: unread announcements in the
+    # catalog target course, ordered most-recent-first. Exposed as a scalar list
+    # so course-scoped "mark every unread announcement read" bijection tasks can
+    # bind it without computing the set inside an invariant filter. ──
+    target_course_unread_announcement_ids: list[str] = []
+    if _tc_target_cid:
+        _tc_unread_sorted = sorted(
+            [
+                a for a in all_announcements
+                if a.get("course_id") == _tc_target_cid and not a.get("is_read", True)
+            ],
+            key=lambda a: a["posted_at"] if isinstance(a["posted_at"], str)
+            else a["posted_at"].isoformat(),
+            reverse=True,
+        )
+        target_course_unread_announcement_ids = [a["id"] for a in _tc_unread_sorted]
+
     return {
         "announcement_ids": announcement_ids,
         "unread_announcement_ids": unread_ids,
         "urgent_announcement_id": urgent_announcement_id or "",
         "latest_announcement_id": latest_announcement_id,
         "course_announcement_ids": course_announcement_ids,
+        "target_course_unread_announcement_ids": ",".join(target_course_unread_announcement_ids),
     }
 
 
