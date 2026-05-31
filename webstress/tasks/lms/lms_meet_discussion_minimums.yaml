@@ -2,11 +2,14 @@ task_id: lms_meet_discussion_minimums
 env_id: lms
 title: Meet Discussion Post and Reply Minimums
 instruction_template: In the discussion "{target.discussion_title}" for {target.course_code},
-  meet the minimum participation requirements. Check the requirements first, then
-  post and reply until the minimums are met.
-difficulty: medium
-time_limit_seconds: 180
-expected_steps: 12
+  meet the minimum participation requirements. Open the discussion and read its stated
+  minimum number of top-level posts and minimum number of replies. Author exactly that
+  many new top-level posts, then post that many replies, with each reply attached to a
+  different existing classmate post. Do not edit any existing post, do not post in any
+  other discussion, and do not send any messages.
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 16
 primary_primitives:
 - patience
 start_path: /courses
@@ -19,7 +22,7 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 2
+      count: 3
     outputs:
     - course_ids
     - course_codes
@@ -29,22 +32,31 @@ seed:
     - enrollment_ids
   - use: discussion_forums
     params:
-      count: 3
-      posts_per: 4
+      count: 4
+      posts_per: 5
+      target_min_posts: 2
+      target_min_replies: 2
     outputs:
     - discussion_ids
     - target_discussion_id
     - target_discussion_title
     - target_course_code
+    - target_min_posts
+    - target_min_replies
+    - reply_parent_post_ids
+    - target_top_level_post_ids
   targets:
     discussion_title: '{output.target_discussion_title}'
     course_code: '{output.target_course_code}'
     target_discussion_id: '{output.target_discussion_id}'
+    target_min_posts: '{output.target_min_posts}'
+    target_min_replies: '{output.target_min_replies}'
+    reply_parent_post_ids: '{output.reply_parent_post_ids}'
+    target_top_level_post_ids: '{output.target_top_level_post_ids}'
 canonical_diff:
   create:
     - entity: DiscussionPost
-      desc: Create one top-level post in the target discussion
-      count: 1
+      desc: Create the first new top-level post in the target discussion
       properties:
         discussion_id:
           expr: "x == target['target_discussion_id']"
@@ -53,18 +65,18 @@ canonical_diff:
         author_name:
           expr: "x == state.student.name"
         body:
-          any: true
+          length:
+            expr: "x >= 1"
         parent_post_id:
           eq: null
         timestamp:
-          expr: "x >= datetime.fromisoformat(target['session_start'])"
+          expr: "x >= session_start"
         updated_at:
           eq: null
         is_anonymous:
           eq: false
     - entity: DiscussionPost
-      desc: Create one reply in the target discussion
-      count: 1
+      desc: Create the second new top-level post in the target discussion
       properties:
         discussion_id:
           expr: "x == target['target_discussion_id']"
@@ -73,11 +85,35 @@ canonical_diff:
         author_name:
           expr: "x == state.student.name"
         body:
-          any: true
+          length:
+            expr: "x >= 1"
         parent_post_id:
-          expr: "x is not None"
+          eq: null
         timestamp:
-          expr: "x >= datetime.fromisoformat(target['session_start'])"
+          expr: "x >= session_start"
+        updated_at:
+          eq: null
+        is_anonymous:
+          eq: false
+    - entity: DiscussionPost
+      desc: Create one reply attached to each distinct required classmate post
+      bijection:
+        over: "[pid.strip() for pid in target['reply_parent_post_ids'].split(',') if pid.strip()]"
+        variable: v
+      properties:
+        discussion_id:
+          expr: "x == target['target_discussion_id']"
+        author_id:
+          expr: "x == state.student.id"
+        author_name:
+          expr: "x == state.student.name"
+        body:
+          length:
+            expr: "x >= 1"
+        parent_post_id:
+          expr: "x == v"
+        timestamp:
+          expr: "x >= session_start"
         updated_at:
           eq: null
         is_anonymous:
@@ -124,10 +160,19 @@ canonical_diff:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
+  - desc: Agent did not edit any existing discussion post
+    expr: "all(p.updated_at is None for p in state.discussion_posts)"
+    severity: high
+  - desc: Student met exactly the stated post and reply minimums in the target discussion
+    expr: "len([p for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.parent_post_id is None]) == int(target['target_min_posts']) and len([p for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.parent_post_id is not None]) == int(target['target_min_replies'])"
+    severity: high
+  - desc: Each new reply attaches to a distinct existing classmate post
+    expr: "len({p.parent_post_id for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.parent_post_id is not None}) == int(target['target_min_replies'])"
+    severity: high
   named_invariants:
     - name: Agent did not post in non-target discussions
       ref: invariant[0]
-      severity: high
+      severity: critical
     - name: Agent did not modify discussions
       ref: invariant[1]
       severity: medium
