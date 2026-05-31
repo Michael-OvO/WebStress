@@ -2243,6 +2243,45 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     )
     top_3_appealable_claim_ids = appealable_ids_sorted[:3]
 
+    # Derived: the top-K APPROVED claims that are payable, ranked by
+    # patient_responsibility (highest first, claim-id tiebreaker ascending).
+    # "Payable" means status=='approved' AND eob_available AND
+    # patient_responsibility > 0. This is the approved-claim analogue of
+    # top_3_appealable_claim_ids and exists so a pay-claim task can drive a
+    # SATURATING bijection over the K highest-balance approved claims without
+    # pushing top-K / tie-break math into the where/filter scope (hazard: the
+    # invariant filter sees only `a` + `target`, the where sees only `id`).
+    # `payable_top_k` (default 3) controls K; the threshold below is exposed so
+    # an instruction can describe the boundary ("balance >= $X") without leaking
+    # the target ids.
+    payable_top_k = int(params.get("payable_top_k", 3))
+    payable_ids = [
+        cid for cid in approved_claim_ids
+        if (c := _claim_by_id(cid)) is not None
+        and c.get("eob_available")
+        and float(c.get("patient_responsibility", "0")) > 0
+    ]
+    payable_ids_sorted = sorted(
+        payable_ids,
+        key=lambda cid: (
+            -float(_claim_by_id(cid)["patient_responsibility"]),
+            cid,
+        ),
+    )
+    top_k_payable_claim_ids = payable_ids_sorted[:payable_top_k]
+    # The smallest patient_responsibility among the selected top-K (the
+    # inclusive cutoff). When fewer than K payable claims exist this is the
+    # smallest of all payable; when none exist it is "0". Stored as a string to
+    # match the Decimal-as-string convention used elsewhere.
+    if top_k_payable_claim_ids:
+        payable_cutoff = min(
+            float(_claim_by_id(cid)["patient_responsibility"])
+            for cid in top_k_payable_claim_ids
+        )
+    else:
+        payable_cutoff = 0.0
+    payable_cutoff_amount = str(round(payable_cutoff, 2))
+
     return {
         "approved_claim_ids": approved_claim_ids,
         "denied_claim_ids": denied_claim_ids,
@@ -2250,6 +2289,8 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         "appealable_claim_id": appealable_claim_id,
         "most_recent_denied_claim_id": most_recent_denied_claim_id,
         "top_3_appealable_claim_ids": top_3_appealable_claim_ids,
+        "top_k_payable_claim_ids": top_k_payable_claim_ids,
+        "payable_cutoff_amount": payable_cutoff_amount,
         "total_patient_responsibility": str(total_patient_responsibility),
     }
 
