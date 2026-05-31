@@ -741,13 +741,19 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
 
     Params: upcoming_count, completed_count, cancelled_count,
             include_specialist (bool), conflict_pair (bool),
+            conflict_clusters (list[int]) — sizes of independent groups of
+            same-datetime double/triple-booked appointments; within each
+            cluster booked_at is strictly increasing so the first is the
+            unique earliest-booked (keep) and the rest are later-booked
+            duplicates (cancel),
             target_specialty (str | None) — when set, the upcoming
             appointment for that specialty is exposed as `target_apt_id`
             (PP-5). When unset, `target_apt_id` falls back to
             `specialist_apt_id` (the first non-PCP upcoming).
     Outputs: upcoming_ids, completed_ids, cancelled_ids, next_appointment_id,
              conflict_apt_ids, pcp_apt_id, specialist_apt_id, telehealth_apt_id,
-             target_apt_id
+             target_apt_id, cluster_all_apt_ids, cluster_cancel_apt_ids,
+             cluster_keep_apt_ids
     """
     upcoming_count = params.get("upcoming_count", 2)
     completed_count = params.get("completed_count", 2)
@@ -951,6 +957,133 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
             conflict_apt_ids.append(apt_id)
             upcoming_ids.append(apt_id)
 
+    # --- Conflict clusters: multiple groups of double/triple-booked
+    # scheduled appointments. `conflict_clusters` is a list of integers, each
+    # the size of one cluster (number of appointments sharing one exact
+    # datetime). Within every cluster booked_at values are STRICTLY
+    # increasing, so the first appointment created is the unique
+    # earliest-booked (the one to KEEP) and every later one is a later-booked
+    # duplicate (to CANCEL). Distinct clusters land on distinct datetimes so
+    # they never cross-collide.
+    #
+    # This generalises the single `conflict_pair` flow (PP-CC). The two are
+    # independent: tasks may opt into either. `conflict_clusters` precomputes
+    # the per-cluster keep/cancel partition and exposes it as scalar target
+    # lists (`cluster_cancel_apt_ids` / `cluster_keep_apt_ids`) so a canonical
+    # diff can saturate a cancel bijection over the cancel set and freeze the
+    # keep set WITHOUT reconstructing the group-by-datetime + earliest-booked
+    # tie-break inside a predicate (rule-6 comprehension-scope hazard).
+    conflict_clusters: list[int] = [int(n) for n in (params.get("conflict_clusters") or [])]
+    cluster_all_apt_ids: list[str] = []
+    cluster_cancel_apt_ids: list[str] = []
+    cluster_keep_apt_ids: list[str] = []
+    if conflict_clusters and len(providers) >= 1:
+        # Spread clusters across distinct future days/hours. Day offsets are
+        # drawn from a disjoint band per cluster so two clusters cannot share a
+        # datetime even after the hour pick.
+        used_days: set[int] = set()
+        # A monotonically increasing booking clock so EVERY cluster appointment
+        # across the whole seed has a globally-unique booked_at and the
+        # earliest-per-cluster is unambiguous.
+        booking_cursor = ctx.now - timedelta(days=30)
+        for c_idx, size in enumerate(conflict_clusters):
+            size = max(2, int(size))
+            # Pick a distinct day offset for this cluster.
+            day_off = ctx.rng.randint(3, 21)
+            while day_off in used_days:
+                day_off = (day_off % 21) + 3
+            used_days.add(day_off)
+            cluster_hour = ctx.rng.choice([9, 11, 13, 14, 15])
+            # Cluster appointments sit on the half-hour (minute=30). Every
+            # other appointment generator in this builder lands on minute=0,
+            # so a cluster datetime can NEVER collide with a non-cluster
+            # upcoming/completed/cancelled appointment — the conflict groups
+            # the agent must resolve are exactly the cluster groups, with no
+            # accidental cross-contamination from distractor appointments.
+            cluster_dt = ctx.now.replace(
+                hour=cluster_hour, minute=30, second=0, microsecond=0
+            ) + timedelta(days=day_off)
+
+            cluster_ids_local: list[str] = []
+            for k in range(size):
+                # Advance the global booking clock by a random positive step so
+                # booked_at is strictly increasing within (and across) clusters.
+                booking_cursor = booking_cursor + timedelta(
+                    hours=ctx.rng.randint(6, 40)
+                )
+                apt_id = ctx.next_id("apt")
+                prov = providers[(c_idx + k) % len(providers)]
+                apt_dict = {
+                    "id": apt_id,
+                    "provider_id": prov["id"],
+                    "datetime": cluster_dt.isoformat(),
+                    "type": "in-person",
+                    "status": "scheduled",
+                    "reason": ctx.rng.choice(
+                        ["Follow-up", "Routine checkup", "Consultation"]
+                    ),
+                    "notes": "",
+                    "linked_referral_id": None,
+                    "booked_at": booking_cursor.isoformat(),
+                    "location": "Main Campus",
+                }
+                _link_matching_referral(apt_dict, prov)
+                ctx.base["appointments"].append(apt_dict)
+                upcoming_ids.append(apt_id)
+                cluster_all_apt_ids.append(apt_id)
+                cluster_ids_local.append(apt_id)
+            # First created == earliest booked == KEEP. Rest == CANCEL.
+            cluster_keep_apt_ids.append(cluster_ids_local[0])
+            cluster_cancel_apt_ids.extend(cluster_ids_local[1:])
+
+        # De-collision pass (PP-CC): when conflict_clusters is active the ONLY
+        # legitimate same-datetime groups are the clusters themselves. The
+        # generic upcoming generator picks random (day, hour) on minute=0, so
+        # two distractor upcoming appointments can coincidentally share a
+        # datetime and form a spurious conflict group the precomputed
+        # keep/cancel partition does not cover. Nudge any such non-cluster
+        # scheduled appointment forward in 1-day steps until its datetime is
+        # unique among all scheduled appointments. Cluster datetimes sit on
+        # minute=30 and are never touched, so this never breaks a real cluster.
+        cluster_id_set = set(cluster_all_apt_ids)
+        taken_dts: set[str] = set()
+        for a in ctx.base["appointments"]:
+            if a.get("status") == "scheduled":
+                taken_dts.add(a["datetime"])
+        for a in ctx.base["appointments"]:
+            if a.get("status") != "scheduled" or a["id"] in cluster_id_set:
+                continue
+            # Count how many scheduled appointments share this datetime.
+            same = [
+                o for o in ctx.base["appointments"]
+                if o.get("status") == "scheduled" and o["datetime"] == a["datetime"]
+            ]
+            if len(same) <= 1:
+                continue
+            # Shift THIS appointment to the next free datetime (keep minute=0
+            # so it never lands inside a cluster's minute=30 slot).
+            dt = datetime.fromisoformat(a["datetime"])
+            for _ in range(60):
+                dt = dt + timedelta(days=1)
+                candidate = dt.isoformat()
+                if candidate not in taken_dts:
+                    taken_dts.discard(a["datetime"])
+                    a["datetime"] = candidate
+                    taken_dts.add(candidate)
+                    break
+
+    # Back-compat: when `conflict_clusters` is used WITHOUT the legacy
+    # `conflict_pair`, expose the first cluster's ids as `conflict_apt_ids`
+    # so existing tasks/variants that read `{output.conflict_apt_ids}` and
+    # `{output.conflict_apt_ids.1}` still resolve to real conflicting
+    # appointments (slot 0 = earliest-booked keep, slot 1 = a later-booked
+    # cancel). Does not affect callers that already pass `conflict_pair`.
+    if not conflict_pair and conflict_clusters and len(cluster_all_apt_ids) >= 2:
+        # Rebuild the first cluster's id list (size of clusters[0]) from the
+        # ordered cluster_all_apt_ids prefix.
+        first_size = max(2, int(conflict_clusters[0]))
+        conflict_apt_ids = list(cluster_all_apt_ids[:first_size])
+
     # PP-5: when target_specialty is unset (or no matching provider was
     # found), fall back to specialist_apt_id so consumers can read a
     # uniform `target_apt_id` field regardless of the seed shape.
@@ -968,6 +1101,10 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         "specialist_apt_id": specialist_apt_id,
         "telehealth_apt_id": telehealth_apt_id,
         "target_apt_id": target_apt_id,
+        # PP-CC conflict-cluster outputs (empty unless `conflict_clusters` set).
+        "cluster_all_apt_ids": cluster_all_apt_ids,
+        "cluster_cancel_apt_ids": cluster_cancel_apt_ids,
+        "cluster_keep_apt_ids": cluster_keep_apt_ids,
     }
 
 
