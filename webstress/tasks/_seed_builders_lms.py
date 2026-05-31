@@ -2956,6 +2956,65 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
             named_pair_gap = str(_gap)
             named_pair_gap_above_3 = "true" if _gap > Decimal("3") else "false"
 
+    # ── GROUNDED discriminator + grounded lowest-dropped-homework ──
+    # The legacy drop_changes_letter / lowest_hw_id outputs above are computed
+    # against intermediate builder data with the LMS-8 raw-percentage method and
+    # DO NOT match the final persisted state the agent observes via
+    # GET /courses/{id}/grades (the engine applies the (1 - late_penalty) factor
+    # and re-derives drops). To make the verification honestly re-derivable,
+    # recompute the discriminator using the real LMSState engine
+    # (weighted_score_for_course) over the FINAL state, and apply the COARSE
+    # letter scale stated in the instruction (A>=90, B>=80, C>=70, D>=60, F<60).
+    # These new outputs are additive and are the only ones
+    # lms_drop_lowest_letter_change gates on.
+    from webstress.backend.models.lms import LMSState as _LMSState
+
+    def _coarse_letter(score: Decimal) -> str:
+        if score >= Decimal("90"):
+            return "A"
+        if score >= Decimal("80"):
+            return "B"
+        if score >= Decimal("70"):
+            return "C"
+        if score >= Decimal("60"):
+            return "D"
+        return "F"
+
+    drop_changes_letter_grounded = "false"
+    lowest_dropped_hw_id = ""
+    weighted_with_drops = ""
+    weighted_without_drops = ""
+    _gb_target_cid = ctx.outputs.get("target_course_id", "") or (courses[0]["id"] if courses else "")
+    if _gb_target_cid:
+        # Engine view of the FINAL state (matches what the agent reads).
+        _engine_state = _LMSState.model_validate(ctx.base)
+        _with = _engine_state.weighted_score_for_course(_gb_target_cid)
+        # Without drops: rebuild a second engine view and zero out drop_lowest
+        # on every category of the target course, then recompute.
+        _engine_no_drop = _LMSState.model_validate(ctx.base)
+        _c_no_drop = _engine_no_drop.get_course(_gb_target_cid)
+        if _c_no_drop is not None:
+            for _cat in _c_no_drop.syllabus.grading_policy.values():
+                _cat.drop_lowest = 0
+        _without = _engine_no_drop.weighted_score_for_course(_gb_target_cid)
+        if _with is not None:
+            weighted_with_drops = str(_with)
+        if _without is not None:
+            weighted_without_drops = str(_without)
+        if _with is not None and _without is not None:
+            if _coarse_letter(_with) != _coarse_letter(_without):
+                drop_changes_letter_grounded = "true"
+        # Grounded lowest dropped homework: the lowest-ratio homework grade the
+        # engine actually drops in the target course (re-derivable by the agent).
+        _dropped_hw = _engine_state.dropped_grades_for_category(_gb_target_cid, "homework")
+        if _dropped_hw:
+            _lowest_dropped = min(
+                _dropped_hw,
+                key=lambda g: (g.score / g.points_possible)
+                if g.points_possible else Decimal("0"),
+            )
+            lowest_dropped_hw_id = _lowest_dropped.assignment_id
+
     return {
         "grade_ids": grade_ids,
         "dropped_grade_ids": dropped_grade_ids,
@@ -2966,6 +3025,9 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
         "most_recent_graded_id": most_recent_graded_id,
         "most_impactful_graded_id": most_impactful_graded_id,
         "drop_changes_letter": drop_changes_letter,
+        "drop_changes_letter_grounded": drop_changes_letter_grounded,
+        "weighted_with_drops": weighted_with_drops,
+        "weighted_without_drops": weighted_without_drops,
         "drop_impact_above_3": drop_impact_above_3,
         "curve_changes_letter": curve_changes_letter,
         "min_score_achievable": min_score_achievable,
@@ -2983,6 +3045,7 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
         "named_pair_gap_above_3": named_pair_gap_above_3,
         "lowest_hw_id": lowest_hw_id,
         "lowest_homework_id": lowest_hw_id,  # alias for YAML outputs that use this key
+        "lowest_dropped_hw_id": lowest_dropped_hw_id,
         "grade_below_80": grade_below_80,
         "highest_weight_ungraded_id": highest_weight_ungraded_id,
         "worst_category_assignment_id": worst_category_assignment_id,
