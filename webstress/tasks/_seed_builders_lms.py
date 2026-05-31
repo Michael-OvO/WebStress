@@ -1576,8 +1576,72 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     if not target_essay_assignment_id and essay_ids:
         target_essay_assignment_id = essay_ids[0]
 
+    # ── highest_points_unsubmitted_id (+ rubric count, decoy) ──
+    # For lms_review_rubric_submit: the agent must NOT be told which assignment
+    # to submit. Instead it must enumerate the still-unsubmitted assignments in
+    # the target course, review each rubric, and pick the one worth the most
+    # points (the rubric with the highest point total). Tie-break: earliest
+    # due_at, then the title that comes first alphabetically (both are
+    # agent-observable on the assignments page). The rubric criteria count of
+    # that winner is encoded into the required file_name so the agent must
+    # actually open the rubric. A sibling decoy in a DIFFERENT course (also
+    # unsubmitted) is exposed so the task can freeze it as a critical invariant.
+    _rrs_target_cid = ctx.outputs.get("target_course_id", "") or target_course_id
+
+    def _id_num(aid: str) -> int:
+        try:
+            return int(str(aid).rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    def _due_dt(a: dict[str, Any]) -> datetime:
+        raw = a.get("due_at")
+        if isinstance(raw, str):
+            return datetime.fromisoformat(raw)
+        return raw  # type: ignore[return-value]
+
+    rrs_unsubmitted = [
+        a for a in all_assignments
+        if a["course_id"] == _rrs_target_cid
+        and a["submission_status"] == "not_submitted"
+    ]
+    highest_points_unsubmitted_id = ""
+    highest_points_rubric_count = 0
+    if rrs_unsubmitted:
+        rrs_winner = sorted(
+            rrs_unsubmitted,
+            key=lambda a: (
+                -Decimal(str(a["points_possible"])),
+                _due_dt(a),
+                str(a.get("title", "")),
+            ),
+        )[0]
+        highest_points_unsubmitted_id = rrs_winner["id"]
+        highest_points_rubric_count = len(rrs_winner.get("rubric", []) or [])
+
+    # Sibling decoy: an unsubmitted assignment in a DIFFERENT course than the
+    # winner (so escalating its invariant to critical punishes the agent that
+    # submits the wrong-course look-alike). Prefer one with the same or higher
+    # points so it is genuinely tempting.
+    rrs_decoy_id = ""
+    if highest_points_unsubmitted_id:
+        decoy_pool = [
+            a for a in all_assignments
+            if a["course_id"] != _rrs_target_cid
+            and a["submission_status"] == "not_submitted"
+            and a["id"] != highest_points_unsubmitted_id
+        ]
+        if decoy_pool:
+            rrs_decoy_id = sorted(
+                decoy_pool,
+                key=lambda a: (-Decimal(str(a["points_possible"])), _id_num(a["id"])),
+            )[0]["id"]
+
     return {
         "assignment_ids": all_assignment_ids,
+        "highest_points_unsubmitted_id": highest_points_unsubmitted_id,
+        "highest_points_rubric_count": str(highest_points_rubric_count),
+        "rubric_review_decoy_id": rrs_decoy_id,
         "missing_assignment_ids": missing_ids,
         "late_assignment_ids": late_ids,
         "late_within_grace_ids": late_within_grace_ids,

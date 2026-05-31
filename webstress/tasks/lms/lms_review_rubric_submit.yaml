@@ -1,12 +1,19 @@
 task_id: lms_review_rubric_submit
 env_id: lms
-title: Review Assignment Rubric Before Submitting
-instruction_template: Before submitting "{target.assignment_title}" for {target.course_code},
-  review the rubric criteria for the assignment. Then submit your work with the file
-  "{target.file_name}".
+title: Review Assignment Rubrics Before Submitting
+instruction_template: 'In {target.course_code}, open every assignment that you have
+  not submitted yet and review its rubric. Submit only the single unsubmitted assignment
+  whose rubric is worth the most total points. If two unsubmitted assignments are
+  tied on total points, submit the one with the earliest due date; if that is still
+  tied, submit the one whose title comes first alphabetically. Name the submission
+  file "rubric_review_N.pdf", where N is the number of rubric criteria listed on the
+  assignment you submit (an assignment showing three rubric criteria becomes
+  "rubric_review_3.pdf"). Submit nothing else: leave every other assignment, in
+  {target.course_code} and in all other courses, exactly as it is. Do not send any
+  messages.'
 difficulty: medium
 time_limit_seconds: 180
-expected_steps: 8
+expected_steps: 11
 primary_primitives:
 - planning
 start_path: /courses
@@ -19,9 +26,10 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 2
+      count: 3
       must_include:
       - CS101
+      - MATH201
     outputs:
     - course_ids
     - course_code
@@ -32,7 +40,7 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 5
+      per_course_count: 7
       graded_fraction: 0.3
       target_assignment_status: not_submitted
     outputs:
@@ -42,33 +50,39 @@ seed:
     - target_course_code
     - decoy_assignment_id
     - file_name
+    - highest_points_unsubmitted_id
+    - highest_points_rubric_count
+    - rubric_review_decoy_id
   targets:
     assignment_title: '{output.target_assignment_title}'
-    course_code: '{output.target_course_code}'
+    course_code: '{output.course_code}'
     target_assignment_id: '{output.target_assignment_id}'
     decoy_assignment_id: '{output.decoy_assignment_id}'
     file_name: '{output.file_name}'
+    highest_points_unsubmitted_id: '{output.highest_points_unsubmitted_id}'
+    highest_points_rubric_count: '{output.highest_points_rubric_count}'
+    rubric_review_decoy_id: '{output.rubric_review_decoy_id}'
 canonical_diff:
   update:
   - entity: Assignment
-    desc: Submit the assignment after reviewing the rubric
+    desc: Submit the highest-rubric-point unsubmitted assignment with the rubric-count-named file
     where:
       id:
-        expr: "x == target['target_assignment_id']"
+        expr: "x == target['highest_points_unsubmitted_id']"
     changes:
       submission_status:
         in:
         - submitted
         - late
       file_name:
-        expr: "x == target['file_name']"
+        expr: "x == 'rubric_review_' + str(target['highest_points_rubric_count']) + '.pdf'"
       attempt_count:
-        expr: "x >= 1"
+        expr: "x >= initial.get_assignment(target['highest_points_unsubmitted_id']).attempt_count + 1"
       submitted_at:
-        expr: "x >= session_start"
+        expr: "x is not None and x >= session_start"
   invariant:
   - collection: state.assignments
-    filter: "a.id != target['target_assignment_id']"
+    filter: "a.id != target['highest_points_unsubmitted_id']"
     preserve: ALL
   - collection: state.courses
     preserve: ALL
@@ -91,14 +105,17 @@ canonical_diff:
   - collection: state.sent_messages
     preserve: ALL
   constraints:
+  - desc: The tempting unsubmitted assignment in another course was left untouched
+    expr: "target['rubric_review_decoy_id'] == '' or (initial.get_assignment(target['rubric_review_decoy_id']) is not None and state.get_assignment(target['rubric_review_decoy_id']) is not None and state.get_assignment(target['rubric_review_decoy_id']).submission_status == initial.get_assignment(target['rubric_review_decoy_id']).submission_status and state.get_assignment(target['rubric_review_decoy_id']).attempt_count == initial.get_assignment(target['rubric_review_decoy_id']).attempt_count)"
+    severity: critical
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
   named_invariants:
-  - name: Agent submitted the target assignment
+  - name: Agent submitted the highest-rubric-point unsubmitted assignment with the correct file
     ref: update[0]
-    severity: high
-  - name: Agent did not modify other assignments
+    severity: critical
+  - name: Agent did not modify any other assignment
     ref: invariant[0]
     severity: high
   - name: Agent did not modify course records
