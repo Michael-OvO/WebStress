@@ -1,13 +1,15 @@
 task_id: lms_resubmit_flagged
 env_id: lms
-title: Submit Work for a Resubmit-Requested Assignment
-instruction_template: Find all assignments across your courses that have been flagged
-  for resubmission (status "resubmit_requested"). Read the feedback on each, then
-  resubmit with updated files. Use the naming convention "revision_v{attempt}.pdf"
-  for each resubmission.
-difficulty: hard
-time_limit_seconds: 240
-expected_steps: 14
+title: Submit Work for Every Resubmit-Requested Assignment
+instruction_template: Find every assignment across all four of your courses that the
+  instructor has flagged for resubmission (submission status "resubmit_requested").
+  Read the feedback on each one, then resubmit it with an updated file. Name each
+  resubmission "revision_v{attempt}.pdf", where {attempt} is that assignment's next
+  attempt number (one greater than its current attempt count). Do not resubmit any
+  assignment that is not flagged, and do not contact anyone.
+difficulty: expert
+time_limit_seconds: 360
+expected_steps: 28
 primary_primitives:
 - backtracking
 start_path: /courses
@@ -20,10 +22,12 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 3
+      count: 4
       must_include:
       - CS101
       - MATH201
+      - ENG102
+      - PHYS201
     outputs:
     - course_ids
     - course_codes
@@ -33,20 +37,23 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 6
+      per_course_count: 7
       graded_fraction: 0.5
-      resubmit_count: 2
+      resubmit_count: 4
+      vary_resubmit_attempts: true
     outputs:
     - assignment_ids
     - resubmit_assignment_ids
+    - resubmit_filenames
     - decoy_assignment_id
   targets:
     resubmit_assignment_ids: '{output.resubmit_assignment_ids}'
+    resubmit_filenames: '{output.resubmit_filenames}'
     decoy_assignment_id: '{output.decoy_assignment_id}'
 canonical_diff:
   update:
     - entity: Assignment
-      desc: Resubmit every flagged assignment with revision_v2.pdf
+      desc: Resubmit every flagged assignment with its per-assignment revision filename
       bijection:
         over: "target['resubmit_assignment_ids'].split(',') if target['resubmit_assignment_ids'] else []"
         variable: v
@@ -59,9 +66,9 @@ canonical_diff:
           - submitted
           - late
         file_name:
-          eq: revision_v2.pdf
+          expr: "x == 'revision_v' + str(initial.get_assignment(v).attempt_count + 1) + '.pdf'"
         attempt_count:
-          expr: "x >= 2"
+          expr: "x == initial.get_assignment(v).attempt_count + 1"
         submitted_at:
           expr: "x >= session_start"
   invariant:
@@ -89,25 +96,25 @@ canonical_diff:
     - collection: state.sent_messages
       preserve: ALL
   constraints:
-  - desc: Agent did not send messages
+  - desc: Agent did not contact anyone
     expr: "len(state.sent_messages) == 0"
-    severity: medium
+    severity: high
   named_invariants:
-    - name: Agent resubmitted every flagged assignment
+    - name: Agent resubmitted every flagged assignment with the correct filename
       ref: update[0]
-      severity: high
-    - name: Agent did not modify other assignments
+      severity: critical
+    - name: Agent did not modify any non-flagged assignment
       ref: invariant[0]
-      severity: high
+      severity: critical
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium
     - name: Agent did not drop or alter enrollments
       ref: invariant[2]
       severity: high
-    - name: Agent did not modify modules
+    - name: Agent did not complete or modify modules
       ref: invariant[3]
-      severity: medium
+      severity: high
     - name: Agent did not modify discussions
       ref: invariant[4]
       severity: medium
@@ -122,11 +129,11 @@ canonical_diff:
       severity: medium
     - name: Agent did not modify grades
       ref: invariant[8]
-      severity: high
+      severity: critical
     - name: Agent did not modify calendar events
       ref: invariant[9]
       severity: low
     - name: Agent did not send messages
       ref: invariant[10]
-      severity: medium
+      severity: high
 secondary_primitives: []
