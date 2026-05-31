@@ -566,6 +566,7 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     missing_count = params.get("missing_count", 1)
     unrecoverable_missing_count = params.get("unrecoverable_missing_count", 0)
     resubmit_count = params.get("resubmit_count", 0)
+    vary_resubmit_attempts = params.get("vary_resubmit_attempts", False)
     target_status = params.get("target_assignment_status", None)
     exclude_course_id = params.get("exclude_course_id", "")
     # When True, force EXACTLY ONE past-due not_submitted assignment to remain
@@ -917,6 +918,26 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         if target_idx > 0:
             target_id = resubmit_ids.pop(target_idx)
             resubmit_ids.insert(0, target_id)
+
+    # ── Vary initial attempt counts across resubmit_requested assignments ──
+    # When requested, give each flagged assignment a distinct prior-attempt
+    # count so the per-row resubmission filename "revision_v{attempt}.pdf"
+    # (attempt == prior attempt_count + 1) differs across assignments and the
+    # agent must re-derive it per assignment rather than reuse one literal.
+    # max_attempts is bumped so that attempt_count < max_attempts still holds
+    # and the resubmit endpoint (guard: attempt_count < max_attempts) accepts.
+    if vary_resubmit_attempts and resubmit_ids:
+        _attempt_cycle = [1, 2, 3, 2]
+        for _pos, _rid in enumerate(resubmit_ids):
+            _new_attempt = _attempt_cycle[_pos % len(_attempt_cycle)]
+            for a in all_assignments:
+                if a["id"] != _rid:
+                    continue
+                a["attempt_count"] = _new_attempt
+                # Guarantee at least one attempt remains for the resubmit.
+                if int(a.get("max_attempts", 1) or 1) < _new_attempt + 1:
+                    a["max_attempts"] = _new_attempt + 1
+                break
 
     # Guarantee late-within-grace examples when requested for grading-dispute tasks.
     needed_grace_lates = late_within_grace_count
@@ -1846,6 +1867,10 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         "lowest_homework_id": lowest_homework_id or "",
         "exam_assignment_id": exam_assignment_id or "",
         "resubmit_assignment_ids": resubmit_ids,
+        "resubmit_filenames": ",".join(
+            f"{rid}:revision_v{int(next((a['attempt_count'] for a in all_assignments if a['id'] == rid), 1) or 1) + 1}.pdf"
+            for rid in resubmit_ids
+        ),
         "target_assignment_id": target_assignment_id or "",
         "target_assignment_title": target_assignment_title,
         "target_course_id": target_course_id,
