@@ -741,13 +741,18 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
 
     Params: upcoming_count, completed_count, cancelled_count,
             include_specialist (bool), conflict_pair (bool),
+            conflict_count (int, default 2) — size of the overlapping
+            conflict cluster when conflict_pair is True; >2 makes the
+            most-recently-booked re-derivation harder,
             target_specialty (str | None) — when set, the upcoming
             appointment for that specialty is exposed as `target_apt_id`
             (PP-5). When unset, `target_apt_id` falls back to
             `specialist_apt_id` (the first non-PCP upcoming).
     Outputs: upcoming_ids, completed_ids, cancelled_ids, next_appointment_id,
-             conflict_apt_ids, pcp_apt_id, specialist_apt_id, telehealth_apt_id,
-             target_apt_id
+             conflict_apt_ids, later_booked_conflict_apt_id,
+             later_booked_conflict_provider_id,
+             later_booked_conflict_earliest_slot, pcp_apt_id,
+             specialist_apt_id, telehealth_apt_id, target_apt_id
     """
     upcoming_count = params.get("upcoming_count", 2)
     completed_count = params.get("completed_count", 2)
@@ -921,15 +926,38 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         ctx.base["appointments"].append(apt_dict)
         cancelled_ids.append(apt_id)
 
-    # --- Conflict pair: two overlapping scheduled appointments ---
+    # --- Conflict cluster: N overlapping scheduled appointments ---
+    # `conflict_pair=True` historically produced exactly two overlapping
+    # appointments and that remains the default. `conflict_count` lets a task
+    # opt into a larger cluster (e.g. three same-time appointments) so the
+    # agent must re-derive the most-recently-booked one from booked_at across
+    # MORE than two candidates rather than reading off a 2-element list.
+    # Each appointment in the cluster gets a strictly later booked_at (day
+    # offsets 0, 1, 2, ...) so booked_at ordering is total and deterministic,
+    # and provider assignment cycles providers[j % len(providers)] so for a
+    # cluster of three the most-recently-booked appointment lands on a
+    # specialist provider (providers[2]). This is what makes the
+    # same-provider earliest-slot computation non-trivial.
+    later_booked_conflict_apt_id: str | None = None
+    later_booked_conflict_provider_id: str | None = None
+    later_booked_conflict_earliest_slot: str | None = None
+    # Type-matched discriminator: the earliest available slot with the SAME
+    # visit type (in-person / telehealth) as the later-booked conflict
+    # appointment. This is a strictly harder destination than the bare
+    # earliest slot because the provider's globally-earliest slot is often
+    # the OTHER type (a trap), so the agent must filter slots by type before
+    # taking the min rather than reading off the first slot. None when no
+    # cluster was built or no same-type slot exists.
+    later_booked_conflict_type_matched_earliest_slot: str | None = None
+    later_booked_conflict_type: str | None = None
     if conflict_pair and len(providers) >= 2:
+        conflict_count = max(2, int(params.get("conflict_count", 2)))
         conflict_dt = ctx.now.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=ctx.rng.randint(3, 10))
-        # First appointment booked earlier, second booked 1 day later so
-        # booked_at values are always distinct and ordering is deterministic.
-        first_booked_at = ctx.now - timedelta(days=ctx.rng.randint(2, 7))
-        second_booked_at = first_booked_at + timedelta(days=1)
-        conflict_booked_ats = [first_booked_at, second_booked_at]
-        for j in range(2):
+        # Each appointment booked one day later than the previous so booked_at
+        # values are always distinct and ordering is deterministic.
+        first_booked_at = ctx.now - timedelta(days=ctx.rng.randint(conflict_count, conflict_count + 5))
+        conflict_booked_ats = [first_booked_at + timedelta(days=j) for j in range(conflict_count)]
+        for j in range(conflict_count):
             apt_id = ctx.next_id("apt")
             prov = providers[j % len(providers)]
             booked_at = conflict_booked_ats[j]
@@ -951,6 +979,37 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
             conflict_apt_ids.append(apt_id)
             upcoming_ids.append(apt_id)
 
+        # Pre-compute the discriminator the agent must re-derive: the
+        # most-recently-booked of the cluster, tie-broken by id ascending.
+        # Exposed as scalar targets so canonical_diff predicates and the
+        # solvability proof can pin exact values without recomputing the
+        # date math inside a filter/where scope (hazard Class 6).
+        conflict_apts = [
+            a for a in ctx.base["appointments"] if a["id"] in conflict_apt_ids
+        ]
+        later_apt = max(conflict_apts, key=lambda a: (a["booked_at"], a["id"]))
+        later_booked_conflict_apt_id = later_apt["id"]
+        later_booked_conflict_provider_id = later_apt["provider_id"]
+        later_prov = next(
+            (p for p in providers if p["id"] == later_apt["provider_id"]), None
+        )
+        if later_prov and later_prov.get("available_slots"):
+            later_booked_conflict_earliest_slot = min(
+                s["datetime"] for s in later_prov["available_slots"]
+            )
+            # Same-visit-type earliest slot. The later-booked conflict's own
+            # `type` is the constraint; only slots of that exact type qualify.
+            later_booked_conflict_type = later_apt.get("type")
+            _same_type_slots = [
+                s["datetime"]
+                for s in later_prov["available_slots"]
+                if s.get("type") == later_apt.get("type")
+            ]
+            if _same_type_slots:
+                later_booked_conflict_type_matched_earliest_slot = min(
+                    _same_type_slots
+                )
+
     # PP-5: when target_specialty is unset (or no matching provider was
     # found), fall back to specialist_apt_id so consumers can read a
     # uniform `target_apt_id` field regardless of the seed shape.
@@ -963,6 +1022,22 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         "cancelled_ids": cancelled_ids,
         "next_appointment_id": next_appointment_id,
         "conflict_apt_ids": conflict_apt_ids,
+        # Pre-computed scalar discriminators for the conflict cluster (None
+        # when no cluster was built). `later_booked_conflict_apt_id` is the
+        # most-recently-booked conflict (tie-break: id asc);
+        # `later_booked_conflict_provider_id` is its provider; and
+        # `later_booked_conflict_earliest_slot` is that provider's earliest
+        # available slot datetime (ISO string) — the canonical destination
+        # for an in-place reschedule or a cancel+rebook.
+        "later_booked_conflict_apt_id": later_booked_conflict_apt_id,
+        "later_booked_conflict_provider_id": later_booked_conflict_provider_id,
+        "later_booked_conflict_earliest_slot": later_booked_conflict_earliest_slot,
+        # `later_booked_conflict_type` is the visit type (in-person /
+        # telehealth) of the later-booked conflict; the type-matched slot is
+        # that provider's earliest available slot of THAT SAME type — the
+        # canonical destination when a task requires preserving visit type.
+        "later_booked_conflict_type": later_booked_conflict_type,
+        "later_booked_conflict_type_matched_earliest_slot": later_booked_conflict_type_matched_earliest_slot,
         "pcp_apt_id": pcp_apt_id,
         "pcp_apt_date": pcp_apt_date,
         "specialist_apt_id": specialist_apt_id,
