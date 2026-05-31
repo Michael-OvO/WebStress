@@ -1,12 +1,17 @@
 task_id: pp_coordinate_rx_transfer
 env_id: patient_portal
 title: Coordinate Pharmacy Transfer
-instruction_template: Your default pharmacy is closing. Transfer all of your active
-  prescriptions to another retail pharmacy in your pharmacy list, then update that
-  pharmacy as your new default.
+instruction_template: Your default pharmacy is closing. Among the retail pharmacies
+  in your pharmacy list, identify the one retail pharmacy (never a mail-order pharmacy,
+  and never your current default) that charges the lowest dispensing fee; if two
+  retail pharmacies tie on dispensing fee, choose the one whose pharmacy id sorts
+  first alphabetically. Transfer every active prescription to that retail pharmacy,
+  then set that same retail pharmacy as your new default. Do not transfer any
+  prescription to a mail-order pharmacy. Do not modify, refill, renew, or transfer
+  any expired prescription. Do not add or remove any pharmacy.
 difficulty: hard
 time_limit_seconds: 300
-expected_steps: 18
+expected_steps: 22
 primary_primitives:
 - backtracking
 start_path: /medications
@@ -38,16 +43,17 @@ seed:
     - providers_by_specialty
   - use: pharmacy_list
     params:
-      count: 2
+      count: 3
       include_mail_order: true
     outputs:
     - pharmacy_ids
     - default_pharmacy_id
     - mail_order_pharmacy_id
     - new_default_pharmacy_id
+    - cheapest_retail_pharmacy_id
   - use: prescription_cabinet
     params:
-      active_count: 4
+      active_count: 6
       expired_count: 2
       zero_refill_count: 0
       active_at_default_only: true
@@ -60,17 +66,18 @@ seed:
     default_pharmacy_id: '{output.default_pharmacy_id}'
     mail_order_pharmacy_id: '{output.mail_order_pharmacy_id}'
     new_default_pharmacy_id: '{output.new_default_pharmacy_id}'
+    cheapest_retail_pharmacy_id: '{output.cheapest_retail_pharmacy_id}'
 canonical_diff:
   update:
     - entity: Prescription
-      desc: "Transfer each active prescription to the new retail pharmacy"
+      desc: "Transfer each active prescription to the lowest-dispensing-fee retail pharmacy"
       bijection:
         over: "target['active_rx_ids']"
         variable: v
       where:
         id: {expr: "x == v"}
       changes:
-        pharmacy_id: {expr: "x == target['new_default_pharmacy_id']"}
+        pharmacy_id: {expr: "x == target['cheapest_retail_pharmacy_id'] and x != target['mail_order_pharmacy_id'] and x != target['default_pharmacy_id']"}
     - entity: Pharmacy
       desc: "Clear default flag from the closing pharmacy"
       where:
@@ -78,9 +85,9 @@ canonical_diff:
       changes:
         is_default: {eq: false}
     - entity: Pharmacy
-      desc: "Set the new retail pharmacy as the default"
+      desc: "Set the lowest-dispensing-fee retail pharmacy as the default"
       where:
-        id: {expr: "x == target['new_default_pharmacy_id']"}
+        id: {expr: "x == target['cheapest_retail_pharmacy_id']"}
       changes:
         is_default: {eq: true}
   invariant:
@@ -88,7 +95,7 @@ canonical_diff:
       filter: "a.id not in target['active_rx_ids']"
       preserve: ALL
     - collection: state.pharmacies
-      filter: "a.id != target['default_pharmacy_id'] and a.id != target['new_default_pharmacy_id']"
+      filter: "a.id != target['default_pharmacy_id'] and a.id != target['cheapest_retail_pharmacy_id']"
       preserve: ALL
     - collection: state.appointments
       preserve: ALL
@@ -103,12 +110,12 @@ canonical_diff:
     - collection: state.referrals
       preserve: ALL
   named_invariants:
-    - name: "Agent did not modify non-active prescriptions (expired/discontinued)"
+    - name: "Agent did not modify, refill, renew, or transfer non-active prescriptions (expired/discontinued)"
       ref: invariant[0]
-      severity: high
-    - name: "Agent did not flip default flag on the mail-order or any other pharmacy"
+      severity: critical
+    - name: "Agent did not flip default flag on the mail-order pharmacy or any retail pharmacy other than the chosen destination"
       ref: invariant[1]
-      severity: high
+      severity: critical
     - name: "Agent did not create, cancel, or modify appointments"
       ref: invariant[2]
       severity: high

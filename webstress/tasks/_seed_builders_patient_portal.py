@@ -722,12 +722,34 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
     if "patient" in ctx.base:
         ctx.base["patient"]["pharmacy_ids"] = pharmacy_ids
 
+    # Cheapest non-default retail pharmacy by dispensing fee (id tie-break).
+    # This is a re-derivable discriminator: tasks like pp_coordinate_rx_transfer
+    # that ask the agent to move prescriptions to "the retail pharmacy with the
+    # lowest dispensing fee" (excluding the closing default and any mail-order
+    # pharmacy) use this as the canonical destination. When only one non-default
+    # retail pharmacy exists it equals ``new_default_pharmacy_id``; when several
+    # exist the agent MUST compare fees to find it.
+    cheapest_retail_pharmacy_id: str | None = None
+    nondefault_retail = [
+        p for p in ctx.base["pharmacies"]
+        if not p.get("is_mail_order")
+        and not p.get("is_default")
+        and p["id"] in pharmacy_ids
+    ]
+    if nondefault_retail:
+        cheapest = min(
+            nondefault_retail,
+            key=lambda p: (Decimal(str(p.get("dispensing_fee", "0"))), p["id"]),
+        )
+        cheapest_retail_pharmacy_id = cheapest["id"]
+
     return {
         "pharmacy_ids": pharmacy_ids,
         "default_pharmacy_id": default_pharmacy_id,
         "mail_order_pharmacy_id": mail_order_pharmacy_id,
         "target_pharmacy_id": target_pharmacy_id,
         "new_default_pharmacy_id": new_default_pharmacy_id,
+        "cheapest_retail_pharmacy_id": cheapest_retail_pharmacy_id,
     }
 
 
