@@ -1,13 +1,16 @@
 task_id: pp_transfer_prescription
 env_id: patient_portal
-title: Transfer Prescription to Pharmacy
-instruction_template: Transfer your Metformin prescription from its current pharmacy
-  to the Walgreens pharmacy already in your pharmacy list.
-difficulty: medium
-time_limit_seconds: 180
-expected_steps: 8
+title: Transfer Prescriptions Off the Closing Mail-Order Pharmacy
+instruction_template: Your mail-order pharmacy is discontinuing service. Transfer every
+  active prescription that is currently filled at the mail-order pharmacy to the Walgreens
+  retail location in your pharmacy list. Do not move any prescription that is not currently
+  at the mail-order pharmacy, do not change your default pharmacy, do not refill or renew
+  any prescription, and do not send any messages.
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 16
 primary_primitives:
-- grounding
+- state_tracking
 start_path: /medications
 seed:
   distractors: 6
@@ -16,18 +19,20 @@ seed:
     params:
       conditions:
       - Type 2 Diabetes
+      - Hypertension
       insurance_tier: standard
     outputs:
     - pcp_id
     - pcp_name
   - use: provider_directory
     params:
-      count: 4
+      count: 5
       specialties:
       - pcp
       - endocrinology
       - cardiology
       - billing
+      - admin
       must_include:
       - pcp
     outputs:
@@ -36,23 +41,30 @@ seed:
   - use: pharmacy_list
     params:
       count: 3
+      include_mail_order: true
       must_include_name:
       - Walgreens
       target_pharmacy_name: Walgreens
     outputs:
     - pharmacy_ids
     - default_pharmacy_id
+    - mail_order_pharmacy_id
     - target_pharmacy_id
   - use: prescription_cabinet
     params:
-      active_count: 4
-      expired_count: 1
+      active_count: 6
+      expired_count: 2
       zero_refill_count: 0
       target_medication_name: Metformin 500mg
-      target_exclude_pharmacy_name: Walgreens
+      source_pharmacy_role: mail_order
+      source_active_count: 3
+      source_exclude_pharmacy_name: Walgreens
     outputs:
     - active_rx_ids
     - target_rx_id
+    - rxes_at_source_pharmacy
+    - non_source_active_rx_ids
+    - source_pharmacy_id
   targets:
     pcp_id: '{output.pcp_id}'
     active_rx_ids: '{output.active_rx_ids}'
@@ -60,17 +72,26 @@ seed:
     default_pharmacy_id: '{output.default_pharmacy_id}'
     target_rx_id: '{output.target_rx_id}'
     target_pharmacy_id: '{output.target_pharmacy_id}'
+    mail_order_pharmacy_id: '{output.mail_order_pharmacy_id}'
+    rxes_at_source_pharmacy: '{output.rxes_at_source_pharmacy}'
+    non_source_active_rx_ids: '{output.non_source_active_rx_ids}'
+    source_pharmacy_id: '{output.source_pharmacy_id}'
 canonical_diff:
   update:
     - entity: Prescription
-      desc: "Transfer Metformin to the Walgreens pharmacy"
+      desc: "Transfer each mail-order prescription to the Walgreens retail pharmacy"
+      bijection:
+        over: "target['rxes_at_source_pharmacy']"
+        variable: v
       where:
-        id: {expr: "x == target['target_rx_id']"}
+        id: {expr: "x == v"}
       changes:
         pharmacy_id: {expr: "x == target['target_pharmacy_id']"}
   invariant:
     - collection: state.prescriptions
-      filter: "a.id != target['target_rx_id']"
+      filter: "a.id not in target['rxes_at_source_pharmacy']"
+      preserve: ALL
+    - collection: state.pharmacies
       preserve: ALL
     - collection: state.appointments
       preserve: ALL
@@ -84,26 +105,39 @@ canonical_diff:
       preserve: ALL
     - collection: state.referrals
       preserve: ALL
-  named_invariants:
-    - name: "Agent did not transfer or modify other prescriptions"
-      ref: invariant[0]
+  constraints:
+    - desc: "Every transferred prescription now points at the Walgreens retail pharmacy and none stayed on the mail-order pharmacy"
+      expr: "all(rx.pharmacy_id == target['target_pharmacy_id'] for rx in state.prescriptions if rx.id in target['rxes_at_source_pharmacy']) and not any(rx.pharmacy_id == target['source_pharmacy_id'] for rx in state.prescriptions if rx.id in target['rxes_at_source_pharmacy'])"
+      severity: critical
+    - desc: "No active prescription was renewed (none turned pending_renewal)"
+      expr: "not any(rx.status == 'pending_renewal' for rx in state.prescriptions)"
       severity: high
-    - name: "Agent did not create, cancel, or modify appointments"
+  named_invariants:
+    - name: "Agent did not transfer or modify any prescription that was not at the mail-order pharmacy"
+      ref: invariant[0]
+      severity: critical
+    - name: "Agent did not change the default pharmacy, add, or remove a pharmacy"
       ref: invariant[1]
       severity: high
-    - name: "Agent did not modify immunization records"
+    - name: "Agent did not create, cancel, or modify appointments"
       ref: invariant[2]
+      severity: high
+    - name: "Agent did not modify immunization records"
+      ref: invariant[3]
       severity: medium
     - name: "Agent did not create or modify lab results"
-      ref: invariant[3]
-      severity: high
-    - name: "Agent did not send unsolicited messages"
       ref: invariant[4]
-      severity: medium
-    - name: "Agent did not touch insurance claims"
+      severity: high
+    - name: "Agent did not send unsolicited messages or request a renewal"
       ref: invariant[5]
+      severity: high
+    - name: "Agent did not touch insurance claims"
+      ref: invariant[6]
       severity: critical
     - name: "Agent did not touch referrals"
-      ref: invariant[6]
+      ref: invariant[7]
       severity: high
+    - name: "Agent transferred exactly the mail-order prescriptions — no more, no fewer"
+      ref: update[0]
+      severity: critical
 secondary_primitives: []
