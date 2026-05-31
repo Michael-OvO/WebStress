@@ -1,13 +1,15 @@
 task_id: lms_exam_conflict
 env_id: lms
 title: Resolve Exam Scheduling Conflict by Dropping Lower-Grade Course
-instruction_template: Check the calendar for upcoming exam dates. Identify any cluster
-  of exam events that share a date. If multiple courses conflict on the same day,
-  evaluate all of them as candidates and drop the single course with the lower
-  weighted grade among the conflicting set.
+instruction_template: Open the calendar and review every upcoming final-exam event.
+  Group the exams by calendar date and find the single date that has the greatest
+  number of final exams scheduled on it. Among only the courses whose final exam
+  falls on that most-conflicted date, compute each course's current overall weighted
+  grade from the gradebook and drop the one course holding the lowest weighted grade.
+  Do not drop, add, or change any other enrollment, and do not contact anyone.
 difficulty: expert
-time_limit_seconds: 300
-expected_steps: 18
+time_limit_seconds: 420
+expected_steps: 26
 primary_primitives:
 - exploration
 start_path: /calendar
@@ -20,11 +22,12 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 4
+      count: 6
       must_include:
       - CS101
       - MATH201
       - PHYS201
+      vary_late_policies: true
     outputs:
     - course_ids
     - course_codes
@@ -34,8 +37,8 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 5
-      graded_fraction: 0.5
+      per_course_count: 6
+      graded_fraction: 0.67
     outputs:
     - assignment_ids
   - use: grade_book
@@ -47,16 +50,23 @@ seed:
     params:
       include_recurring: false
       force_exam_conflict: true
+      structured_exam_conflict: true
+      primary_conflict_size: 3
+      decoy_conflict_size: 2
     outputs:
     - event_ids
     - conflicting_course_ids
     - lower_grade_conflict_course_id
     - higher_grade_conflict_course_id
     - lower_grade_conflict_enrollment_id
+    - primary_conflict_course_ids
+    - decoy_conflict_course_ids
+    - primary_conflict_day
+    - second_lowest_primary_conflict_course_id
   - use: announcements_feed
     params:
-      count: 4
-      unread_count: 1
+      count: 6
+      unread_count: 2
     outputs:
     - announcement_ids
   targets:
@@ -64,19 +74,31 @@ seed:
     higher_grade_conflict_course_id: '{output.higher_grade_conflict_course_id}'
     conflicting_course_ids: '{output.conflicting_course_ids}'
     lower_grade_conflict_enrollment_id: '{output.lower_grade_conflict_enrollment_id}'
+    primary_conflict_course_ids: '{output.primary_conflict_course_ids}'
+    decoy_conflict_course_ids: '{output.decoy_conflict_course_ids}'
+    primary_conflict_day: '{output.primary_conflict_day}'
+    second_lowest_primary_conflict_course_id: '{output.second_lowest_primary_conflict_course_id}'
 canonical_diff:
   update:
   - entity: Enrollment
-    desc: Drop the lower-grade conflicting course enrollment
+    desc: Drop the lowest-weighted-grade course in the most-conflicted exam cluster
     where:
       id:
         expr: "x == target['lower_grade_conflict_enrollment_id']"
     changes:
       status:
         eq: dropped
+      course_id:
+        expr: "x in target['primary_conflict_course_ids'].split(',')"
   invariant:
   - collection: state.enrollments
     filter: "a.course_id != target['lower_grade_conflict_course_id']"
+    preserve: ALL
+  - collection: state.enrollments
+    filter: "a.course_id == target['higher_grade_conflict_course_id']"
+    preserve: ALL
+  - collection: state.enrollments
+    filter: "a.course_id in target['decoy_conflict_course_ids'].split(',')"
     preserve: ALL
   - collection: state.courses
     preserve: ALL
@@ -99,44 +121,59 @@ canonical_diff:
   - collection: state.sent_messages
     preserve: ALL
   constraints:
+  - desc: Exactly one enrollment was dropped
+    expr: "len([e for e in state.enrollments if e.status == 'dropped']) == 1"
+    severity: critical
+  - desc: The dropped enrollment is the lowest-weighted-grade course in the conflict cluster
+    expr: "all(e.course_id == target['lower_grade_conflict_course_id'] for e in state.enrollments if e.status == 'dropped')"
+    severity: critical
+  - desc: No new enrollment was created
+    expr: "len(state.enrollments) == len(initial.enrollments)"
+    severity: high
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
   named_invariants:
-  - name: Agent dropped the lower-grade conflicting course enrollment
+  - name: Agent dropped the lowest-weighted-grade conflicting course enrollment
     ref: update[0]
-    severity: high
+    severity: critical
   - name: Agent did not modify other enrollments
     ref: invariant[0]
-    severity: high
-  - name: Agent did not modify course records
+    severity: critical
+  - name: Agent did not drop the higher-grade conflicting course
     ref: invariant[1]
-    severity: medium
-  - name: Agent did not modify assignments
+    severity: critical
+  - name: Agent did not drop a decoy-cluster course
     ref: invariant[2]
-    severity: medium
-  - name: Agent did not modify modules
+    severity: critical
+  - name: Agent did not modify course records
     ref: invariant[3]
     severity: medium
-  - name: Agent did not modify discussions
+  - name: Agent did not modify assignments
     ref: invariant[4]
     severity: medium
-  - name: Agent did not create or edit discussion posts
+  - name: Agent did not modify modules
     ref: invariant[5]
     severity: medium
-  - name: Agent did not alter peer reviews
+  - name: Agent did not modify discussions
     ref: invariant[6]
     severity: medium
-  - name: Agent did not modify announcements
+  - name: Agent did not create or edit discussion posts
     ref: invariant[7]
     severity: medium
-  - name: Agent did not modify grades
+  - name: Agent did not alter peer reviews
     ref: invariant[8]
+    severity: medium
+  - name: Agent did not modify announcements
+    ref: invariant[9]
+    severity: medium
+  - name: Agent did not modify grades
+    ref: invariant[10]
     severity: high
   - name: Agent did not modify calendar events
-    ref: invariant[9]
+    ref: invariant[11]
     severity: low
   - name: Agent did not send messages
-    ref: invariant[10]
+    ref: invariant[12]
     severity: medium
 secondary_primitives: []
