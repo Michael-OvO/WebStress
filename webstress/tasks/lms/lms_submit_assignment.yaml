@@ -1,14 +1,26 @@
 task_id: lms_submit_assignment
 env_id: lms
-title: Submit an Assignment for a Course
+title: Catch Up on Recoverable Missing Assignments
 instruction_template: >-
-  Submit the assignment "{target.assignment_title}" for {target.course_code}.
-  Upload a file named "{target.file_name}".
-difficulty: easy
-time_limit_seconds: 120
-expected_steps: 6
+  You have fallen behind in several courses. Go through every assignment that is
+  currently past its due date, has not been submitted, AND is still inside its
+  course's late-submission window — meaning the number of days the assignment is
+  past due does not exceed that course's maximum allowed late days (shown in each
+  course's syllabus late policy). Submit each one of those assignments. Do NOT
+  submit any past-due assignment whose days-late already exceeds its course's
+  maximum allowed late days, and do NOT submit any assignment that is not yet
+  past due or has already been submitted. For each assignment you submit, upload
+  a file named "catchup_<CODE>.pdf" where <CODE> is the course code that the
+  assignment belongs to (for example, an assignment in a course coded ZZZ999
+  must be submitted with the file name catchup_ZZZ999.pdf). Do not send any
+  messages.
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 11
 primary_primitives:
   - grounding
+secondary_primitives:
+  - backtracking
 start_path: /courses
 
 seed:
@@ -20,17 +32,22 @@ seed:
         - student_id
     - use: course_catalog
       params:
-        count: 3
+        count: 4
         must_include: ["CS101", "MATH201"]
+        vary_late_policies: true
       outputs:
         - course_ids
+        - course_codes
     - use: enrollment_set
       params: {}
       outputs:
         - enrollment_ids
     - use: assignment_battery
       params:
-        per_course_count: 5
+        per_course_count: 7
+        missing_count: 4
+        unrecoverable_missing_count: 2
+        late_count: 1
         target_assignment_status: "not_submitted"
       outputs:
         - assignment_ids
@@ -40,32 +57,40 @@ seed:
         - target_course_code
         - decoy_assignment_id
         - file_name
+        - recoverable_missing_assignment_ids
+        - unrecoverable_assignment_ids
   targets:
     assignment_title: '{output.target_assignment_title}'
     course_code: '{output.target_course_code}'
     target_assignment_id: '{output.target_assignment_id}'
     decoy_assignment_id: '{output.decoy_assignment_id}'
     file_name: '{output.file_name}'
+    recoverable_missing_assignment_ids: '{output.recoverable_missing_assignment_ids}'
+    unrecoverable_assignment_ids: '{output.unrecoverable_assignment_ids}'
 
 canonical_diff:
   update:
     - entity: Assignment
-      desc: Submit the specified assignment with the required file name
+      desc: Submit every recoverable missing assignment with its per-course catch-up file
+      bijection:
+        over: "target['recoverable_missing_assignment_ids'].split(',') if target['recoverable_missing_assignment_ids'] else []"
+        variable: v
       where:
         id:
-          expr: "x == target['target_assignment_id']"
+          expr: "x == v"
       changes:
         submission_status: {in: [submitted, late]}
         file_name:
-          expr: "x == target['file_name']"
+          expr: "x == 'catchup_' + initial.get_course(initial.get_assignment(v).course_id).course_code + '.pdf'"
         attempt_count:
-          expr: "x >= initial.get_assignment(target['target_assignment_id']).attempt_count + 1"
+          expr: "x >= initial.get_assignment(v).attempt_count + 1"
         submitted_at:
-          expr: "x is not None"
+          expr: "x is not None and x >= session_start"
   invariant:
     - collection: state.assignments
-      filter: "a.id != target['target_assignment_id']"
+      filter: "a.id not in (target['recoverable_missing_assignment_ids'].split(',') if target['recoverable_missing_assignment_ids'] else [])"
       preserve: ALL
+      comprehensive: true
     - collection: state.courses
       preserve: ALL
     - collection: state.enrollments
@@ -87,13 +112,24 @@ canonical_diff:
     - collection: state.sent_messages
       preserve: ALL
   constraints:
+  - desc: Agent did not submit any unrecoverable (past-window) assignment
+    expr: >-
+      all(
+        a.submission_status == 'not_submitted'
+        for a in state.assignments
+        if a.id in (target['unrecoverable_assignment_ids'].split(',') if target['unrecoverable_assignment_ids'] else [])
+      )
+    severity: critical
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
   named_invariants:
-    - name: Agent did not modify other assignments
-      ref: invariant[0]
+    - name: Agent submitted every recoverable missing assignment with the right file
+      ref: update[0]
       severity: high
+    - name: Agent did not submit unrecoverable or already-submitted assignments
+      ref: invariant[0]
+      severity: critical
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium
