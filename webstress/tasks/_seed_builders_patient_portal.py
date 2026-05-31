@@ -514,11 +514,21 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         the same specialty (e.g. immunizations administered by different PCPs).
       must_include (list[str]): specialties that must be present; merged with
         `specialties` with duplicates collapsed.
+      force_in_person_specialties (list[str]): for each listed specialty, every
+        provider of that specialty is guaranteed at least one in-person slot.
+        If a provider's randomly-generated slots are all telehealth, the
+        earliest slot's type is flipped to "in-person". This is applied AFTER
+        all RNG slot draws (so it does not perturb the deterministic seed
+        stream of other tasks) and only activates when the param is supplied —
+        existing tasks are unaffected. Required by tasks whose canonical
+        answer is "the earliest in-person slot of provider X", to keep that
+        answer guaranteed to exist across every seed.
     Outputs: provider_ids, providers_by_specialty
     """
     specialties = params.get("specialties", ["pcp"])
     count_per_specialty = params.get("count_per_specialty", {}) or {}
     must_include = set(params.get("must_include", []))
+    force_in_person_specialties = set(params.get("force_in_person_specialties", []) or [])
     # Merge specialties + must_include, deduped. count_per_specialty controls
     # how many providers of each specialty are created (default 1).
     all_specialties = list(dict.fromkeys(specialties + list(must_include)))
@@ -572,6 +582,17 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
                 })
             # Sort slots by datetime
             slots.sort(key=lambda s: s["datetime"])
+
+            # Guarantee at least one in-person slot for opted-in specialties.
+            # Applied after all RNG draws so the deterministic seed stream is
+            # unchanged for tasks that do not request this. If no slot is
+            # in-person, flip the earliest slot to in-person (a stable, fully
+            # deterministic choice). No-op when an in-person slot already
+            # exists or the specialty is not opted in.
+            if spec in force_in_person_specialties and slots and not any(
+                s["type"] == "in-person" for s in slots
+            ):
+                slots[0]["type"] = "in-person"
 
             prov_dict = {
                 "id": prov_id,
