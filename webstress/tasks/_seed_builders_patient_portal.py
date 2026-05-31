@@ -2040,15 +2040,37 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     """Create insurance claims in various statuses.
 
     Params: approved_count (int), denied_count (int), processing_count (int),
-            with_eob (bool), near_appeal_deadline (bool)
+            with_eob (bool), near_appeal_deadline (bool),
+            approved_no_eob_count (int), approved_zero_resp_count (int)
     Outputs: approved_claim_ids, denied_claim_ids, processing_claim_ids,
-             appealable_claim_id, total_patient_responsibility
+             appealable_claim_id, most_recent_denied_claim_id,
+             top_3_appealable_claim_ids, payable_approved_claim_ids,
+             total_patient_responsibility
+
+    ``approved_no_eob_count`` adds N approved claims whose ``eob_available`` is
+    forced False regardless of ``with_eob`` (the EOB cannot be reviewed yet, so
+    these are NOT payable in an "review EOB then pay" workflow even though they
+    carry a positive balance).
+
+    ``approved_zero_resp_count`` adds N approved claims that are fully covered
+    (``amount_covered == amount_billed`` ⇒ ``patient_responsibility == 0``).
+    The ``/claims/{id}/pay`` route rejects these (422 — "No patient
+    responsibility to pay"), so they must NOT be acted on.
+
+    ``payable_approved_claim_ids`` is the precomputed discriminator a task can
+    drive a saturating bijection over: every approved claim that has an
+    available EOB AND a strictly-positive ``patient_responsibility``. Computing
+    it here keeps the canonical_diff free of filter-scope date/eob math
+    (hazard: ``where``/``filter`` scopes see only id + changed fields, or
+    ``a`` + ``target``).
     """
     approved_count = params.get("approved_count", 1)
     denied_count = params.get("denied_count", 0)
     processing_count = params.get("processing_count", 0)
     with_eob = params.get("with_eob", False)
     near_appeal_deadline = params.get("near_appeal_deadline", False)
+    approved_no_eob_count = params.get("approved_no_eob_count", 0)
+    approved_zero_resp_count = params.get("approved_zero_resp_count", 0)
 
     if "claims" not in ctx.base:
         ctx.base["claims"] = []
@@ -2120,7 +2142,8 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
                 return apt
         return None
 
-    def _make_claim(status: str, appeal_days: int, eob: bool = False) -> dict[str, Any]:
+    def _make_claim(status: str, appeal_days: int, eob: bool = False,
+                    zero_resp: bool = False) -> dict[str, Any]:
         clm_id = ctx.next_id("clm")
         service_date = (ctx.now - timedelta(days=ctx.rng.randint(7, 120))).date()
 
@@ -2133,8 +2156,14 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
 
         amount_billed = Decimal(str(ctx.rng.randint(100, 2000)))
         if status == "approved":
-            amount_covered = Decimal(str(round(float(amount_billed) * ctx.rng.uniform(0.6, 0.9), 2)))
-            patient_resp = amount_billed - amount_covered
+            if zero_resp:
+                # Fully covered — patient owes nothing. The pay route rejects
+                # these (422), so they must never be acted on.
+                amount_covered = amount_billed
+                patient_resp = Decimal("0")
+            else:
+                amount_covered = Decimal(str(round(float(amount_billed) * ctx.rng.uniform(0.6, 0.9), 2)))
+                patient_resp = amount_billed - amount_covered
         elif status == "denied":
             amount_covered = Decimal("0")
             patient_resp = amount_billed
@@ -2177,6 +2206,24 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # Approved claims
     for _ in range(approved_count):
         claim = _make_claim("approved", ctx.rng.randint(30, 90), eob=with_eob)
+        ctx.base["claims"].append(claim)
+        approved_claim_ids.append(claim["id"])
+        total_patient_responsibility += Decimal(claim["patient_responsibility"])
+
+    # Approved claims whose EOB is NOT yet available. These carry a positive
+    # balance but the EOB cannot be reviewed, so an "review EOB then pay"
+    # workflow must skip them. They are still legitimate approved claims, so
+    # they appear in approved_claim_ids.
+    for _ in range(approved_no_eob_count):
+        claim = _make_claim("approved", ctx.rng.randint(30, 90), eob=False)
+        ctx.base["claims"].append(claim)
+        approved_claim_ids.append(claim["id"])
+        total_patient_responsibility += Decimal(claim["patient_responsibility"])
+
+    # Approved claims that are fully covered (patient_responsibility == 0).
+    # The pay route rejects these (422), so they must never be paid.
+    for _ in range(approved_zero_resp_count):
+        claim = _make_claim("approved", ctx.rng.randint(30, 90), eob=with_eob, zero_resp=True)
         ctx.base["claims"].append(claim)
         approved_claim_ids.append(claim["id"])
         total_patient_responsibility += Decimal(claim["patient_responsibility"])
@@ -2243,6 +2290,20 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     )
     top_3_appealable_claim_ids = appealable_ids_sorted[:3]
 
+    # Derived: the payable approved claims — approved AND eob_available AND a
+    # strictly-positive patient_responsibility. This is the discriminator an
+    # "review the EOB, then pay the patient responsibility" task drives a
+    # saturating bijection over. Approved-but-no-EOB and fully-covered
+    # (zero-responsibility) approved claims are deliberately excluded so the
+    # agent must filter, not just "pay every approved claim". Sorted by
+    # claim id for deterministic ordering across runs.
+    payable_approved_claim_ids = sorted(
+        cid for cid in approved_claim_ids
+        if (c := _claim_by_id(cid)) is not None
+        and c.get("eob_available")
+        and float(c.get("patient_responsibility", "0")) > 0
+    )
+
     return {
         "approved_claim_ids": approved_claim_ids,
         "denied_claim_ids": denied_claim_ids,
@@ -2250,6 +2311,7 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         "appealable_claim_id": appealable_claim_id,
         "most_recent_denied_claim_id": most_recent_denied_claim_id,
         "top_3_appealable_claim_ids": top_3_appealable_claim_ids,
+        "payable_approved_claim_ids": payable_approved_claim_ids,
         "total_patient_responsibility": str(total_patient_responsibility),
     }
 
