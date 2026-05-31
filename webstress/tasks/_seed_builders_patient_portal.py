@@ -805,6 +805,12 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
     # dispensing fee retail pharmacy" rather than naming the store. Tie-break by
     # the lower numeric id suffix so the answer is deterministic when two
     # retail pharmacies share a fee.
+    #
+    # pp_coordinate_rx_transfer also reads this as the canonical destination
+    # for moving prescriptions to "the retail pharmacy with the lowest
+    # dispensing fee" (excluding the closing default and any mail-order
+    # pharmacy). It is exposed under both the descriptive name and the legacy
+    # ``cheapest_retail_pharmacy_id`` alias; both refer to the same pharmacy.
     def _id_suffix(pid: str) -> int:
         try:
             return int(pid.rsplit("_", 1)[-1])
@@ -817,6 +823,7 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
     ]
     lowest_fee_retail_pharmacy_id: str | None = None
     lowest_fee_retail_pharmacy_name: str | None = None
+    cheapest_retail_pharmacy_id: str | None = None
     retail_fee_by_id: dict[str, str] = {
         p["id"]: str(p["dispensing_fee"]) for p in retail_candidates
     }
@@ -827,6 +834,7 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
         )
         lowest_fee_retail_pharmacy_id = cheapest["id"]
         lowest_fee_retail_pharmacy_name = cheapest["name"]
+        cheapest_retail_pharmacy_id = cheapest["id"]
 
     return {
         "pharmacy_ids": pharmacy_ids,
@@ -837,6 +845,7 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
         "lowest_fee_retail_pharmacy_id": lowest_fee_retail_pharmacy_id,
         "lowest_fee_retail_pharmacy_name": lowest_fee_retail_pharmacy_name,
         "retail_fee_by_id": retail_fee_by_id,
+        "cheapest_retail_pharmacy_id": cheapest_retail_pharmacy_id,
     }
 
 
