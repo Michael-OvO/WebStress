@@ -2,10 +2,15 @@ task_id: lms_read_urgent_announcement
 env_id: lms
 title: Read Urgent Announcement
 instruction_template: >-
-  Find and mark the urgent announcement as read.
-difficulty: easy
-time_limit_seconds: 120
-expected_steps: 4
+  Your announcements feed has several urgent notices still marked unread. Open
+  the feed, and mark as read the single urgent unread announcement that was
+  posted most recently (the latest posted_at among announcements whose priority
+  is urgent and that are still unread). Mark exactly that one announcement read.
+  Do not mark any other announcement read, do not use mark-all-read, and do not
+  send any messages.
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 9
 primary_primitives:
   - grounding
 start_path: /courses
@@ -19,7 +24,7 @@ seed:
         - student_id
     - use: course_catalog
       params:
-        count: 3
+        count: 5
       outputs:
         - course_ids
     - use: enrollment_set
@@ -28,29 +33,36 @@ seed:
         - enrollment_ids
     - use: announcements_feed
       params:
-        count: 6
-        unread_count: 3
-        urgent_count: 1
+        count: 12
+        unread_count: 7
+        urgent_count: 4
+        distinct_urgent_recency: true
       outputs:
         - announcement_ids
         - unread_announcement_ids
         - urgent_announcement_id
+        - urgent_unread_announcement_ids
+        - target_urgent_announcement_id
   targets:
     urgent_announcement_id: '{output.urgent_announcement_id}'
     unread_announcement_ids: '{output.unread_announcement_ids}'
+    urgent_unread_announcement_ids: '{output.urgent_unread_announcement_ids}'
+    target_urgent_announcement_id: '{output.target_urgent_announcement_id}'
 
 canonical_diff:
   update:
     - entity: Announcement
-      desc: Mark the urgent announcement as read
+      desc: Mark the most recently posted urgent unread announcement as read
       where:
         id:
-          expr: "x == target['urgent_announcement_id']"
+          expr: "x == target['target_urgent_announcement_id']"
+        priority:
+          eq: urgent
       changes:
         is_read: {eq: true}
   invariant:
     - collection: state.announcements
-      filter: "a.id != target['urgent_announcement_id']"
+      filter: "a.id != target['target_urgent_announcement_id']"
       preserve: ALL
     - collection: state.courses
       preserve: ALL
@@ -75,11 +87,17 @@ canonical_diff:
   constraints:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
-    severity: medium
+    severity: high
+  - desc: Other urgent unread announcements were left unread (no mark-all-read)
+    expr: >-
+      sum(1 for a in state.announcements if a.priority == 'urgent'
+      and not a.is_read) == len(target['urgent_unread_announcement_ids'].split(','))
+      - 1
+    severity: critical
   named_invariants:
     - name: Agent did not modify non-target announcements
       ref: invariant[0]
-      severity: high
+      severity: critical
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium

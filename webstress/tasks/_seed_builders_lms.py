@@ -2941,6 +2941,13 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     count = params.get("count", 6)
     unread_count = params.get("unread_count", 2)
     urgent_count = params.get("urgent_count", 1)
+    # When True, urgent announcements receive deterministic, mutually-distinct
+    # posted_at timestamps such that the single most-recently-posted urgent
+    # UNREAD announcement is a non-first urgent index. This turns "find the
+    # urgent one" into "re-derive top-1-by-recency over the urgent unread set",
+    # with no tie-break ambiguity. Defaults False so every other task that uses
+    # this builder keeps byte-identical fixtures.
+    distinct_urgent_recency = params.get("distinct_urgent_recency", False)
 
     courses = ctx.base.get("courses", [])
     if "announcements" not in ctx.base:
@@ -2949,6 +2956,9 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     announcement_ids: list[str] = []
     unread_ids: list[str] = []
     urgent_announcement_id: str | None = None
+    # (id, posted_at iso) for the urgent + unread pool used to derive the
+    # single "most recently posted urgent unread" discriminator.
+    urgent_unread_pool: list[tuple[str, str]] = []
 
     for i in range(count):
         ann_id = ctx.next_id("announcement")
@@ -2961,12 +2971,24 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         is_read = i >= unread_count
         is_urgent = i < urgent_count
 
+        # Original behaviour (preserved exactly when the flag is off so that
+        # every other consumer of this builder is unaffected). Consume the
+        # RNG draw unconditionally to keep the stream identical.
+        posted_at = ctx.now - timedelta(days=ctx.rng.randint(0, 14))
+        if distinct_urgent_recency and is_urgent:
+            # Deterministic, distinct timestamps for urgent announcements.
+            # Rotate the "most recent" off the first urgent index: index 1 is
+            # newest (0 minutes back), then 0, then 2, 3, ... — so the latest
+            # urgent unread is NOT the first urgent the agent encounters.
+            rank = 0 if i == 1 else (1 if i == 0 else i)
+            posted_at = ctx.now - timedelta(hours=12) - timedelta(minutes=rank)
+
         announcement = Announcement(
             id=ann_id,
             course_id=course_id,
             title=f"{'URGENT: ' if is_urgent else ''}Announcement {i + 1}",
             body=body,
-            posted_at=ctx.now - timedelta(days=ctx.rng.randint(0, 14)),
+            posted_at=posted_at,
             is_read=is_read,
             priority="urgent" if is_urgent else "normal",
         )
@@ -2977,6 +2999,8 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
             unread_ids.append(ann_id)
         if is_urgent and urgent_announcement_id is None:
             urgent_announcement_id = ann_id
+        if is_urgent and not is_read:
+            urgent_unread_pool.append((ann_id, posted_at.isoformat()))
 
     # ── latest_announcement_id: most recent UNREAD by posted_at (fallback to any) ──
     latest_announcement_id = ""
@@ -3003,10 +3027,24 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         f"{cid}:{','.join(aids)}" for cid, aids in course_ann_map.items()
     )
 
+    # ── target_urgent_announcement_id: the single most recently posted ──
+    # urgent + unread announcement. Timestamps are distinct by construction,
+    # so this top-1-by-recency discriminator is always unique. The agent must
+    # re-derive it (filter urgent AND unread, pick latest posted_at) rather
+    # than just "find the urgent one" — multiple urgent unread compete.
+    urgent_unread_announcement_ids = [aid for aid, _ in urgent_unread_pool]
+    target_urgent_announcement_id = ""
+    if urgent_unread_pool:
+        target_urgent_announcement_id = max(
+            urgent_unread_pool, key=lambda pair: pair[1],
+        )[0]
+
     return {
         "announcement_ids": announcement_ids,
         "unread_announcement_ids": unread_ids,
         "urgent_announcement_id": urgent_announcement_id or "",
+        "urgent_unread_announcement_ids": urgent_unread_announcement_ids,
+        "target_urgent_announcement_id": target_urgent_announcement_id,
         "latest_announcement_id": latest_announcement_id,
         "course_announcement_ids": course_announcement_ids,
     }
