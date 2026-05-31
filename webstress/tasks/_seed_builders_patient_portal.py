@@ -1076,6 +1076,15 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     expiring_soon_count = params.get("expiring_soon_count", 0)
     expiring_zero_refill_count = params.get("expiring_zero_refill_count", 0)
     interaction_pair = params.get("interaction_pair", False)
+    # When True, after the genuine active↔active interaction pair is wired up,
+    # attach a DECOY interaction entry between an expired prescription and one
+    # active prescription that is NOT a member of the genuine pair. This means
+    # the cabinet contains two prescriptions whose ``interactions`` list is
+    # non-empty but only ONE pair is an active↔active conflict; an agent that
+    # naively scans for ``interactions != []`` (rather than confirming both
+    # members are ``status == "active"``) will surface the wrong pair. Requires
+    # ``interaction_pair`` and at least one expired prescription to take effect.
+    expired_interaction_decoy = bool(params.get("expired_interaction_decoy", False))
     target_medication_name: str | None = params.get("target_medication_name")
     target_exclude_mail_order = bool(params.get("target_exclude_mail_order", False))
     target_exclude_pharmacy_name: str | None = params.get("target_exclude_pharmacy_name")
@@ -1266,6 +1275,7 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             expiring_zero_refill_rx_ids.append(rx["id"])
 
     # Expired prescriptions
+    expired_rx_ids: list[str] = []
     for _ in range(expired_count):
         if med_idx >= len(med_pool):
             break
@@ -1273,6 +1283,7 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         med_idx += 1
         rx = _make_rx(med, "expired", 0, -ctx.rng.randint(1, 90))
         ctx.base["prescriptions"].append(rx)
+        expired_rx_ids.append(rx["id"])
 
     # Interaction pair -- two active meds with mutual conflict entries
     if interaction_pair and len(_INTERACTION_PAIRS) > 0:
@@ -1284,8 +1295,18 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         if pair_meds[0] and pair_meds[1]:
             rx_ids_pair: list[str] = []
             for k, pm in enumerate(pair_meds):
-                # Check if this medication is already in prescriptions
-                existing = next((r for r in ctx.base["prescriptions"] if r["medication"] == pm["name"]), None)
+                # Reuse an existing prescription for this medication ONLY when it
+                # is ACTIVE — the interaction pair must be an active↔active
+                # conflict. If the only existing match is expired (or none
+                # exists), mint a fresh ACTIVE prescription so the genuine pair
+                # is always actionable regardless of seed.
+                existing = next(
+                    (
+                        r for r in ctx.base["prescriptions"]
+                        if r["medication"] == pm["name"] and r.get("status") == "active"
+                    ),
+                    None,
+                )
                 if existing:
                     rx_ids_pair.append(existing["id"])
                 else:
@@ -1303,6 +1324,39 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
 
             interacting_rx_ids = rx_ids_pair
             interacting_medications = list(pair)
+
+    # Decoy interaction trap: wire a cross-interaction between an expired
+    # prescription and one ACTIVE prescription that is NOT part of the genuine
+    # active↔active pair. The decoy is intentionally invalid (one member is
+    # expired), so the only conflict that warrants action is the genuine pair.
+    decoy_interaction_rx_ids: list[str] = []
+    if expired_interaction_decoy and expired_rx_ids:
+        expired_id = expired_rx_ids[0]
+        expired_rx = next(
+            (r for r in ctx.base["prescriptions"] if r["id"] == expired_id), None
+        )
+        # Choose an active rx outside the genuine pair as the decoy's active side.
+        decoy_active = next(
+            (
+                r for r in ctx.base["prescriptions"]
+                if r.get("status") == "active"
+                and r["id"] not in interacting_rx_ids
+            ),
+            None,
+        )
+        if expired_rx is not None and decoy_active is not None:
+            expired_rx["interactions"] = [decoy_active["medication"]]
+            decoy_active["interactions"] = [expired_rx["medication"]]
+            decoy_interaction_rx_ids = [expired_id, decoy_active["id"]]
+
+    # Provider ids that wrote the genuine active↔active interaction pair. Tasks
+    # that route the agent to a prescriber (rather than the PCP) can pin this;
+    # exposed unconditionally so it is available without re-scanning rx records.
+    interacting_prescriber_ids: list[str] = []
+    for rid in interacting_rx_ids:
+        rx_obj = next((r for r in ctx.base["prescriptions"] if r["id"] == rid), None)
+        if rx_obj is not None:
+            interacting_prescriber_ids.append(rx_obj["provider_id"])
 
     # Subset of expiring rxes that still have ≥1 refill remaining — this is
     # the "request refill" target for tasks that distinguish refill-vs-renewal
@@ -1323,6 +1377,8 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         "expiring_with_refills_rx_ids": expiring_with_refills_rx_ids,
         "interacting_rx_ids": interacting_rx_ids,
         "interacting_medications": interacting_medications,
+        "interacting_prescriber_ids": interacting_prescriber_ids,
+        "decoy_interaction_rx_ids": decoy_interaction_rx_ids,
     }
 
 
