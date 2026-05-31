@@ -2567,9 +2567,35 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
 
     Params: approved_count (int), pending_count (int), denied_count (int),
             with_prior_auth (bool), expiring_soon (bool),
-            must_have_specialties (list[str]) — approved referrals guaranteed for these specialties
+            must_have_specialties (list[str]) — approved referrals guaranteed for these specialties,
+            extra_specialty_referrals (list[dict]) — additional decoy referrals appended
+              AFTER the guaranteed/approved batch. Each dict accepts keys
+              ``specialty`` (str), ``status`` (str: approved|requested|denied),
+              ``prior_auth`` (bool, default False), ``prior_auth_status`` (str,
+              optional override e.g. "pending"|"approved"|"denied"), and
+              ``pin_to_specialty_provider`` (bool, default True — force
+              ``to_provider_id`` to a provider that actually matches the
+              referral specialty rather than borrowing a candidate appointment's
+              provider). These are intentionally placed after the eligible
+              approved referral so the create-appointment gate (which picks the
+              FIRST approved referral for a specialty) still resolves to the
+              eligible one, while the directory shows several same-specialty
+              referrals the agent must disambiguate.
+            pin_must_have_providers (bool, default False) — when True, every
+              ``must_have_specialties`` approved referral pins its
+              ``to_provider_id`` to a provider whose specialty matches, instead
+              of inheriting an unrelated candidate appointment's provider.
     Outputs: approved_ref_ids, pending_ref_ids, denied_ref_ids,
-             prior_auth_ref_id, expiring_ref_id
+             prior_auth_ref_id, expiring_ref_id,
+             eligible_approved_ref_ids (approved referrals that clear the
+               scheduling gate: not prior_auth_required OR prior_auth_status ==
+               "approved"),
+             eligible_ref_id_by_specialty (specialty → first eligible approved
+               referral id),
+             eligible_provider_id_by_specialty (specialty → that referral's
+               to_provider_id),
+             ineligible_approved_ref_ids (approved referrals blocked by an
+               unapproved prior-auth — decoys the agent must NOT link).
     """
     approved_count = params.get("approved_count", 1)
     pending_count = params.get("pending_count", 1)
@@ -2577,6 +2603,10 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
     with_prior_auth = params.get("with_prior_auth", False)
     expiring_soon = params.get("expiring_soon", False)
     must_have_specialties: list[str] = list(params.get("must_have_specialties", []))
+    extra_specialty_referrals: list[dict[str, Any]] = [
+        dict(item) for item in (params.get("extra_specialty_referrals") or [])
+    ]
+    pin_must_have_providers = bool(params.get("pin_must_have_providers", False))
 
     if "referrals" not in ctx.base:
         ctx.base["referrals"] = []
@@ -2597,7 +2627,9 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
     expiring_ref_id: str | None = None
 
     def _make_ref(status: str, expires_days: int, prior_auth: bool = False,
-                  specialty: str | None = None) -> dict[str, Any]:
+                  specialty: str | None = None,
+                  pin_to_specialty_provider: bool = False,
+                  prior_auth_status_override: str | None = None) -> dict[str, Any]:
         ref_id = ctx.next_id("ref")
         candidate_appointments = [
             apt for apt in appointments
@@ -2610,11 +2642,23 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
             specialty = providers_by_id[preferred_appointment["provider_id"]]["specialty"]
         if specialty is None:
             specialty = ctx.rng.choice(available_specialties)
-        to_prov = (
-            providers_by_id.get(preferred_appointment["provider_id"])
-            if preferred_appointment is not None
-            else next((p for p in specialist_specs if p["specialty"] == specialty), None)
-        )
+        if pin_to_specialty_provider:
+            # Force the referral to point at a provider that actually matches
+            # the referral specialty (deterministic: first matching provider),
+            # not an unrelated candidate appointment's provider. Required when
+            # a task pins the appointment's provider_id to the referral's
+            # to_provider_id and that provider must own the bookable slots.
+            preferred_appointment = None
+            to_prov = next(
+                (p for p in specialist_specs if p["specialty"] == specialty),
+                None,
+            )
+        else:
+            to_prov = (
+                providers_by_id.get(preferred_appointment["provider_id"])
+                if preferred_appointment is not None
+                else next((p for p in specialist_specs if p["specialty"] == specialty), None)
+            )
         to_prov_id = to_prov["id"] if to_prov else None
         linked_appointment = preferred_appointment or next(
             (
@@ -2639,6 +2683,8 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         prior_auth_status = "not_required"
         if prior_auth:
             prior_auth_status = "approved" if status == "approved" else "pending"
+        if prior_auth_status_override is not None:
+            prior_auth_status = prior_auth_status_override
 
         return {
             "id": ref_id,
@@ -2660,7 +2706,9 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         needs_auth = with_prior_auth and prior_auth_ref_id is None and i == 0
         forced_specialty = guaranteed.pop(0) if guaranteed else None
         ref = _make_ref("approved", ctx.rng.randint(60, 180), prior_auth=needs_auth,
-                        specialty=forced_specialty)
+                        specialty=forced_specialty,
+                        pin_to_specialty_provider=pin_must_have_providers
+                        and forced_specialty is not None)
         ctx.base["referrals"].append(ref)
         approved_ref_ids.append(ref["id"])
         if needs_auth:
@@ -2678,6 +2726,34 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         ctx.base["referrals"].append(ref)
         denied_ref_ids.append(ref["id"])
 
+    # Extra decoy referrals — appended AFTER the eligible approved batch so the
+    # scheduling gate (which resolves the FIRST approved same-specialty
+    # referral) keeps pointing at the eligible one. These deliberately mimic an
+    # eligible referral (same specialty, sometimes status="approved") while
+    # being blocked by an unapproved prior-auth or a non-approved status, so the
+    # agent must disambiguate rather than pattern-match on specialty alone.
+    for spec_ref in extra_specialty_referrals:
+        e_specialty = spec_ref.get("specialty")
+        e_status = str(spec_ref.get("status", "requested"))
+        e_prior_auth = bool(spec_ref.get("prior_auth", False))
+        e_pa_override = spec_ref.get("prior_auth_status")
+        e_pin = bool(spec_ref.get("pin_to_specialty_provider", True))
+        ref = _make_ref(
+            e_status,
+            ctx.rng.randint(60, 180),
+            prior_auth=e_prior_auth,
+            specialty=e_specialty,
+            pin_to_specialty_provider=e_pin and e_specialty is not None,
+            prior_auth_status_override=e_pa_override,
+        )
+        ctx.base["referrals"].append(ref)
+        if e_status == "approved":
+            approved_ref_ids.append(ref["id"])
+        elif e_status == "requested":
+            pending_ref_ids.append(ref["id"])
+        elif e_status == "denied":
+            denied_ref_ids.append(ref["id"])
+
     # Expiring soon referral
     if expiring_soon:
         ref = _make_ref("approved", ctx.rng.randint(3, 10))
@@ -2685,12 +2761,55 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         approved_ref_ids.append(ref["id"])
         expiring_ref_id = ref["id"]
 
+    # ----------------------------------------------------------------------
+    # Eligibility computation. An approved referral clears the
+    # create-appointment gate iff it is approved AND (prior-auth not required
+    # OR prior-auth already approved). Tasks that pin the appointment's
+    # linked_referral_id to an EXACT eligible referral (rather than "any
+    # neurology referral") need this precomputed so a canonical_diff predicate
+    # never reconstructs the eligibility filter inside a comprehension scope
+    # (Class 6/8 hazard).
+    # ----------------------------------------------------------------------
+    referrals_now = ctx.base["referrals"]
+    by_id = {r["id"]: r for r in referrals_now}
+
+    def _is_eligible(r: dict[str, Any]) -> bool:
+        return (
+            r.get("status") == "approved"
+            and (
+                not r.get("prior_auth_required")
+                or r.get("prior_auth_status") == "approved"
+            )
+        )
+
+    eligible_approved_ref_ids = [rid for rid in approved_ref_ids if _is_eligible(by_id[rid])]
+    ineligible_approved_ref_ids = [
+        rid for rid in approved_ref_ids if not _is_eligible(by_id[rid])
+    ]
+    eligible_ref_id_by_specialty: dict[str, str] = {}
+    eligible_provider_id_by_specialty: dict[str, str | None] = {}
+    eligible_ref_ids_by_specialty: dict[str, list[str]] = {}
+    for rid in eligible_approved_ref_ids:
+        r = by_id[rid]
+        spec = r.get("to_specialty")
+        if spec is None:
+            continue
+        eligible_ref_ids_by_specialty.setdefault(spec, []).append(rid)
+        if spec not in eligible_ref_id_by_specialty:
+            eligible_ref_id_by_specialty[spec] = rid
+            eligible_provider_id_by_specialty[spec] = r.get("to_provider_id")
+
     return {
         "approved_ref_ids": approved_ref_ids,
         "pending_ref_ids": pending_ref_ids,
         "denied_ref_ids": denied_ref_ids,
         "prior_auth_ref_id": prior_auth_ref_id,
         "expiring_ref_id": expiring_ref_id,
+        "eligible_approved_ref_ids": eligible_approved_ref_ids,
+        "ineligible_approved_ref_ids": ineligible_approved_ref_ids,
+        "eligible_ref_id_by_specialty": eligible_ref_id_by_specialty,
+        "eligible_provider_id_by_specialty": eligible_provider_id_by_specialty,
+        "eligible_ref_ids_by_specialty": eligible_ref_ids_by_specialty,
     }
 
 
