@@ -2941,6 +2941,7 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     count = params.get("count", 6)
     unread_count = params.get("unread_count", 2)
     urgent_count = params.get("urgent_count", 1)
+    require_target_in_waitlisted = params.get("require_target_in_waitlisted", False)
 
     courses = ctx.base.get("courses", [])
     if "announcements" not in ctx.base:
@@ -2981,6 +2982,56 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     # ── latest_announcement_id: most recent UNREAD by posted_at (fallback to any) ──
     latest_announcement_id = ""
     all_announcements = ctx.base.get("announcements", [])
+
+    # ── Enrollment-aware completion discriminator ──
+    # Some tasks must mark read ONLY the unread+urgent announcements that belong
+    # to a course the student is ACTIVELY enrolled in (status == "enrolled").
+    # Unread+urgent announcements in a waitlisted/dropped course are decoys that
+    # must stay unread, as are all non-urgent unread announcements. This forces
+    # the agent to cross-reference announcement priority against enrollment
+    # status rather than blindly using mark_all_read or "all unread".
+    enrollments = ctx.base.get("enrollments", [])
+    enrolled_course_ids = {
+        e["course_id"] for e in enrollments if e.get("status") == "enrolled"
+    }
+    non_enrolled_course_ids = {
+        e["course_id"] for e in enrollments if e.get("status") != "enrolled"
+    }
+
+    # Guarantee (when requested) that at least one unread+urgent announcement
+    # lands in a NON-enrolled (e.g. waitlisted) course so the enrollment
+    # cross-reference is load-bearing. Round-robin distribution does not always
+    # place an urgent announcement in the waitlisted course, so reassign one
+    # urgent+unread announcement to a non-enrolled course if none is there yet.
+    if require_target_in_waitlisted and non_enrolled_course_ids:
+        urgent_unread = [
+            a for a in all_announcements
+            if a["priority"] == "urgent" and not a.get("is_read", True)
+        ]
+        already_in_waitlisted = any(
+            a["course_id"] in non_enrolled_course_ids for a in urgent_unread
+        )
+        in_enrolled = [
+            a for a in urgent_unread if a["course_id"] in enrolled_course_ids
+        ]
+        # Only move one if there will still be >=1 urgent+unread left in an
+        # enrolled course (keeps the positive target set non-empty).
+        if not already_in_waitlisted and len(in_enrolled) >= 2:
+            target_waitlisted_cid = sorted(non_enrolled_course_ids)[0]
+            in_enrolled[-1]["course_id"] = target_waitlisted_cid
+
+    enrolled_unread_urgent_ids = [
+        a["id"] for a in all_announcements
+        if a["priority"] == "urgent"
+        and not a.get("is_read", True)
+        and a["course_id"] in enrolled_course_ids
+    ]
+    preserved_unread_ids = [
+        a["id"] for a in all_announcements
+        if not a.get("is_read", True)
+        and a["id"] not in set(enrolled_unread_urgent_ids)
+    ]
+
     if all_announcements:
         sorted_ann = sorted(
             all_announcements,
@@ -3009,6 +3060,9 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         "urgent_announcement_id": urgent_announcement_id or "",
         "latest_announcement_id": latest_announcement_id,
         "course_announcement_ids": course_announcement_ids,
+        "enrolled_unread_urgent_announcement_ids": ",".join(enrolled_unread_urgent_ids),
+        "preserved_unread_announcement_ids": ",".join(preserved_unread_ids),
+        "non_enrolled_course_ids": ",".join(sorted(non_enrolled_course_ids)),
     }
 
 
