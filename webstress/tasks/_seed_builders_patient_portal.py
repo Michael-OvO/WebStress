@@ -1095,7 +1095,8 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             interaction_pair (bool)
     Outputs: active_rx_ids, zero_refill_rx_id, expiring_rx_ids,
              expiring_zero_refill_rx_ids, interacting_rx_ids,
-             interacting_medications
+             interacting_medications, zero_refill_rx_ids,
+             zero_refill_medications
 
     Note on ``expiring_zero_refill_count``: forces the first N entries of
     the ``expiring_rx_ids`` subset to have ``refills_remaining == 0``. This
@@ -1161,6 +1162,14 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     active_rx_ids: list[str] = []
     zero_refill_rx_id: str | None = None
     zero_refill_medication: str = ""
+    # Full list of the dedicated zero-refill active prescriptions created by the
+    # ``zero_refill_count`` loop (NOT the expiring subset). Tasks that must
+    # renew *every* out-of-refills prescription (e.g. pp_request_renewal, which
+    # asks the agent to renew each medication that has 0 refills remaining)
+    # need the complete set to drive a bijection without recomputing the
+    # refills==0 filter inside a predicate (Class 6 set-precompute hazard).
+    zero_refill_rx_ids: list[str] = []
+    zero_refill_medications: list[str] = []
     target_rx_id: str | None = None
     expiring_rx_ids: list[str] = []
     expiring_zero_refill_rx_ids: list[str] = []
@@ -1278,6 +1287,8 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         rx = _make_rx(med, "active", 0, ctx.rng.randint(30, 180))
         ctx.base["prescriptions"].append(rx)
         active_rx_ids.append(rx["id"])
+        zero_refill_rx_ids.append(rx["id"])
+        zero_refill_medications.append(med["name"])
         if zero_refill_rx_id is None:
             zero_refill_rx_id = rx["id"]
             zero_refill_medication = med["name"]
@@ -1404,6 +1415,8 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         "active_at_default_rx_ids": active_at_default_rx_ids,
         "zero_refill_rx_id": zero_refill_rx_id,
         "zero_refill_medication": zero_refill_medication,
+        "zero_refill_rx_ids": zero_refill_rx_ids,
+        "zero_refill_medications": zero_refill_medications,
         "target_rx_id": target_rx_id,
         "expiring_rx_ids": expiring_rx_ids,
         "expiring_zero_refill_rx_ids": expiring_zero_refill_rx_ids,
