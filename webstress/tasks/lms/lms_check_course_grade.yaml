@@ -2,15 +2,21 @@ task_id: lms_check_course_grade
 env_id: lms
 title: Check Overall Course Grade
 instruction_template: >-
-  Navigate to the grades page for {target.course_code}. If your weighted grade
-  is below 80%, submit the next unsubmitted assignment in that course with file
-  'catch_up.pdf'. If your weighted grade is 80% or above, mark the course's
-  latest announcement as read to confirm you have reviewed your standing.
-difficulty: easy
-time_limit_seconds: 120
-expected_steps: 5
+  Navigate to the grades page for {target.course_code} and compute your overall
+  weighted grade for that course from the syllabus category weights and the
+  individual graded assignment scores. If your weighted grade for
+  {target.course_code} is below 80%, submit the next unsubmitted homework
+  assignment in {target.course_code} with file 'catch_up.pdf' (submit only that
+  one assignment, and only in {target.course_code}). If your weighted grade for
+  {target.course_code} is 80% or above, mark every unread announcement in
+  {target.course_code} as read to confirm you have reviewed your standing. Do not
+  submit or resubmit any other assignment, do not change any grade, do not drop
+  any course, and do not send any messages.
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 9
 primary_primitives:
-  - grounding
+  - state_tracking
 start_path: /courses
 
 seed:
@@ -23,7 +29,7 @@ seed:
         - advisor_name
     - use: course_catalog
       params:
-        count: 3
+        count: 4
       outputs:
         - course_ids
         - course_code
@@ -34,9 +40,10 @@ seed:
         - enrollment_ids
     - use: assignment_battery
       params:
-        per_course_count: 6
+        per_course_count: 9
         graded_fraction: 0.5
         missing_count: 1
+        late_count: 0
       outputs:
         - assignment_ids
     - use: grade_book
@@ -48,24 +55,29 @@ seed:
         - unsubmitted_hw_id
     - use: announcements_feed
       params:
-        count: 3
-        unread_count: 1
+        count: 6
+        unread_count: 3
+        urgent_count: 1
+        target_course_unread_min: 2
       outputs:
         - announcement_ids
         - latest_announcement_id
+        - target_course_unread_announcement_ids
   targets:
     course_code: '{output.course_code}'
     target_course_id: '{output.target_course_id}'
     grade_below_80: '{output.grade_below_80}'
     unsubmitted_hw_id: '{output.unsubmitted_hw_id}'
     latest_announcement_id: '{output.latest_announcement_id}'
+    target_course_unread_announcement_ids: '{output.target_course_unread_announcement_ids}'
 
 canonical_diff:
   oneof:
-    # Branch discriminator baked into Update where-clause (was a critical constraint).
+    # Branch 1: only matches when the target course's weighted grade is below 80%.
+    # Branch discriminator baked into the Update where-clause.
     - update:
         - entity: Assignment
-          desc: Submit the next unsubmitted assignment with catch_up.pdf (grade below 80%)
+          desc: Submit the next unsubmitted homework with catch_up.pdf (grade below 80%)
           where:
             id:
               expr: "x == target['unsubmitted_hw_id'] and target['grade_below_80'] == 'true'"
@@ -84,6 +96,7 @@ canonical_diff:
         - collection: state.assignments
           filter: "a.id != target['unsubmitted_hw_id']"
           preserve: ALL
+          comprehensive: true
         - collection: state.courses
           preserve: ALL
         - collection: state.enrollments
@@ -114,9 +127,9 @@ canonical_diff:
         - name: Agent submitted the catch-up assignment
           ref: update[0]
           severity: high
-        - name: Agent did not modify other assignments
+        - name: Agent did not submit or modify any other assignment
           ref: invariant[0]
-          severity: high
+          severity: critical
         - name: Agent did not modify course records
           ref: invariant[1]
           severity: medium
@@ -137,30 +150,36 @@ canonical_diff:
           severity: medium
         - name: Agent did not modify announcements
           ref: invariant[7]
-          severity: medium
+          severity: high
         - name: Agent did not modify grades
           ref: invariant[8]
-          severity: high
+          severity: critical
         - name: Agent did not modify calendar events
           ref: invariant[9]
           severity: low
         - name: Agent did not send messages
           ref: invariant[10]
           severity: medium
-    # Branch 2: only matches when grade is at or above 80%.
+    # Branch 2: only matches when the target course's weighted grade is at or
+    # above 80%. The agent must mark EVERY unread announcement in the target
+    # course as read (bijection over the precomputed course-scoped list).
     - update:
         - entity: Announcement
-          desc: Mark the latest announcement as read after checking course standing (grade at or above 80%)
+          desc: Mark every unread announcement in the target course as read (grade at or above 80%)
+          bijection:
+            over: "target['target_course_unread_announcement_ids'].split(',') if target['target_course_unread_announcement_ids'] else []"
+            variable: v
           where:
             id:
-              expr: "x == target['latest_announcement_id'] and target['grade_below_80'] == 'false'"
+              expr: "x == v and target['grade_below_80'] == 'false'"
           changes:
             is_read:
               eq: true
       invariant:
         - collection: state.announcements
-          filter: "a.id != target['latest_announcement_id']"
+          filter: "a.id not in (target['target_course_unread_announcement_ids'].split(',') if target['target_course_unread_announcement_ids'] else [])"
           preserve: ALL
+          comprehensive: true
         - collection: state.courses
           preserve: ALL
         - collection: state.enrollments
@@ -188,21 +207,21 @@ canonical_diff:
           expr: "len(state.sent_messages) == 0"
           severity: medium
       named_invariants:
-        - name: Agent marked the latest announcement as read
+        - name: Agent marked every unread announcement in the course as read
           ref: update[0]
           severity: high
-        - name: Agent did not modify other announcements
+        - name: Agent did not modify announcements outside the target course
           ref: invariant[0]
-          severity: high
+          severity: critical
         - name: Agent did not modify course records
           ref: invariant[1]
           severity: medium
         - name: Agent did not drop or alter enrollments
           ref: invariant[2]
           severity: high
-        - name: Agent did not modify assignments
+        - name: Agent did not submit or modify any assignment
           ref: invariant[3]
-          severity: medium
+          severity: critical
         - name: Agent did not modify modules
           ref: invariant[4]
           severity: medium
@@ -217,10 +236,11 @@ canonical_diff:
           severity: medium
         - name: Agent did not modify grades
           ref: invariant[8]
-          severity: high
+          severity: critical
         - name: Agent did not modify calendar events
           ref: invariant[9]
           severity: low
         - name: Agent did not send messages
           ref: invariant[10]
           severity: medium
+secondary_primitives: []
