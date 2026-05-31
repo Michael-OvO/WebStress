@@ -1,11 +1,15 @@
 task_id: pp_review_eob
 env_id: patient_portal
-title: Review EOB and Pay Most Recent Claim
-instruction_template: Review the Explanation of Benefits for your most recent approved claim and pay the patient responsibility
-  on that claim in full. Do not pay or appeal any other claim, and do not send any messages.
-difficulty: medium
-time_limit_seconds: 200
-expected_steps: 10
+title: Review EOBs and Settle Reviewable Approved Balances
+instruction_template: Review the Explanation of Benefits on your insurance claims.
+  Pay the patient responsibility in full on every approved claim that has an available
+  EOB and a patient-responsibility balance greater than zero, using the claim pay
+  action. Do not pay an approved claim whose EOB is not available, do not pay an approved
+  claim that has no patient-responsibility balance, do not pay or appeal any denied
+  or processing claim, and do not send any messages.
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 18
 primary_primitives:
 - state_tracking
 start_path: /billing
@@ -43,34 +47,49 @@ seed:
   - use: appointment_history
     params:
       upcoming_count: 1
-      completed_count: 3
+      completed_count: 6
     outputs:
     - completed_ids
   - use: insurance_claims
     params:
       approved_count: 3
+      approved_no_eob_count: 2
+      approved_zero_resp_count: 2
       denied_count: 3
       processing_count: 1
       with_eob: true
     outputs:
     - approved_claim_ids
     - denied_claim_ids
+    - processing_claim_ids
+    - payable_approved_claim_ids
     - total_patient_responsibility
   targets:
     approved_claim_ids: '{output.approved_claim_ids}'
+    payable_approved_claim_ids: '{output.payable_approved_claim_ids}'
+    denied_claim_ids: '{output.denied_claim_ids}'
 canonical_diff:
   update:
   - entity: InsuranceClaim
-    desc: Pay the most recent approved claim in full (zero out patient_responsibility)
+    desc: Pay the patient responsibility in full (zero it out) on every approved claim
+      that has an available EOB and a positive balance owed
+    bijection:
+      over: "target['payable_approved_claim_ids']"
+      variable: v
     where:
       id:
-        expr: "x == max(\n  target['approved_claim_ids'],\n  key=lambda cid: (initial.get_claim(cid).service_date, cid),\n\
-          )"
+        expr: "x == v"
     changes:
       patient_responsibility:
         eq: 0
   invariant:
+  # Every claim NOT in the payable-approved set must be preserved untouched:
+  # approved-but-no-EOB claims, fully-covered approved claims, all denied
+  # claims (appeal/pay temptation), the processing claim, and any injected
+  # decoy claims. Filter scope exposes `a` + `target` only (hazard), so the
+  # scalar seed list is used directly rather than recomputing the filter.
   - collection: state.claims
+    filter: "a.id not in target['payable_approved_claim_ids']"
     preserve: ALL
   - collection: state.appointments
     preserve: ALL
@@ -91,7 +110,9 @@ canonical_diff:
   - collection: state.patient
     preserve: ALL
   named_invariants:
-  - name: Agent did not pay, appeal, or modify other insurance claims
+  - name: Agent did not pay, appeal, or otherwise modify any claim outside the payable
+      approved set (no-EOB approved, fully-covered approved, denied, or processing
+      claims)
     ref: invariant[0]
     severity: critical
   - name: Agent did not create, cancel, or modify appointments
@@ -112,4 +133,7 @@ canonical_diff:
   - name: Agent did not touch referrals
     ref: invariant[6]
     severity: high
+  - name: Agent paid exactly the payable approved claims (no more, no fewer)
+    ref: update[0]
+    severity: critical
 secondary_primitives: []
