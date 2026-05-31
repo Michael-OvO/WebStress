@@ -3376,6 +3376,34 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
             peer_review_assignment_id_list.append(aid)
             seen_aid.add(aid)
 
+    # ------------------------------------------------------------------
+    # Precomputed "redo" rubric scores (LMS-difficulty lever).
+    #
+    # Returned-for-revision reviews all carry the SAME previous_rubric_scores
+    # (clarity=2, depth=1; originality unscored). A redo task can require the
+    # agent to RE-DERIVE the corrected scores via a deterministic published
+    # rule instead of supplying "any 1-5 values". The rule:
+    #   * For each rubric criterion that already has a previous score, the
+    #     corrected score is exactly (previous + 2), capped at 5.
+    #   * For any criterion that has NO previous score, the corrected score
+    #     is exactly 3.
+    # Because every returned review shares the same previous_rubric_scores,
+    # the corrected mapping is uniform and is exposed as three scalar targets
+    # plus the canonical assignment-rubric order. The agent must apply the
+    # rule to land the exact integers; "any valid 1-5" no longer passes.
+    canonical_prev = {rubric_items[0].criterion: 2}
+    if len(rubric_items) > 1:
+        canonical_prev[rubric_items[1].criterion] = 1
+    required_redo_scores: dict[str, int] = {}
+    for item in rubric_items:
+        prev = canonical_prev.get(item.criterion)
+        if prev is None:
+            required_redo_scores[item.criterion] = 3
+        else:
+            required_redo_scores[item.criterion] = min(5, prev + 2)
+
+    rubric_criteria_order = [item.criterion for item in rubric_items]
+
     return {
         "review_ids": review_ids,
         "pending_review_ids": pending_review_ids,
@@ -3383,4 +3411,8 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
         "returned_review_ids": returned_review_ids,
         "target_review_id": pending_review_ids[0] if pending_review_ids else (review_ids[0] if review_ids else ""),
         "peer_review_assignment_ids": peer_review_assignment_id_list,
+        "rubric_criteria": rubric_criteria_order,
+        "req_score_clarity": required_redo_scores.get("clarity", 3),
+        "req_score_depth": required_redo_scores.get("depth", 3),
+        "req_score_originality": required_redo_scores.get("originality", 3),
     }

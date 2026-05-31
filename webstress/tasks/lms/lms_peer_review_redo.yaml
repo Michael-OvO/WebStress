@@ -1,14 +1,18 @@
 task_id: lms_peer_review_redo
 env_id: lms
 title: Peer Review Quality Audit and Redo
-instruction_template: Your previously submitted peer review for the assignment in
-  {target.course_code} was returned because it was incomplete. Review the assignment
-  rubric carefully, then redo the peer review by scoring all rubric criteria (clarity,
-  depth, originality) and providing detailed comments of at least 50 characters. Your
-  previous scores are visible for comparison but you must update all of them.
+instruction_template: Three of your submitted peer reviews for the assignment in {target.course_code}
+  were returned for revision because they were incomplete. Open every returned review
+  and redo it by re-scoring all three rubric criteria (clarity, depth, originality)
+  using this exact rule, computed from the previous scores shown on each review. For
+  any criterion that already has a previous score, the corrected score is exactly two
+  points higher than the previous score, capped at a maximum of 5. For any criterion
+  that has no previous score, the corrected score is exactly 3. Write a fresh comment
+  of at least 80 characters for each review and submit all three. Do not touch any
+  peer review that was not returned for revision, and do not send any messages.
 difficulty: expert
-time_limit_seconds: 360
-expected_steps: 22
+time_limit_seconds: 440
+expected_steps: 30
 primary_primitives:
 - verification
 start_path: /peer-reviews
@@ -45,48 +49,67 @@ seed:
     - grade_ids
   - use: peer_review_assignments
     params:
-      count: 3
+      count: 6
       course_id: '{output.target_course_id}'
       statuses:
       - in_progress
       - assigned
       - submitted
-      returned_review_count: 1
+      - assigned
+      - submitted
+      - in_progress
+      returned_review_count: 3
     outputs:
     - review_ids
     - pending_review_ids
     - completed_review_ids
     - returned_review_ids
+    - peer_review_assignment_ids
+    - rubric_criteria
+    - req_score_clarity
+    - req_score_depth
+    - req_score_originality
   targets:
     course_code: '{output.course_code}'
     pending_review_ids: '{output.pending_review_ids}'
     completed_review_ids: '{output.completed_review_ids}'
     returned_review_ids: '{output.returned_review_ids}'
+    peer_review_assignment_ids: '{output.peer_review_assignment_ids}'
+    rubric_criteria: '{output.rubric_criteria}'
+    req_score_clarity: '{output.req_score_clarity}'
+    req_score_depth: '{output.req_score_depth}'
+    req_score_originality: '{output.req_score_originality}'
 canonical_diff:
   update:
     - entity: PeerReview
-      desc: Redo the returned peer review with all rubric scores and a detailed comment
+      desc: Redo every returned peer review with the rule-derived rubric scores and a fresh detailed comment
+      bijection:
+        over: "[r.strip() for r in target['returned_review_ids'].split(',') if r.strip()]"
+        variable: v
       where:
         id:
-          expr: "x == target['returned_review_ids'].split(',')[0]"
+          expr: "x == v.strip()"
       changes:
         rubric_scores:
           expr: >-
             len(x) == 3
             and set(x) == {'clarity', 'depth', 'originality'}
-            and all(1 <= v <= 5 for v in x.values())
+            and int(x['clarity']) == int(target['req_score_clarity'])
+            and int(x['depth']) == int(target['req_score_depth'])
+            and int(x['originality']) == int(target['req_score_originality'])
         comments:
-          expr: "len(x.strip()) >= 50"
+          expr: "len(x.strip()) >= 80"
         status: {eq: submitted}
   invariant:
     - collection: state.peer_reviews
-      filter: "a.id != target['returned_review_ids'].split(',')[0]"
+      filter: "a.id not in [r.strip() for r in target['returned_review_ids'].split(',') if r.strip()]"
       preserve: ALL
     - collection: state.courses
       preserve: ALL
     - collection: state.enrollments
       preserve: ALL
     - collection: state.assignments
+      filter: "a.id not in [aid.strip() for aid in (target.get('peer_review_assignment_ids', '') or '').split(',') if aid.strip()]"
       preserve: ALL
     - collection: state.modules
       preserve: ALL
@@ -105,20 +128,23 @@ canonical_diff:
   constraints:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
-    severity: medium
+    severity: critical
   named_invariants:
-    - name: Agent did not modify other peer reviews
+    - name: Agent redid every returned peer review with the rule-derived scores
+      ref: update[0]
+      severity: critical
+    - name: Agent did not modify peer reviews that were not returned for revision
       ref: invariant[0]
-      severity: high
+      severity: critical
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium
     - name: Agent did not drop or alter enrollments
       ref: invariant[2]
       severity: high
-    - name: Agent did not modify assignments
+    - name: Agent did not modify unrelated assignments
       ref: invariant[3]
-      severity: medium
+      severity: high
     - name: Agent did not modify modules
       ref: invariant[4]
       severity: medium
@@ -139,5 +165,5 @@ canonical_diff:
       severity: low
     - name: Agent did not send messages
       ref: invariant[10]
-      severity: medium
+      severity: critical
 secondary_primitives: []
