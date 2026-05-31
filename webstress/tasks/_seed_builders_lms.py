@@ -2676,6 +2676,9 @@ def _build_module_sequence(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
     count : int              -- number of modules (default 5)
     chain_type : str         -- "linear", "branching", or "mixed" (default "linear")
     completed_count : int    -- how many modules are already completed (default 2)
+    content_items_per_module : int -- total content items per module (default 2,
+                                      min effectively 2; values >2 append
+                                      quiz/reading/external_link content)
     """
     course_id = params.get("course_id", "")
     count = params.get("count", 5)
@@ -2734,7 +2737,13 @@ def _build_module_sequence(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
         else:
             status = "locked"
 
-        # Content items
+        # Content items. The base two (reading + video) are always present; an
+        # optional `content_items_per_module` knob appends additional graded
+        # content (quiz / reading / external_link rotation) so a task can demand
+        # more per-module work without changing the unlock semantics. Seeded
+        # items default to completed only for already-completed modules
+        # (i < completed_count); every item on an incomplete module starts
+        # uncompleted so the agent must finish all of them before marking done.
         content_items = [
             ContentItem(
                 title=f"Reading: Chapter {i + 1}",
@@ -2748,6 +2757,17 @@ def _build_module_sequence(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
                 linked_assignment_id=(linked_assignment_id or None) if i == completed_count else None,
             ),
         ]
+        extra_items = max(0, int(params.get("content_items_per_module", 2)) - 2)
+        _extra_cycle = ["quiz", "reading", "external_link"]
+        for j in range(extra_items):
+            item_type = _extra_cycle[j % len(_extra_cycle)]
+            content_items.append(
+                ContentItem(
+                    title=f"{item_type.replace('_', ' ').title()} {i + 1}.{j + 1}",
+                    type=item_type,
+                    completed=i < completed_count,
+                )
+            )
 
         module = Module(
             id=module_id,
