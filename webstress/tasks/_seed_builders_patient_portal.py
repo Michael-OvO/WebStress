@@ -1895,6 +1895,157 @@ def build_message_threads(ctx: PatientPortalSeedContext, params: dict[str, Any])
 
 
 # ---------------------------------------------------------------------------
+# 7b. insurance_card_message
+# ---------------------------------------------------------------------------
+
+# Deterministic carrier/plan pools for the new-insurance scenario. These are
+# distinct from the tier-derived plan names in `patient_profile` so the
+# authoritative new plan is unambiguously different from the patient's
+# existing (seeded) plan.
+_INSURANCE_CARRIERS: list[dict[str, str]] = [
+    {"carrier": "Aetna", "tier": "PPO Silver", "prefix": "AET"},
+    {"carrier": "Cigna", "tier": "HMO Gold", "prefix": "CIG"},
+    {"carrier": "United Healthcare", "tier": "PPO Platinum", "prefix": "UHC"},
+    {"carrier": "Humana", "tier": "EPO Bronze", "prefix": "HUM"},
+    {"carrier": "Kaiser Permanente", "tier": "HMO Plus", "prefix": "KP"},
+]
+
+
+@_register("insurance_card_message")
+def build_insurance_card_message(ctx: PatientPortalSeedContext, params: dict[str, Any]) -> dict[str, Any]:
+    """Seed two billing messages that carry insurance-card details.
+
+    The *current* (authoritative) message is the MOST RECENT billing message in
+    the inbox and contains the new plan name, member id, group number, and an
+    updated contact phone/email. An *older* (stale, superseded) message carries
+    DIFFERENT outdated values — a grounding decoy. Neither value set appears in
+    the task instruction, so the agent must read the inbox, disambiguate the
+    most-recent billing message from the stale one, and extract the exact
+    strings to apply.
+
+    Must run AFTER ``provider_directory`` (needs a billing/PCP provider) and
+    is independent of ``message_threads`` (it appends its own messages).
+
+    Params:
+        stale_offset_days (int): how many days BEFORE the authoritative message
+            the stale decoy is timestamped (default 21).
+        current_offset_days (int): how many days BEFORE ``ctx.now`` the
+            authoritative message is timestamped (default 1).
+    Outputs: new_plan_name, new_member_id, new_group_number, new_phone,
+             new_email, stale_plan_name, stale_member_id, stale_group_number,
+             current_card_msg_id, stale_card_msg_id, billing_provider_id
+    """
+    stale_offset_days = int(params.get("stale_offset_days", 21))
+    current_offset_days = int(params.get("current_offset_days", 1))
+
+    providers = ctx.base.get("providers", [])
+    billing_prov = next(
+        (p for p in providers if p.get("specialty") == "billing"), None
+    )
+    pcp_id = ctx.base.get("patient", {}).get("pcp_id", "prov_1")
+    billing_provider_id = billing_prov["id"] if billing_prov else pcp_id
+
+    if "messages" not in ctx.base:
+        ctx.base["messages"] = []
+
+    # Pick two DISTINCT carriers deterministically: index 0 = authoritative,
+    # index 1 = stale decoy.
+    pool = list(_INSURANCE_CARRIERS)
+    ctx.rng.shuffle(pool)
+    current = pool[0]
+    stale = pool[1]
+
+    def _plan(c: dict[str, str]) -> str:
+        return f"{c['carrier']} {c['tier']}"
+
+    def _member(c: dict[str, str]) -> str:
+        return f"{c['prefix']}-{ctx.rng.randint(1000000, 9999999)}"
+
+    def _group(c: dict[str, str]) -> str:
+        return f"GRP-{ctx.rng.randint(10000, 99999)}"
+
+    new_plan_name = _plan(current)
+    new_member_id = _member(current)
+    new_group_number = _group(current)
+    new_phone = f"(555) {ctx.rng.randint(200, 999)}-{ctx.rng.randint(1000, 9999)}"
+    # Deterministic new contact email derived from the patient name + new
+    # carrier domain so it is clearly distinct from the patient's seeded email.
+    domain = "".join(ch for ch in current["carrier"].lower() if ch.isalpha()) + "mail.com"
+    patient_name = ctx.base.get("patient", {}).get("name", "member")
+    new_email = ctx.email_for_name(patient_name, domain)
+
+    stale_plan_name = _plan(stale)
+    stale_member_id = _member(stale)
+    stale_group_number = _group(stale)
+    stale_phone = f"(555) {ctx.rng.randint(200, 999)}-{ctx.rng.randint(1000, 9999)}"
+
+    current_ts = ctx.now - timedelta(days=current_offset_days)
+    stale_ts = ctx.now - timedelta(days=stale_offset_days)
+
+    stale_msg_id = ctx.next_id("msg")
+    stale_thread_id = ctx.next_id("thread")
+    stale_body = (
+        "Insurance Card Update (SUPERSEDED):\n"
+        f"Plan name: {stale_plan_name}\n"
+        f"Member ID: {stale_member_id}\n"
+        f"Group number: {stale_group_number}\n"
+        f"Benefits hotline: {stale_phone}\n"
+        "NOTE: This card was issued in a prior enrollment period and has been "
+        "replaced. Please disregard if you have received a newer card update."
+    )
+    ctx.base["messages"].append({
+        "id": stale_msg_id,
+        "from_type": "provider",
+        "provider_id": billing_provider_id,
+        "subject": "Insurance Card Update",
+        "body": stale_body,
+        "thread_id": stale_thread_id,
+        "timestamp": stale_ts.isoformat(),
+        "is_read": True,
+        "category": "billing",
+    })
+
+    current_msg_id = ctx.next_id("msg")
+    current_thread_id = ctx.next_id("thread")
+    current_body = (
+        "Your New Insurance Card — Effective Immediately:\n"
+        f"Plan name: {new_plan_name}\n"
+        f"Member ID: {new_member_id}\n"
+        f"Group number: {new_group_number}\n"
+        "Please also update your contact details on file to the ones we have "
+        "for your new plan:\n"
+        f"Contact phone: {new_phone}\n"
+        f"Contact email: {new_email}\n"
+        "Update your profile so claims route correctly under the new plan."
+    )
+    ctx.base["messages"].append({
+        "id": current_msg_id,
+        "from_type": "provider",
+        "provider_id": billing_provider_id,
+        "subject": "New Insurance Card on File",
+        "body": current_body,
+        "thread_id": current_thread_id,
+        "timestamp": current_ts.isoformat(),
+        "is_read": False,
+        "category": "billing",
+    })
+
+    return {
+        "new_plan_name": new_plan_name,
+        "new_member_id": new_member_id,
+        "new_group_number": new_group_number,
+        "new_phone": new_phone,
+        "new_email": new_email,
+        "stale_plan_name": stale_plan_name,
+        "stale_member_id": stale_member_id,
+        "stale_group_number": stale_group_number,
+        "current_card_msg_id": current_msg_id,
+        "stale_card_msg_id": stale_msg_id,
+        "billing_provider_id": billing_provider_id,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 8. referral_chain
 # ---------------------------------------------------------------------------
 
