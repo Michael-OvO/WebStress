@@ -1,13 +1,23 @@
 task_id: lms_submit_late
 env_id: lms
-title: Submit Late Assignment
-instruction_template: Submit the late assignment "{target.assignment_title}" for {target.course_code}.
-  Upload a file named "{target.file_name}".
-difficulty: medium
-time_limit_seconds: 180
-expected_steps: 10
+title: Submit the Sole Recoverable Late Assignment
+instruction_template: 'In {target.course_code_1}, {target.course_code_2}, and {target.course_code_3}
+  you have several past-due assignments that you never submitted. Each course''s syllabus
+  sets a late-submission window (a maximum number of days past the due date during
+  which late work is still accepted). Exactly one of your past-due, never-submitted
+  assignments is still inside its course''s late window; every other past-due, never-submitted
+  assignment is already outside its window and can no longer be accepted. Submit that
+  one assignment. Name the uploaded file using the assignment''s course code in capital
+  letters followed by "_late_submission.pdf" (for example, a course coded ABC123 would
+  use ABC123_late_submission.pdf). Do not submit, resubmit, or otherwise modify any
+  other assignment, and do not send any messages.'
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 18
 primary_primitives:
 - state_tracking
+secondary_primitives:
+- verification
 start_path: /courses
 seed:
   distractors: 1
@@ -22,19 +32,25 @@ seed:
       must_include:
       - CS101
       - MATH201
+      vary_late_policies: true
     outputs:
     - course_ids
     - course_codes
+    - course_code_1
+    - course_code_2
   - use: enrollment_set
     params: {}
     outputs:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 6
-      graded_fraction: 0.5
-      late_count: 0
-      missing_count: 2
+      per_course_count: 7
+      graded_fraction: 0.45
+      late_count: 1
+      missing_count: 3
+      unrecoverable_missing_count: 2
+      sole_recoverable_missing: true
+      target_recoverable_missing: true
       target_assignment_status: not_submitted
     outputs:
     - assignment_ids
@@ -43,32 +59,34 @@ seed:
     - target_course_id
     - target_course_code
     - decoy_assignment_id
+    - sole_recoverable_missing_id
     - file_name
-  - use: grade_book
-    params: {}
-    outputs:
-    - grade_ids
   targets:
     assignment_title: '{output.target_assignment_title}'
     course_code: '{output.target_course_code}'
+    course_code_1: '{output.course_code_1}'
+    course_code_2: '{output.course_code_2}'
+    course_code_3: '{output.course_codes[2]}'
     target_assignment_id: '{output.target_assignment_id}'
     target_course_id: '{output.target_course_id}'
     decoy_assignment_id: '{output.decoy_assignment_id}'
+    sole_recoverable_missing_id: '{output.sole_recoverable_missing_id}'
     file_name: '{output.file_name}'
+    required_file_name: '{output.target_course_code}_late_submission.pdf'
 canonical_diff:
   update:
   - entity: Assignment
-    desc: Submit the specified late assignment with the required file name
+    desc: Submit the sole recoverable past-due assignment with the required file name
     where:
       id:
         expr: "x == target['target_assignment_id']"
+      submission_status:
+        expr: "initial is None or x == 'not_submitted'"
     changes:
       submission_status:
-        in:
-        - submitted
-        - late
+        eq: late
       file_name:
-        expr: "x == target['file_name']"
+        expr: "x == target['required_file_name']"
       attempt_count:
         expr: "x >= 1"
       submitted_at:
@@ -101,10 +119,22 @@ canonical_diff:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
-  named_invariants:
-  - name: Agent did not modify other assignments
-    ref: invariant[0]
+  - desc: The decoy assignment in another course was left untouched (status and attempt
+      count unchanged from the initial state)
+    expr: "any(a.id == target['decoy_assignment_id'] and a.submission_status == next((b.submission_status
+      for b in initial.assignments if b.id == a.id), None) and a.attempt_count == next((b.attempt_count
+      for b in initial.assignments if b.id == a.id), -1) for a in state.assignments)"
     severity: high
+  - desc: Only the targeted assignment changed status from its initial not_submitted
+      state (no wrong or extra submissions)
+    expr: "len([a for a in state.assignments if a.submission_status != next((b.submission_status
+      for b in initial.assignments if b.id == a.id), a.submission_status) and a.id
+      != target['target_assignment_id']]) == 0"
+    severity: critical
+  named_invariants:
+  - name: Agent did not modify any other assignment (no wrong or extra submissions)
+    ref: invariant[0]
+    severity: critical
   - name: Agent did not modify course records
     ref: invariant[1]
     severity: medium
@@ -135,4 +165,3 @@ canonical_diff:
   - name: Agent did not send messages
     ref: invariant[10]
     severity: medium
-secondary_primitives: []
