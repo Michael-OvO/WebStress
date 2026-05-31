@@ -1,12 +1,14 @@
 task_id: pp_claim_audit
 env_id: patient_portal
 title: Insurance Claim Audit
-instruction_template: Review all your insurance claims. Identify all denied claims
-  that are still eligible for appeal (appeal deadline has not passed and an EOB is
-  available). From those eligible claims, select the top 3 by patient responsibility
-  amount (highest first; if two claims tie, break the tie by claim ID). Appeal exactly
-  those 3 claims using the claim appeal action. Do not appeal any other claim and
-  do not send any messages.
+instruction_template: Review all your insurance claims. A denied claim is eligible
+  for appeal only if it currently has the status denied, an Explanation of Benefits
+  (EOB) is available for it, and its appeal deadline has not yet passed. From the
+  set of claims that satisfy all three conditions, select the top 3 by patient responsibility
+  amount (highest first; if two claims tie on patient responsibility, break the tie
+  by ascending claim ID). Appeal exactly those 3 claims using the claim appeal action.
+  Do not appeal any claim outside that set of 3. Do not pay any claim. Do not modify
+  any other claim and do not send any messages.
 difficulty: expert
 time_limit_seconds: 480
 expected_steps: 40
@@ -54,13 +56,17 @@ seed:
     - completed_ids
   - use: insurance_claims
     params:
-      approved_count: 2
-      denied_count: 5
+      approved_count: 3
+      denied_count: 6
+      processing_count: 2
+      denied_no_eob_count: 3
+      denied_expired_count: 3
       with_eob: true
       near_appeal_deadline: true
     outputs:
     - denied_claim_ids
     - appealable_claim_id
+    - appealable_claim_ids
     - approved_claim_ids
     - top_3_appealable_claim_ids
   - use: referral_chain
@@ -73,6 +79,7 @@ seed:
     pcp_id: '{output.pcp_id}'
     denied_claim_ids: '{output.denied_claim_ids}'
     appealable_claim_id: '{output.appealable_claim_id}'
+    appealable_claim_ids: '{output.appealable_claim_ids}'
     approved_claim_ids: '{output.approved_claim_ids}'
     top_3_appealable_claim_ids: '{output.top_3_appealable_claim_ids}'
 canonical_diff:
@@ -85,8 +92,39 @@ canonical_diff:
       where:
         id:
           expr: "x == v"
+        # The matched claim must have been denied BEFORE the appeal (the appeal
+        # route only accepts denied claims). Pins the bijection to the correct
+        # pre-state so an appeal of a non-denied lookalike cannot satisfy it.
+        status:
+          expr: "x == 'denied'"
       changes:
         status: {eq: "appealed"}
+  constraints:
+    # Honest forbidden-action clauses mapped onto post-state checks. The
+    # eligible appealable set is precomputed (target['appealable_claim_ids']);
+    # the agent must independently re-derive it (denied AND eob AND
+    # appeal_deadline >= now) to avoid the high-patient-responsibility decoys
+    # that are denied-but-ineligible (no EOB, or already-expired deadline).
+    - desc: "Exactly 3 claims are in the appealed status (no more, no fewer)"
+      expr: "len([c for c in state.claims if c.status == 'appealed']) == 3"
+      severity: critical
+    - desc: "Every newly-appealed claim is in the eligible appealable set (not an ineligible denied lookalike)"
+      expr: >-
+        all(
+          c.id in target['appealable_claim_ids']
+          for c in state.claims
+          if c.status == 'appealed'
+        )
+      severity: critical
+    - desc: "No claim was paid (every claim's patient_responsibility is preserved)"
+      expr: >-
+        all(
+          Decimal(str(c.patient_responsibility)) == Decimal(str(ic.patient_responsibility))
+          for c in state.claims
+          for ic in initial.claims
+          if c.id == ic.id
+        )
+      severity: critical
   invariant:
     # Every claim NOT in the top-3-appealable set must be preserved.
     # Filter scope exposes `a` + `target` only — no `initial`, no lambdas —
@@ -111,7 +149,7 @@ canonical_diff:
     - collection: state.providers
       preserve: ALL
   named_invariants:
-    - name: "Agent did not appeal, modify, or pay any claim outside the top-3 appealable set"
+    - name: "Agent did not appeal, pay, or modify any claim outside the top-3 appealable set"
       ref: invariant[0]
       severity: critical
     - name: "Agent did not create, cancel, or modify appointments"

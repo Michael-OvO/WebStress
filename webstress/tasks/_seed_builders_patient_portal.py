@@ -3259,6 +3259,14 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # than acting on every denied claim. Backward-compatible: defaults to 0.
     expired_denied_count = params.get("expired_denied_count", 0)
     no_eob_denied_count = params.get("no_eob_denied_count", 0)
+    # Additional denied claims that LOOK appealable (status == denied) but are
+    # NOT eligible, forcing the agent to apply the full eligibility filter
+    # (denied AND eob_available AND appeal_deadline >= now) rather than acting
+    # on every denied claim. `denied_no_eob_count` denied claims have no EOB;
+    # `denied_expired_count` denied claims have an already-passed appeal
+    # deadline (and DO carry an EOB so the deadline is the only disqualifier).
+    denied_no_eob_count = params.get("denied_no_eob_count", 0)
+    denied_expired_count = params.get("denied_expired_count", 0)
 
     if "claims" not in ctx.base:
         ctx.base["claims"] = []
@@ -3443,6 +3451,25 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         denied_claim_ids.append(claim["id"])
         ineligible_denied_ids.append(claim["id"])
 
+    # Denied-but-INELIGIBLE claims: no EOB available. These are denied (so they
+    # look appealable by status) but the appeal route rejects them ("EOB is not
+    # yet available"). They carry a high patient_responsibility so a top-K-by-PR
+    # selection that ignores the eob filter would wrongly pick them up.
+    for _ in range(denied_no_eob_count):
+        claim = _make_claim("denied", ctx.rng.randint(30, 60), eob=False)
+        ctx.base["claims"].append(claim)
+        denied_claim_ids.append(claim["id"])
+        ineligible_denied_ids.append(claim["id"])
+
+    # Denied-but-INELIGIBLE claims: appeal deadline already passed. They DO
+    # carry an EOB, so only the (negative) deadline disqualifies them; the
+    # appeal route rejects them ("Appeal deadline has passed").
+    for _ in range(denied_expired_count):
+        claim = _make_claim("denied", -ctx.rng.randint(5, 40), eob=True)
+        ctx.base["claims"].append(claim)
+        denied_claim_ids.append(claim["id"])
+        ineligible_denied_ids.append(claim["id"])
+
     # Processing claims
     for _ in range(processing_count):
         claim = _make_claim("processing", ctx.rng.randint(60, 120))
@@ -3608,6 +3635,7 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         "denied_claim_ids": denied_claim_ids,
         "processing_claim_ids": processing_claim_ids,
         "appealable_claim_id": appealable_claim_id,
+        "appealable_claim_ids": appealable_ids_sorted,
         "most_recent_denied_claim_id": most_recent_denied_claim_id,
         "most_recent_approved_claim_id": most_recent_approved_claim_id,
         "most_recent_approved_patient_responsibility": (
