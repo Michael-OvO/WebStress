@@ -594,9 +594,42 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         if pcp_prov:
             ctx.outputs["pcp_name"] = pcp_prov["name"]
 
+    # Derived: for each specialty, the globally-earliest available slot across
+    # ALL providers of that specialty. Tasks that ask the agent to book "the
+    # next available <specialty> slot" when there are MULTIPLE providers of
+    # that specialty need a scalar answer that disambiguates BOTH the datetime
+    # AND the owning provider — comparing only `x in providers_by_specialty[s]`
+    # plus a min-over-slots expr leaves a false-positive hole (an agent could
+    # name the earliest datetime but the wrong sibling provider). Exposing the
+    # owning provider id as a scalar lets the canonical_diff pin it exactly.
+    # Slot datetimes are unique within a specialty (random day/hour over 14
+    # days), so the (datetime, provider_id) pair is deterministic; ties break
+    # on provider_id ascending for total determinism.
+    min_slot_by_specialty: dict[str, dict[str, str]] = {}
+    earliest_slot_provider_by_specialty: dict[str, str] = {}
+    earliest_slot_datetime_by_specialty: dict[str, str] = {}
+    for spec, ids in providers_by_specialty.items():
+        candidates: list[tuple[str, str]] = []
+        for pid in ids:
+            prov = next((p for p in ctx.base["providers"] if p["id"] == pid), None)
+            if prov is None:
+                continue
+            for slot in prov.get("available_slots", []):
+                candidates.append((slot["datetime"], pid))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        best_dt, best_pid = candidates[0]
+        min_slot_by_specialty[spec] = {"datetime": best_dt, "provider_id": best_pid}
+        earliest_slot_provider_by_specialty[spec] = best_pid
+        earliest_slot_datetime_by_specialty[spec] = best_dt
+
     return {
         "provider_ids": provider_ids,
         "providers_by_specialty": providers_by_specialty,
+        "min_slot_by_specialty": min_slot_by_specialty,
+        "earliest_slot_provider_by_specialty": earliest_slot_provider_by_specialty,
+        "earliest_slot_datetime_by_specialty": earliest_slot_datetime_by_specialty,
     }
 
 
@@ -2243,12 +2276,49 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     )
     top_3_appealable_claim_ids = appealable_ids_sorted[:3]
 
+    # Derived: the most-recent APPROVED claim by service_date (cid tiebreaker
+    # ascending, mirroring most_recent_denied_claim_id). Tasks that ask the
+    # agent to act on "your most recent approved claim" need a scalar id +
+    # the claim's patient_responsibility so the canonical_diff can gate an
+    # exact, re-derived value (the agent must locate the claim, read its
+    # balance, and format it) without leaking the answer into the prompt.
+    most_recent_approved_claim_id: str | None = None
+    most_recent_approved_patient_responsibility: str = "0"
+    billing_followup_reason: str = ""
+    if approved_claim_ids:
+        most_recent_approved_claim_id = max(
+            approved_claim_ids,
+            key=lambda cid: (_claim_service_date(cid), cid),
+        )
+        _mra = _claim_by_id(most_recent_approved_claim_id)
+        if _mra is not None:
+            most_recent_approved_patient_responsibility = str(
+                _mra.get("patient_responsibility", "0")
+            )
+            # Deterministic, re-derivable appointment-reason string that bakes
+            # in the most-recent approved claim's id AND its patient balance.
+            # The agent must (1) locate the most-recent approved claim, (2) read
+            # its patient_responsibility, and (3) format this exact string —
+            # making the claim-review step load-bearing rather than decorative.
+            # Exposed as a seed output (not a literal in the instruction) so it
+            # never leaks the answer into the prompt.
+            billing_followup_reason = (
+                f"Incorrect charge review for claim "
+                f"{most_recent_approved_claim_id} "
+                f"(patient balance ${most_recent_approved_patient_responsibility})"
+            )
+
     return {
         "approved_claim_ids": approved_claim_ids,
         "denied_claim_ids": denied_claim_ids,
         "processing_claim_ids": processing_claim_ids,
         "appealable_claim_id": appealable_claim_id,
         "most_recent_denied_claim_id": most_recent_denied_claim_id,
+        "most_recent_approved_claim_id": most_recent_approved_claim_id,
+        "most_recent_approved_patient_responsibility": (
+            most_recent_approved_patient_responsibility
+        ),
+        "billing_followup_reason": billing_followup_reason,
         "top_3_appealable_claim_ids": top_3_appealable_claim_ids,
         "total_patient_responsibility": str(total_patient_responsibility),
     }
