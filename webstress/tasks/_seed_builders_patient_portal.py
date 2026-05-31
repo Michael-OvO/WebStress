@@ -981,16 +981,27 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
 
     Params: active_count (int), expired_count (int), zero_refill_count (int),
             expiring_soon_count (int), expiring_zero_refill_count (int),
-            interaction_pair (bool)
+            interaction_pair (bool), source_pharmacy_role (str),
+            source_active_count (int), source_exclude_pharmacy_name (str)
     Outputs: active_rx_ids, zero_refill_rx_id, expiring_rx_ids,
              expiring_zero_refill_rx_ids, interacting_rx_ids,
-             interacting_medications
+             interacting_medications, rxes_at_source_pharmacy,
+             non_source_active_rx_ids, source_pharmacy_id
 
     Note on ``expiring_zero_refill_count``: forces the first N entries of
     the ``expiring_rx_ids`` subset to have ``refills_remaining == 0``. This
     lets tasks deterministically pin the "expiring AND zero-refill" target
     intersection. Remaining expiring rxes get ``randint(1, 2)`` so the
     distinction is meaningful.
+
+    Note on ``source_pharmacy_role`` / ``source_active_count``: pins the first
+    ``source_active_count`` ACTIVE prescriptions onto the pharmacy identified
+    by ``source_pharmacy_role`` (``"mail_order"`` or ``"default"``) and exposes
+    that exact id set as ``rxes_at_source_pharmacy``. The remaining active
+    prescriptions are pinned off the source (and, if
+    ``source_exclude_pharmacy_name`` is given, off the transfer destination
+    too) and exposed as ``non_source_active_rx_ids`` so a transfer bijection
+    can saturate over a deterministic subset while the rest stay decoys.
     """
     active_count = params.get("active_count", 3)
     expired_count = params.get("expired_count", 0)
@@ -1008,6 +1019,21 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     # already at the destination) so the canonical_diff update[0] bijection
     # saturates.
     active_at_default_only = bool(params.get("active_at_default_only", False))
+    # Force the FIRST `source_active_count` active prescriptions onto a
+    # single "source" pharmacy identified by role. Used by tasks like
+    # pp_transfer_prescription where the scenario is "the mail-order pharmacy
+    # is discontinuing — transfer exactly the prescriptions filled there to a
+    # specific retail location". The remaining active prescriptions are
+    # pinned to a pharmacy that is NEITHER the source NOR (optionally) the
+    # destination, so they are decoys the agent must NOT move. Exposes the
+    # exact subset as `rxes_at_source_pharmacy` so a bijection can saturate
+    # over a deterministic set without reconstructing the filter inside a
+    # predicate (Class 6 set-in-filter hazard). `source_pharmacy_role` is one
+    # of {"mail_order", "default"}; `source_exclude_pharmacy_name` keeps the
+    # NON-source active rxes off the transfer destination so they stay decoys.
+    source_pharmacy_role: str | None = params.get("source_pharmacy_role")
+    source_active_count = int(params.get("source_active_count", 0) or 0)
+    source_exclude_pharmacy_name: str | None = params.get("source_exclude_pharmacy_name")
 
     if "prescriptions" not in ctx.base:
         ctx.base["prescriptions"] = []
@@ -1016,6 +1042,18 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     pharmacies = ctx.base.get("pharmacies", [])
     pcp_id = ctx.base.get("patient", {}).get("pcp_id", "prov_1")
     default_pharm_id = next((p["id"] for p in pharmacies if p.get("is_default")), "pharm_1") if pharmacies else "pharm_1"
+
+    # Resolve the "source" pharmacy id (the one the source active rxes are
+    # pinned to) from its role. Falls back to None when no matching pharmacy
+    # exists; in that case the source-pinning logic is skipped and
+    # `rxes_at_source_pharmacy` stays empty.
+    source_pharmacy_id: str | None = None
+    if source_pharmacy_role == "mail_order":
+        source_pharmacy_id = next(
+            (p["id"] for p in pharmacies if p.get("is_mail_order")), None
+        )
+    elif source_pharmacy_role == "default":
+        source_pharmacy_id = default_pharm_id if pharmacies else None
 
     # Shuffle the medication pool, then pin target_medication_name first if specified
     med_pool = list(_MEDICATIONS)
@@ -1038,6 +1076,10 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     expiring_zero_refill_rx_ids: list[str] = []
     interacting_rx_ids: list[str] = []
     interacting_medications: list[str] = []
+    # Subset of active rxes deterministically pinned to the source pharmacy
+    # (e.g. the discontinuing mail-order pharmacy). This is the canonical
+    # transfer set for pp_transfer_prescription.
+    rxes_at_source_pharmacy: list[str] = []
 
     def _make_rx(
         med: dict,
@@ -1048,6 +1090,8 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         force_retail_pharmacy: bool = False,
         exclude_pharmacy_name: str | None = None,
         force_default_pharmacy: bool = False,
+        force_pharmacy_id: str | None = None,
+        exclude_pharmacy_ids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         nonlocal med_idx
         rx_id = ctx.next_id("rx")
@@ -1068,7 +1112,20 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             ]
             if filtered:
                 available_pharmacies = filtered
-        pharm_id = ctx.rng.choice([p["id"] for p in available_pharmacies]) if available_pharmacies else default_pharm_id
+        if exclude_pharmacy_ids:
+            filtered = [
+                p for p in available_pharmacies
+                if p.get("id") not in exclude_pharmacy_ids
+            ]
+            if filtered:
+                available_pharmacies = filtered
+        # An explicit pharmacy id pin overrides every heuristic above so the
+        # rx lands deterministically on the requested pharmacy (used by the
+        # source-pharmacy transfer fixture).
+        if force_pharmacy_id and any(p["id"] == force_pharmacy_id for p in pharmacies):
+            pharm_id = force_pharmacy_id
+        else:
+            pharm_id = ctx.rng.choice([p["id"] for p in available_pharmacies]) if available_pharmacies else default_pharm_id
         last_filled = ctx.now - timedelta(days=ctx.rng.randint(7, 60))
         expires_at = ctx.now + timedelta(days=expires_days)
 
@@ -1087,7 +1144,7 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         }
 
     # Active prescriptions (normal refills)
-    for _ in range(active_count):
+    for _active_idx in range(active_count):
         if med_idx >= len(med_pool):
             break
         med = med_pool[med_idx]
@@ -1100,6 +1157,25 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         exclude_pharmacy_for_rx = (
             target_exclude_pharmacy_name if is_target_med else None
         )
+        # Source-pharmacy pinning: the first `source_active_count` active rxes
+        # land on the source pharmacy (the transfer set); the rest are pinned
+        # off the source AND (optionally) off the destination so they are
+        # decoys the agent must not move.
+        force_pharmacy_for_rx: str | None = None
+        exclude_pharmacy_ids_for_rx: tuple[str, ...] = ()
+        is_source_rx = False
+        if source_pharmacy_id is not None and source_active_count > 0:
+            if _active_idx < source_active_count:
+                force_pharmacy_for_rx = source_pharmacy_id
+                is_source_rx = True
+            else:
+                # Non-source actives must NOT live on the source pharmacy
+                # (otherwise the "transfer everything at the mail-order
+                # pharmacy" instruction would be ambiguous), and they stay off
+                # the transfer destination so they remain legitimate decoys.
+                exclude_pharmacy_ids_for_rx = (source_pharmacy_id,)
+                if source_exclude_pharmacy_name and exclude_pharmacy_for_rx is None:
+                    exclude_pharmacy_for_rx = source_exclude_pharmacy_name
         rx = _make_rx(
             med,
             "active",
@@ -1108,9 +1184,13 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             force_retail_pharmacy=force_retail_pharmacy,
             exclude_pharmacy_name=exclude_pharmacy_for_rx,
             force_default_pharmacy=active_at_default_only,
+            force_pharmacy_id=force_pharmacy_for_rx,
+            exclude_pharmacy_ids=exclude_pharmacy_ids_for_rx,
         )
         ctx.base["prescriptions"].append(rx)
         active_rx_ids.append(rx["id"])
+        if is_source_rx:
+            rxes_at_source_pharmacy.append(rx["id"])
         # Track target rx if this medication matches the pinned target
         if target_medication_name and target_rx_id is None:
             if target_medication_name.lower() in med["name"].lower():
@@ -1201,6 +1281,13 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         if rid not in expiring_zero_refill_rx_ids
     ]
 
+    # Active rxes NOT pinned to the source pharmacy. These share the "active"
+    # category with the transfer set but must remain on their current
+    # pharmacy — they are the decoys a filtered invariant freezes.
+    non_source_active_rx_ids = [
+        rid for rid in active_rx_ids if rid not in rxes_at_source_pharmacy
+    ]
+
     return {
         "active_rx_ids": active_rx_ids,
         "zero_refill_rx_id": zero_refill_rx_id,
@@ -1211,6 +1298,10 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         "expiring_with_refills_rx_ids": expiring_with_refills_rx_ids,
         "interacting_rx_ids": interacting_rx_ids,
         "interacting_medications": interacting_medications,
+        # Source-pharmacy transfer fixture outputs.
+        "rxes_at_source_pharmacy": rxes_at_source_pharmacy,
+        "non_source_active_rx_ids": non_source_active_rx_ids,
+        "source_pharmacy_id": source_pharmacy_id,
     }
 
 
