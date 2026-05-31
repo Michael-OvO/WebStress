@@ -981,10 +981,19 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
 
     Params: active_count (int), expired_count (int), zero_refill_count (int),
             expiring_soon_count (int), expiring_zero_refill_count (int),
-            interaction_pair (bool)
+            interaction_pair (bool), maintenance_medications (list[str])
     Outputs: active_rx_ids, zero_refill_rx_id, expiring_rx_ids,
              expiring_zero_refill_rx_ids, interacting_rx_ids,
-             interacting_medications
+             interacting_medications, maintenance_rx_ids,
+             non_maintenance_rx_ids, maintenance_rx_medications
+
+    Note on ``maintenance_medications``: the named medications are pinned into
+    the front of the active set (so both partition subsets are non-empty and
+    deterministic) and the active rxes are split into ``maintenance_rx_ids``
+    (medication matches a maintenance name) vs ``non_maintenance_rx_ids``.
+    Used by formulary-partition tasks (e.g. pp_insurance_plan_change) where the
+    new plan covers maintenance meds only via mail-order while retail meds must
+    stay at the default pharmacy.
 
     Note on ``expiring_zero_refill_count``: forces the first N entries of
     the ``expiring_rx_ids`` subset to have ``refills_remaining == 0``. This
@@ -1008,6 +1017,18 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     # already at the destination) so the canonical_diff update[0] bijection
     # saturates.
     active_at_default_only = bool(params.get("active_at_default_only", False))
+    # Formulary partition: tasks like pp_insurance_plan_change need the active
+    # prescriptions split into a "maintenance / mail-order-only" subset (which
+    # the new plan covers only via the mail-order pharmacy) and the remaining
+    # retail subset (which must stay at the default retail pharmacy). The
+    # caller passes the canonical medication names that are designated
+    # maintenance meds; the builder PINS those medications into the active set
+    # (so the partition is deterministic and both subsets are non-empty) and
+    # exposes the two disjoint id lists as outputs. Matching is by
+    # case-insensitive medication-name substring against the rx medication.
+    maintenance_medications: list[str] = [
+        str(m) for m in (params.get("maintenance_medications") or [])
+    ]
 
     if "prescriptions" not in ctx.base:
         ctx.base["prescriptions"] = []
@@ -1028,6 +1049,22 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         if pinned:
             med_pool.remove(pinned)
             med_pool.insert(0, pinned)
+    # Pin maintenance medications to the front of the pool (preserving the
+    # caller-supplied order) so the first active rxes are exactly the
+    # maintenance meds. This makes the maintenance/retail partition
+    # deterministic regardless of the shuffle. Pinned AFTER
+    # target_medication_name so an explicit single target still wins slot 0.
+    if maintenance_medications:
+        maintenance_pinned: list[dict[str, Any]] = []
+        for needle in maintenance_medications:
+            match = next(
+                (m for m in med_pool if needle.lower() in m["name"].lower()),
+                None,
+            )
+            if match is not None:
+                med_pool.remove(match)
+                maintenance_pinned.append(match)
+        med_pool = maintenance_pinned + med_pool
     med_idx = 0
 
     active_rx_ids: list[str] = []
@@ -1201,6 +1238,33 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         if rid not in expiring_zero_refill_rx_ids
     ]
 
+    # Formulary partition over the ACTIVE prescriptions: an active rx is a
+    # "maintenance / mail-order-only" rx iff its medication matches one of the
+    # caller-supplied maintenance_medications (case-insensitive substring).
+    # The complement is the "retail" subset that must stay at the default
+    # pharmacy. Both lists are disjoint and cover active_rx_ids exactly, so a
+    # task can drive one bijection over each subset (move-to-mail-order vs
+    # freeze-at-retail) without reconstructing the partition inside a
+    # predicate. Computed in builder per Class-6 (sets must be precomputed).
+    def _rx_medication(rid: str) -> str:
+        for r in ctx.base["prescriptions"]:
+            if r["id"] == rid:
+                return str(r.get("medication", ""))
+        return ""
+
+    maintenance_lc = [m.lower() for m in maintenance_medications]
+    maintenance_rx_ids: list[str] = []
+    non_maintenance_rx_ids: list[str] = []
+    for rid in active_rx_ids:
+        med_name = _rx_medication(rid).lower()
+        if maintenance_lc and any(needle in med_name for needle in maintenance_lc):
+            maintenance_rx_ids.append(rid)
+        else:
+            non_maintenance_rx_ids.append(rid)
+    # Parallel list of the maintenance medication display names actually
+    # present in the active set (for instruction/grading cross-reference).
+    maintenance_rx_medications = [_rx_medication(rid) for rid in maintenance_rx_ids]
+
     return {
         "active_rx_ids": active_rx_ids,
         "zero_refill_rx_id": zero_refill_rx_id,
@@ -1211,6 +1275,9 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         "expiring_with_refills_rx_ids": expiring_with_refills_rx_ids,
         "interacting_rx_ids": interacting_rx_ids,
         "interacting_medications": interacting_medications,
+        "maintenance_rx_ids": maintenance_rx_ids,
+        "non_maintenance_rx_ids": non_maintenance_rx_ids,
+        "maintenance_rx_medications": maintenance_rx_medications,
     }
 
 
