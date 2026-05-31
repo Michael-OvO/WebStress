@@ -3201,6 +3201,18 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     )
     recent_appealable_claim_ids = recent_appealable_sorted[:recent_appealable_n]
 
+    # Derived: the appealable denied claims sorted by URGENCY — earliest
+    # appeal_deadline first, claim-id tiebreaker ascending. Distinct from the
+    # patient-responsibility sort above. Canonical_diff needs a scalar list to
+    # drive an exact-cardinality bijection (appeal the most-urgent N) without
+    # pushing date-parse/sort math into the invariant/where scope (hazard:
+    # filter sees only a+target, where sees only id+changed fields).
+    appealable_ids_by_deadline = sorted(
+        appealable_ids,
+        key=lambda cid: (_claim_by_id(cid)["appeal_deadline"], cid),
+    )
+    top_2_urgent_appealable_claim_ids = appealable_ids_by_deadline[:2]
+
     return {
         "approved_claim_ids": approved_claim_ids,
         "denied_claim_ids": denied_claim_ids,
@@ -3219,6 +3231,8 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         "recent_appealable_claim_ids": recent_appealable_claim_ids,
         "appealable_claim_ids": appealable_ids_sorted,
         "ineligible_denied_ids": ineligible_denied_ids,
+        "top_2_urgent_appealable_claim_ids": top_2_urgent_appealable_claim_ids,
+        "appealable_claim_ids_by_deadline": appealable_ids_by_deadline,
         "total_patient_responsibility": str(total_patient_responsibility),
     }
 
