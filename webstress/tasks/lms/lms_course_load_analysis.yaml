@@ -1,15 +1,23 @@
 task_id: lms_course_load_analysis
 env_id: lms
 title: Course Load Analysis for Adding a Fifth Course
-instruction_template: 'You''re considering adding a 5th course. Use the precomputed
-  branch flag {target.can_add_course} from the seed output: if it is ''true'', the
-  new course keeps your GPA at or above 3.0 and you should mark all unread
-  announcements as read. If it is ''false'', assume adding the course would drop GPA
-  below 3.0 and do NOT mark announcements — instead drop your lowest-performing
-  current course.'
+instruction_template: 'You are considering adding a fifth course next term. Decide
+  whether it is safe to add using the standard credit-weighted GPA rule. Read your
+  cumulative GPA from your Profile and the credit hours of every course you are
+  currently enrolled in. Model the new course as a 3-credit course in which you would
+  earn a C, which counts as 2.0 grade points per credit. Compute the projected
+  cumulative GPA as (current_GPA * current_total_credits + 2.0 * 3) / (current_total_credits
+  + 3). If that projected GPA is greater than or equal to 3.0, adding the course is
+  safe: in that case mark every unread announcement as read and make no other
+  changes. If the projected GPA is below 3.0, adding the course is not safe: in that
+  case do NOT touch any announcement and instead drop exactly the single course in
+  which you currently have the lowest weighted grade (recompute each course''s
+  weighted grade from its graded work and grading-policy weights to identify it).
+  Do not enroll in or create any new course, do not modify any grade, and do not
+  send any message.'
 difficulty: expert
-time_limit_seconds: 360
-expected_steps: 20
+time_limit_seconds: 420
+expected_steps: 26
 primary_primitives:
 - planning
 start_path: /dashboard
@@ -69,12 +77,15 @@ seed:
     unread_announcement_ids: '{output.unread_announcement_ids}'
 canonical_diff:
   oneof:
-  # Branch discriminator baked into the Update where-clause (was a critical constraint).
-  # Bijection still produces slots from unread_announcement_ids; the where-clause
-  # only matches them when the GPA discriminator allows this branch.
+  # Branch 1 — "safe to add": projected GPA >= 3.0 (can_add_course == 'true').
+  # The agent must RE-DERIVE the projected GPA; the flag is never shown. The
+  # bijection produces one read slot per unread announcement; the where-clause
+  # only matches when the discriminator allows this branch, so an agent that
+  # mis-computes the GPA and marks announcements on the wrong branch scores zero
+  # AND trips the drop-branch enrollment invariant.
   - update:
     - entity: Announcement
-      desc: Mark all unread announcements as read after confirming the GPA is safe
+      desc: Mark all unread announcements as read after confirming the projected GPA is at or above 3.0
       bijection:
         over: "target['unread_announcement_ids'].split(',') if target['unread_announcement_ids'] else []"
         variable: v
@@ -111,20 +122,29 @@ canonical_diff:
     constraints:
     - desc: Agent did not send messages
       expr: "len(state.sent_messages) == 0"
-      severity: medium
+      severity: critical
+    - desc: Agent did not enroll in or create any new course
+      expr: "len(state.enrollments) == len(initial.enrollments)"
+      severity: critical
+    - desc: Every enrollment remains in its original status (no course dropped on the safe branch)
+      expr: "all(e.status == g.status for e in state.enrollments for g in initial.enrollments if e.id == g.id)"
+      severity: critical
+    - desc: No grade score was altered
+      expr: "all(str(gr.score) == str(ig.score) for gr in state.grades for ig in initial.grades if gr.id == ig.id)"
+      severity: high
     named_invariants:
     - name: Agent marked all unread announcements as read
       ref: update[0]
-      severity: high
-    - name: Agent did not modify announcements
+      severity: critical
+    - name: Agent did not modify already-read announcements
       ref: invariant[0]
-      severity: medium
+      severity: high
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium
     - name: Agent did not drop or alter enrollments
       ref: invariant[2]
-      severity: high
+      severity: critical
     - name: Agent did not modify assignments
       ref: invariant[3]
       severity: medium
@@ -149,11 +169,14 @@ canonical_diff:
     - name: Agent did not send messages
       ref: invariant[10]
       severity: medium
-  # Branch 2: only matches when can_add_course == 'false'.
-  # No bijection; where-clause itself rejects when discriminator is wrong.
+  # Branch 2 — "not safe to add": projected GPA < 3.0 (can_add_course == 'false').
+  # The agent must RE-DERIVE both the projected GPA (to reach this branch) AND the
+  # lowest-weighted-grade course (to pick the drop target). No bijection; the
+  # where-clause discriminator rejects the wrong branch, and the wrong drop target
+  # is frozen by the filtered enrollment invariant.
   - update:
     - entity: Enrollment
-      desc: Drop the lowest-performing current course (cannot add a fifth course)
+      desc: Drop the single lowest-weighted-grade current course (projected GPA falls below 3.0, so the fifth course cannot be added)
       where:
         course_id:
           expr: "x == target['lowest_performing_course_id'] and target['can_add_course'] == 'false'"
@@ -189,20 +212,29 @@ canonical_diff:
     constraints:
     - desc: Agent did not send messages
       expr: "len(state.sent_messages) == 0"
-      severity: medium
-    named_invariants:
-    - name: Agent dropped the lowest-performing course enrollment
-      ref: update[0]
+      severity: critical
+    - desc: Agent did not enroll in or create any new course
+      expr: "len(state.enrollments) == len(initial.enrollments)"
+      severity: critical
+    - desc: Exactly one enrollment was dropped
+      expr: "len([e for e in state.enrollments if e.status == 'dropped']) == len([e for e in initial.enrollments if e.status == 'dropped']) + 1"
+      severity: critical
+    - desc: No grade score was altered
+      expr: "all(str(gr.score) == str(ig.score) for gr in state.grades for ig in initial.grades if gr.id == ig.id)"
       severity: high
+    named_invariants:
+    - name: Agent dropped the lowest-weighted-grade course enrollment
+      ref: update[0]
+      severity: critical
     - name: Agent did not modify announcements
       ref: invariant[0]
-      severity: medium
+      severity: high
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium
     - name: Agent did not modify enrollments other than the target course
       ref: invariant[2]
-      severity: high
+      severity: critical
     - name: Agent did not modify assignments
       ref: invariant[3]
       severity: medium
