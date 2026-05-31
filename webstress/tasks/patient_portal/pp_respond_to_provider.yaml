@@ -1,13 +1,19 @@
 task_id: pp_respond_to_provider
 env_id: patient_portal
-title: Review Provider Message and Schedule Follow-Up
-instruction_template: Your PCP sent you a message about adjusting your blood pressure
-  medication. Read the message, then schedule exactly one PCP follow-up appointment
-  using the next available PCP slot. Use the appointment reason exactly "Blood pressure
-  medication adjustment follow-up". Do not reply and do not send any messages.
-difficulty: medium
-time_limit_seconds: 180
-expected_steps: 8
+title: Review Provider Message and Schedule Confirmed Follow-Up
+instruction_template: 'Your inbox contains a message titled "Blood Pressure Medication
+  Adjustment" from your assigned primary care physician (PCP) about adjusting your
+  blood pressure medication. Do the following: 1) Open and read that exact message
+  so it is marked as read. 2) Schedule exactly one follow-up appointment with the
+  SAME PCP who sent that message (your assigned PCP), using that PCP''s earliest
+  available in-person slot. Use the appointment reason exactly "Blood pressure medication
+  adjustment follow-up". 3) After scheduling, confirm the appointment so its confirmation
+  state becomes confirmed. Book in-person only, not telehealth. Do not book with any
+  other primary care physician. Do not reply to the message and do not send any new
+  messages.'
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 16
 primary_primitives:
 - grounding
 start_path: /messages
@@ -19,6 +25,11 @@ seed:
       conditions:
       - Hypertension
       insurance_tier: standard
+      # B-1 confirmation workflow: new PCP appointments land in
+      # confirmation_state="pending"; the agent must POST /appointments/{id}/confirm
+      # after scheduling so a single book-and-forget action is insufficient.
+      auto_confirm_specialties:
+      - pcp
     outputs:
     - pcp_id
     - pcp_name
@@ -33,6 +44,18 @@ seed:
       - admin
       must_include:
       - pcp
+      # Two distinct PCPs: prov_1 is the patient's assigned PCP (and the
+      # sender of the bp_medication_adjustment message); the second PCP is a
+      # same-specialty decoy whose slots may be globally earlier. The agent
+      # must book with the message sender (target.pcp_id == prov_1), NOT the
+      # decoy PCP, so a naive "earliest PCP slot anywhere" answer is wrong.
+      count_per_specialty:
+        pcp: 2
+      # Guarantee BOTH PCPs have at least one in-person slot so the canonical
+      # answer ("assigned PCP's earliest in-person slot") always exists, and
+      # the decoy PCP is a real bookable alternative the agent must reject.
+      force_in_person_specialties:
+      - pcp
     outputs:
     - provider_ids
     - providers_by_specialty
@@ -43,8 +66,8 @@ seed:
     - default_pharmacy_id
   - use: message_threads
     params:
-      thread_count: 4
-      unread_count: 2
+      thread_count: 5
+      unread_count: 3
       categories:
       - clinical
       - scheduling
@@ -61,12 +84,19 @@ seed:
     all_msg_ids: '{output.all_msg_ids}'
     thread_ids: '{output.thread_ids}'
     bp_msg_id: '{output.context_msg_ids.bp_medication_adjustment}'
+    # All PCP provider ids in the directory (>=2). Exposed so the
+    # bounded-creation / sibling invariants can reason about "the other PCP"
+    # without recomputing a set inside a filter scope (Class 6 hazard).
+    pcp_provider_ids: '{output.providers_by_specialty.pcp}'
 canonical_diff:
   # Positive signals:
   #   (a) mark the PCP's "Blood Pressure Medication Adjustment" message
   #       (identified by seed output target.bp_msg_id) as read;
-  #   (b) create a new PCP follow-up appointment at the earliest available PCP
-  #       slot with the exact required reason.
+  #   (b) create exactly one PCP follow-up appointment with the assigned PCP
+  #       (target.pcp_id == prov_1, the message sender) at THAT PCP's earliest
+  #       available in-person slot, with the exact required reason, AND
+  #   (c) confirm the appointment (confirmation_state == "confirmed") because
+  #       the seed marks new PCP appointments as requires_confirmation.
   update:
     - entity: ClinicalMessage
       desc: "Mark the PCP's Blood Pressure Medication Adjustment message as read"
@@ -82,16 +112,39 @@ canonical_diff:
         is_read: {eq: true}
   create:
     - entity: Appointment
-      desc: "Schedule one PCP follow-up at the next available PCP slot"
+      desc: >-
+        Schedule one in-person follow-up with the assigned PCP (the message
+        sender, target.pcp_id) at that PCP's earliest in-person slot, then
+        confirm it.
       properties:
         status: {eq: "scheduled"}
+        type: {eq: "in-person"}
         provider_id:
+          # Must be the assigned PCP (prov_1), i.e. the sender of the bp
+          # message — NOT the decoy second PCP whose slots may be earlier.
           expr: "x == target['pcp_id']"
         reason: {eq: "Blood pressure medication adjustment follow-up"}
+        # The seed places new PCP appointments in confirmation_state="pending"
+        # (auto_confirm_specialties: [pcp]); the agent must call /confirm so
+        # this becomes "confirmed". A scheduled-but-unconfirmed appointment fails.
+        confirmation_state: {eq: "confirmed"}
+        # PCP follow-ups need no referral; pin to null so a stray referral link
+        # (copied from a decoy) is rejected.
+        linked_referral_id: {eq: null}
         datetime:
+          # Earliest IN-PERSON slot of the ASSIGNED PCP specifically. Filtering
+          # to in-person matters because that PCP's slot list mixes modalities,
+          # and scoping to target.pcp_id matters because a second PCP exists
+          # whose bare-earliest slot would be the wrong answer.
           expr: >
             x == min(s.datetime for p in initial.providers
-                     if p.id == target['pcp_id'] for s in p.available_slots)
+                     if p.id == target['pcp_id']
+                     for s in p.available_slots
+                     if s.type == 'in-person')
+        notes: {any: true}
+        pre_auth_status: {any: true}
+        booked_at: {any: true}
+        location: {any: true}
   invariant:
     - collection: state.messages
       preserve: ALL
@@ -108,10 +161,26 @@ canonical_diff:
       preserve: ALL
     - collection: state.referrals
       preserve: ALL
+    - collection: state.providers
+      preserve: ALL
+    - collection: state.patient
+      preserve: ALL
+    # Bounded-creation guard: the ONLY newly-created appointment permitted is
+    # the one booked with the assigned PCP. Any appointment created with a
+    # different provider (e.g. the decoy second PCP, or a specialist) is a
+    # forbidden extra mutation. Pre-existing appointments are excluded so this
+    # only ever fires on agent-created rows. comprehensive:true flags any such
+    # unaccounted create as collateral.
+    - collection: state.appointments
+      filter: >-
+        a.id not in {x.id for x in initial.appointments}
+        and a.provider_id != target['pcp_id']
+      preserve: ALL
+      comprehensive: true
   named_invariants:
-    - name: "Agent did not modify unrelated messages or send new ones"
+    - name: "Agent did not modify unrelated messages or send/reply with new ones"
       ref: invariant[0]
-      severity: medium
+      severity: high
     - name: "Agent did not cancel or modify pre-existing appointments"
       ref: invariant[1]
       severity: high
@@ -130,4 +199,13 @@ canonical_diff:
     - name: "Agent did not touch referrals"
       ref: invariant[6]
       severity: high
+    - name: "Agent did not modify provider records"
+      ref: invariant[7]
+      severity: medium
+    - name: "Agent did not modify patient demographics or insurance"
+      ref: invariant[8]
+      severity: high
+    - name: "Agent did not book with the wrong PCP or any other provider"
+      ref: invariant[9]
+      severity: critical
 secondary_primitives: []
