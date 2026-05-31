@@ -2,14 +2,19 @@ task_id: lms_ta_dual_role
 env_id: lms
 title: TA Dual Role Management
 instruction_template: 'You are a TA for {target.ta_course_code} and a student in {target.student_course_code}.
-  Complete the following without confusing your roles: (1) In your TA course, complete
-  all pending peer reviews assigned to you with full rubric scores and comments of
-  at least 30 characters each. (2) In your student course, submit the assignment "{target.student_assignment_title}"
-  with file "ta_student_submission.pdf". Make sure you do not submit to the wrong
-  course.'
+  Complete the following without confusing your roles. (1) In your TA course {target.ta_course_code},
+  open every pending peer review assigned to you (there are {target.pending_review_count})
+  and complete each one. Score all three rubric criteria (clarity, depth, originality)
+  with whole numbers from 1 to 5. For any review that was returned for revision, your
+  new score on each criterion that was previously scored must be strictly higher than
+  the previous score shown on that review. Each comment must be at least 60 characters
+  long and must address the reviewee by their first name as shown on that review. (2)
+  In your student course {target.student_course_code}, submit the assignment "{target.student_assignment_title}"
+  with file "ta_student_submission.pdf" exactly once. Do not submit to the wrong course,
+  do not touch any peer review that is not assigned to you, and do not send any messages.'
 difficulty: expert
-time_limit_seconds: 360
-expected_steps: 25
+time_limit_seconds: 420
+expected_steps: 32
 primary_primitives:
 - exploration
 start_path: /courses
@@ -38,7 +43,7 @@ seed:
     - ta_course_id
   - use: assignment_battery
     params:
-      per_course_count: 5
+      per_course_count: 6
       graded_fraction: 0.4
       target_assignment_status: not_submitted
       exclude_course_id: '{output.ta_course_id}'
@@ -55,15 +60,23 @@ seed:
     - grade_ids
   - use: peer_review_assignments
     params:
-      count: 3
+      count: 5
       course_id: '{output.ta_course_id}'
+      returned_review_count: 2
       statuses:
       - assigned
+      - assigned
+      - in_progress
       - assigned
       - in_progress
     outputs:
     - review_ids
     - pending_review_ids
+    - completed_review_ids
+    - returned_review_ids
+    - pending_review_min_scores
+    - pending_review_name_tokens
+    - pending_review_count
   targets:
     ta_course_code: CS201
     student_course_code: '{output.target_course_code}'
@@ -72,10 +85,13 @@ seed:
     decoy_assignment_id: '{output.decoy_assignment_id}'
     ta_course_id: '{output.ta_course_id}'
     pending_review_ids: '{output.pending_review_ids}'
+    pending_review_min_scores: '{output.pending_review_min_scores}'
+    pending_review_name_tokens: '{output.pending_review_name_tokens}'
+    pending_review_count: '{output.pending_review_count}'
 canonical_diff:
   update:
     - entity: PeerReview
-      desc: Complete every pending TA peer review with all rubric scores and a 30+ character comment
+      desc: Complete every pending TA peer review with improving rubric scores and a 60+ character comment that names the reviewee
       bijection:
         over: "[v.strip() for v in target['pending_review_ids'].split(',') if v.strip()]"
         variable: v
@@ -87,12 +103,20 @@ canonical_diff:
           expr: >-
             len(x) == 3
             and set(x) == {'clarity', 'depth', 'originality'}
-            and all(1 <= v <= 5 for v in x.values())
+            and all(int(s) >= 1 and int(s) <= 5 for s in x.values())
+            and all(
+              int(x[c]) >= int(
+                next(e for e in target['pending_review_min_scores'].split('|') if e.split('=')[0] == v).split('=')[1].split('~')[i]
+              )
+              for i, c in enumerate(['clarity', 'depth', 'originality'])
+            )
         comments:
-          expr: "len(x.strip()) >= 30"
+          expr: >-
+            len(x.strip()) >= 60
+            and next(e for e in target['pending_review_name_tokens'].split('|') if e.split(':')[0] == v).split(':')[1].lower() in x.lower()
         status: {eq: submitted}
     - entity: Assignment
-      desc: Submit the student-course assignment with the required file name
+      desc: Submit the student-course assignment exactly once with the required file name
       where:
         id:
           expr: "x == target['target_assignment_id']"
@@ -104,7 +128,7 @@ canonical_diff:
         file_name:
           eq: ta_student_submission.pdf
         attempt_count:
-          expr: "x >= 1"
+          expr: "int(x) == 1"
         submitted_at:
           expr: "x >= session_start"
   invariant:
@@ -136,16 +160,22 @@ canonical_diff:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
+  - desc: Agent completed exactly the pending peer reviews, no more and no fewer
+    expr: >-
+      len([r for r in state.peer_reviews if r.status == 'submitted'])
+      == len([r for r in initial.peer_reviews if r.status == 'submitted'])
+      + len([v.strip() for v in target['pending_review_ids'].split(',') if v.strip()])
+    severity: critical
   named_invariants:
-    - name: Agent completed every pending TA peer review
+    - name: Agent completed every pending TA peer review with improving named feedback
       ref: update[0]
-      severity: high
-    - name: Agent submitted the student-course assignment
+      severity: critical
+    - name: Agent submitted the student-course assignment exactly once
       ref: update[1]
       severity: high
     - name: Agent did not modify other peer reviews
       ref: invariant[0]
-      severity: high
+      severity: critical
     - name: Agent did not modify other assignments
       ref: invariant[1]
       severity: high

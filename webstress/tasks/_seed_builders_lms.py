@@ -3376,6 +3376,43 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
             peer_review_assignment_id_list.append(aid)
             seen_aid.add(aid)
 
+    # ── Per-pending-review grading discriminators ──
+    # For every pending review the canonical_diff bijects over, expose:
+    #   pending_review_min_scores : "<rid>=<clarity>~<depth>~<originality>|..."
+    #       the MINIMUM acceptable score per rubric criterion. For a
+    #       returned-for-revision review the minimum is one point ABOVE the
+    #       previous score on that criterion (capped at 5), so the agent must
+    #       read previous_rubric_scores and strictly improve it; for a fresh
+    #       (never-scored) criterion the minimum is 1.
+    #   pending_review_name_tokens : "<rid>:<reviewee_first_name>|..."
+    #       the reviewee first name that the agent's comment must mention.
+    # These are precomputed scalars exposed as targets (rule 6) — the
+    # canonical_diff never recomputes a set inside a filter; it only parses
+    # the per-review entry keyed by the bijection variable.
+    _criteria_order = ["clarity", "depth", "originality"]
+    _pending_lookup = {pr["id"]: pr for pr in ctx.base["peer_reviews"]}
+    min_score_entries: list[str] = []
+    name_token_entries: list[str] = []
+    for rid in pending_review_ids:
+        pr = _pending_lookup.get(rid)
+        if pr is None:
+            continue
+        prev = pr.get("previous_rubric_scores", {}) or {}
+        mins: list[str] = []
+        for crit in _criteria_order:
+            prev_val = prev.get(crit)
+            if prev_val is None:
+                # also tolerate normalised keys (e.g. spaces -> underscores)
+                prev_val = prev.get(crit.replace(" ", "_"))
+            if prev_val is not None:
+                required = min(int(prev_val) + 1, 5)
+            else:
+                required = 1
+            mins.append(str(required))
+        min_score_entries.append(f"{rid}={'~'.join(mins)}")
+        first_name = str(pr.get("reviewee_name", "")).split()[0] if pr.get("reviewee_name") else ""
+        name_token_entries.append(f"{rid}:{first_name}")
+
     return {
         "review_ids": review_ids,
         "pending_review_ids": pending_review_ids,
@@ -3383,4 +3420,7 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
         "returned_review_ids": returned_review_ids,
         "target_review_id": pending_review_ids[0] if pending_review_ids else (review_ids[0] if review_ids else ""),
         "peer_review_assignment_ids": peer_review_assignment_id_list,
+        "pending_review_min_scores": "|".join(min_score_entries),
+        "pending_review_name_tokens": "|".join(name_token_entries),
+        "pending_review_count": str(len(pending_review_ids)),
     }
