@@ -1753,10 +1753,62 @@ def build_lab_results_panel(ctx: PatientPortalSeedContext, params: dict[str, Any
                 if flag == "critical" and critical_lab_id is None:
                     critical_lab_id = lab["id"]
 
+    # Derived: the test_name / test_code of every out-of-range RESULTED lab
+    # (flag in {"abnormal", "critical"}), ordered by collected_at descending
+    # then lab id, deduplicated while preserving that order. Tasks that ask
+    # the agent to RE-DERIVE which resulted labs are out of range (e.g.
+    # pp_cross_reference_labs_meds) need a scalar list target so a
+    # `substring_all` / `set_eq` predicate can verify the agent named the
+    # exact abnormal panel — without pushing reference-range parsing into a
+    # `filter:`/`expr` scope (which only sees a+target+initial+state).
+    _all_labs_by_id = {lab["id"]: lab for lab in ctx.base["lab_results"]}
+    _abnormal_sorted = sorted(
+        abnormal_lab_ids,
+        key=lambda lid: (_all_labs_by_id[lid]["collected_at"], lid),
+        reverse=True,
+    )
+    abnormal_lab_test_names: list[str] = []
+    abnormal_lab_test_codes: list[str] = []
+    # Per-lab "<test_name> <value> <unit>" label for every out-of-range
+    # RESULTED lab, in the same (collected_at desc, id) order. Tasks that want
+    # the agent to RE-DERIVE and quote each abnormal reading's actual value —
+    # not merely list the test names — pin a `substring_all`/expr predicate
+    # against this scalar list so a generic "review your labs" reason cannot
+    # satisfy the gate. The unit is appended only when non-empty (e.g. INR has
+    # no unit) so the label is an exact substring an agent can reproduce.
+    abnormal_lab_value_labels: list[str] = []
+    # test_name of the single most-severe (critical) out-of-range RESULTED lab.
+    # Empty string when no critical lab exists. Lets a task escalate the
+    # most-tempting "abnormal vs critical" distinction into an exact predicate
+    # without pushing flag parsing into a filter scope.
+    critical_lab_test_name: str = ""
+    for lid in _abnormal_sorted:
+        lab = _all_labs_by_id.get(lid)
+        if lab is None:
+            continue
+        if lab["test_name"] not in abnormal_lab_test_names:
+            abnormal_lab_test_names.append(lab["test_name"])
+        if lab["test_code"] not in abnormal_lab_test_codes:
+            abnormal_lab_test_codes.append(lab["test_code"])
+        unit = str(lab.get("unit") or "").strip()
+        value_label = (
+            f"{lab['test_name']} {lab['value']} {unit}".strip()
+            if unit
+            else f"{lab['test_name']} {lab['value']}".strip()
+        )
+        if value_label not in abnormal_lab_value_labels:
+            abnormal_lab_value_labels.append(value_label)
+        if not critical_lab_test_name and lab.get("flag") == "critical":
+            critical_lab_test_name = lab["test_name"]
+
     return {
         "resulted_lab_ids": resulted_lab_ids,
         "pending_lab_ids": pending_lab_ids,
         "abnormal_lab_ids": abnormal_lab_ids,
+        "abnormal_lab_test_names": abnormal_lab_test_names,
+        "abnormal_lab_test_codes": abnormal_lab_test_codes,
+        "abnormal_lab_value_labels": abnormal_lab_value_labels,
+        "critical_lab_test_name": critical_lab_test_name,
         "critical_lab_id": critical_lab_id,
         "trend_lab_ids": trend_lab_ids,
         "trend_test_name": trend_test_name,
