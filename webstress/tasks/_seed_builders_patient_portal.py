@@ -621,16 +621,31 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
             (or the caller must guarantee it ends up in the selection) —
             otherwise `target_pharmacy_id` may be None.
     Outputs: pharmacy_ids, default_pharmacy_id, mail_order_pharmacy_id,
-             target_pharmacy_id, new_default_pharmacy_id
+             target_pharmacy_id, new_default_pharmacy_id,
+             lowest_fee_retail_pharmacy_id, lowest_fee_retail_pharmacy_name,
+             retail_fee_by_id
 
     ``new_default_pharmacy_id`` is the first non-default, non-mail-order
     retail pharmacy in ``pharmacy_ids`` (i.e. ``selected[1]`` when count >= 2).
     Tasks like ``pp_coordinate_rx_transfer`` that tell the agent to transfer
     prescriptions to "another retail pharmacy in your pharmacy list" use this
     as the canonical new-default answer.
+
+    ``distinct_retail_fees`` (list[int]): when supplied, the retail pharmacies
+    are assigned these dispensing fees in selection order (recycled if the
+    list is shorter than the count). This makes the "lowest dispensing fee"
+    discriminator deterministic and unambiguous across seeds. When omitted,
+    each retail pharmacy gets a random fee from ``[5, 8, 10, 12]`` (legacy
+    behaviour).
+
+    ``lowest_fee_retail_pharmacy_id`` is the id of the non-default, non-mail
+    -order retail pharmacy with the strictly lowest ``dispensing_fee``,
+    breaking ties by the lower numeric id suffix. Tasks that ask the agent to
+    re-derive the cheapest retail pharmacy use this as the canonical answer.
     """
     count = params.get("count", 2)
     include_mail_order = params.get("include_mail_order", False)
+    distinct_retail_fees_raw = params.get("distinct_retail_fees")
     must_include_raw = params.get("must_include_name") or []
     if isinstance(must_include_raw, str):
         must_include_names = [must_include_raw]
@@ -673,10 +688,19 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
     target_pharmacy_id: str | None = None
     new_default_pharmacy_id: str | None = None
 
+    # Deterministic distinct dispensing fees in selection order, when the
+    # caller wants an unambiguous "lowest fee" discriminator.
+    distinct_retail_fees: list[int] | None = None
+    if distinct_retail_fees_raw:
+        distinct_retail_fees = [int(f) for f in distinct_retail_fees_raw]
+
     for i, tmpl in enumerate(selected):
         pharm_id = ctx.next_id("pharm")
         is_default = i == 0
-        dispensing_fee = Decimal(str(ctx.rng.choice([5, 8, 10, 12])))
+        if distinct_retail_fees:
+            dispensing_fee = Decimal(str(distinct_retail_fees[i % len(distinct_retail_fees)]))
+        else:
+            dispensing_fee = Decimal(str(ctx.rng.choice([5, 8, 10, 12])))
 
         pharm_dict = {
             "id": pharm_id,
@@ -722,12 +746,43 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
     if "patient" in ctx.base:
         ctx.base["patient"]["pharmacy_ids"] = pharmacy_ids
 
+    # Compute the cheapest NON-DEFAULT, NON-MAIL-ORDER retail pharmacy. This is
+    # the canonical answer for tasks that ask the agent to re-derive "lowest
+    # dispensing fee retail pharmacy" rather than naming the store. Tie-break by
+    # the lower numeric id suffix so the answer is deterministic when two
+    # retail pharmacies share a fee.
+    def _id_suffix(pid: str) -> int:
+        try:
+            return int(pid.rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    retail_candidates = [
+        p for p in ctx.base.get("pharmacies", [])
+        if not p.get("is_mail_order") and not p.get("is_default")
+    ]
+    lowest_fee_retail_pharmacy_id: str | None = None
+    lowest_fee_retail_pharmacy_name: str | None = None
+    retail_fee_by_id: dict[str, str] = {
+        p["id"]: str(p["dispensing_fee"]) for p in retail_candidates
+    }
+    if retail_candidates:
+        cheapest = min(
+            retail_candidates,
+            key=lambda p: (Decimal(str(p["dispensing_fee"])), _id_suffix(p["id"])),
+        )
+        lowest_fee_retail_pharmacy_id = cheapest["id"]
+        lowest_fee_retail_pharmacy_name = cheapest["name"]
+
     return {
         "pharmacy_ids": pharmacy_ids,
         "default_pharmacy_id": default_pharmacy_id,
         "mail_order_pharmacy_id": mail_order_pharmacy_id,
         "target_pharmacy_id": target_pharmacy_id,
         "new_default_pharmacy_id": new_default_pharmacy_id,
+        "lowest_fee_retail_pharmacy_id": lowest_fee_retail_pharmacy_id,
+        "lowest_fee_retail_pharmacy_name": lowest_fee_retail_pharmacy_name,
+        "retail_fee_by_id": retail_fee_by_id,
     }
 
 
@@ -1031,6 +1086,14 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     # already at the destination) so the canonical_diff update[0] bijection
     # saturates.
     active_at_default_only = bool(params.get("active_at_default_only", False))
+    # PP: place exactly the first N active prescriptions on the default
+    # pharmacy (the "transfer set") and the remaining active prescriptions on
+    # `active_trap_pharmacy_id` (a non-default retail pharmacy that should NOT
+    # be touched). Lets a task expose `active_at_default_rx_ids` so a transfer
+    # bijection saturates over exactly the rxes at the closing/old default
+    # while sibling rxes at another pharmacy act as a frozen distractor set.
+    active_at_default_count = int(params.get("active_at_default_count", 0) or 0)
+    active_trap_pharmacy_id: str | None = params.get("active_trap_pharmacy_id")
 
     if "prescriptions" not in ctx.base:
         ctx.base["prescriptions"] = []
@@ -1071,6 +1134,7 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         force_retail_pharmacy: bool = False,
         exclude_pharmacy_name: str | None = None,
         force_default_pharmacy: bool = False,
+        pin_pharmacy_id: str | None = None,
     ) -> dict[str, Any]:
         nonlocal med_idx
         rx_id = ctx.next_id("rx")
@@ -1091,7 +1155,13 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             ]
             if filtered:
                 available_pharmacies = filtered
-        pharm_id = ctx.rng.choice([p["id"] for p in available_pharmacies]) if available_pharmacies else default_pharm_id
+        if pin_pharmacy_id and any(p["id"] == pin_pharmacy_id for p in pharmacies):
+            # Deterministically place this rx on a specific pharmacy (used to
+            # build a controlled "transfer set" at the default and a frozen
+            # distractor set at another retail pharmacy).
+            pharm_id = pin_pharmacy_id
+        else:
+            pharm_id = ctx.rng.choice([p["id"] for p in available_pharmacies]) if available_pharmacies else default_pharm_id
         last_filled = ctx.now - timedelta(days=ctx.rng.randint(7, 60))
         expires_at = ctx.now + timedelta(days=expires_days)
 
@@ -1110,7 +1180,8 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         }
 
     # Active prescriptions (normal refills)
-    for _ in range(active_count):
+    active_at_default_rx_ids: list[str] = []
+    for active_idx in range(active_count):
         if med_idx >= len(med_pool):
             break
         med = med_pool[med_idx]
@@ -1123,6 +1194,16 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         exclude_pharmacy_for_rx = (
             target_exclude_pharmacy_name if is_target_med else None
         )
+        # When active_at_default_count is set: pin the first N active rxes to
+        # the default pharmacy (the transfer set) and the rest to the trap
+        # pharmacy (a frozen distractor set). This takes precedence over the
+        # random/force_default placement so the split is deterministic.
+        pin_pharmacy_for_rx: str | None = None
+        if active_at_default_count > 0:
+            if active_idx < active_at_default_count:
+                pin_pharmacy_for_rx = default_pharm_id
+            elif active_trap_pharmacy_id:
+                pin_pharmacy_for_rx = active_trap_pharmacy_id
         rx = _make_rx(
             med,
             "active",
@@ -1131,9 +1212,16 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             force_retail_pharmacy=force_retail_pharmacy,
             exclude_pharmacy_name=exclude_pharmacy_for_rx,
             force_default_pharmacy=active_at_default_only,
+            pin_pharmacy_id=pin_pharmacy_for_rx,
         )
         ctx.base["prescriptions"].append(rx)
         active_rx_ids.append(rx["id"])
+        if (
+            active_at_default_count > 0
+            and active_idx < active_at_default_count
+            and rx["pharmacy_id"] == default_pharm_id
+        ):
+            active_at_default_rx_ids.append(rx["id"])
         # Track target rx if this medication matches the pinned target
         if target_medication_name and target_rx_id is None:
             if target_medication_name.lower() in med["name"].lower():
@@ -1226,6 +1314,7 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
 
     return {
         "active_rx_ids": active_rx_ids,
+        "active_at_default_rx_ids": active_at_default_rx_ids,
         "zero_refill_rx_id": zero_refill_rx_id,
         "zero_refill_medication": zero_refill_medication,
         "target_rx_id": target_rx_id,

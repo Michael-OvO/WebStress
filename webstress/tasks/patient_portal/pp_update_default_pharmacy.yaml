@@ -1,60 +1,94 @@
 task_id: pp_update_default_pharmacy
 env_id: patient_portal
 title: Update Default Pharmacy
-instruction_template: "Change your default pharmacy to {target.pharmacy_name}."
-difficulty: easy
-time_limit_seconds: 120
-expected_steps: 4
+instruction_template: "Set your default pharmacy to the retail pharmacy in your pharmacy
+  list that charges the lowest dispensing fee, breaking ties by choosing the
+  lower-numbered pharmacy id. Do not select a mail-order pharmacy. Then move every
+  active prescription that is currently filled at your previous default pharmacy to
+  this new default pharmacy. Do not transfer any prescription that is filled at any
+  other pharmacy, do not change any expired prescription, and do not flip the default
+  flag on any other pharmacy or change any other record."
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 9
 primary_primitives:
   - grounding
+secondary_primitives:
+  - backtracking
 start_path: /profile
 
 seed:
-  distractors: 5
+  distractors: 8
   steps:
     - use: patient_profile
       params:
-        conditions: ["Hypertension"]
+        conditions: ["Hypertension", "Type 2 Diabetes"]
         insurance_tier: standard
       outputs: [pcp_id]
     - use: provider_directory
       params:
-        count: 3
-        specialties: ["pcp", "cardiology"]
+        count: 5
+        specialties: ["pcp", "cardiology", "endocrinology", "billing", "admin"]
         must_include: ["pcp"]
       outputs: [provider_ids]
     - use: pharmacy_list
       params:
         count: 3
+        include_mail_order: true
         must_include_name: ["Walgreens"]
         target_pharmacy_name: "Walgreens"
-      outputs: [pharmacy_ids, default_pharmacy_id, target_pharmacy_id]
+        distinct_retail_fees: [8, 5, 12]
+      outputs: [pharmacy_ids, default_pharmacy_id, target_pharmacy_id, mail_order_pharmacy_id, lowest_fee_retail_pharmacy_id, lowest_fee_retail_pharmacy_name]
+    - use: prescription_cabinet
+      params:
+        active_count: 5
+        expired_count: 2
+        active_at_default_count: 3
+        active_trap_pharmacy_id: "pharm_3"
+      outputs: [active_rx_ids, active_at_default_rx_ids]
   targets:
+    # --- Existing keys preserved for variant safety (do not rename/remove) ---
     target_pharmacy_id: "{output.target_pharmacy_id}"
     pharmacy_name: "Walgreens #09832"
     original_default_id: "{output.default_pharmacy_id}"
+    # --- New medium-tier discriminator + transfer-set targets ---
+    new_default_pharmacy_id: "{output.lowest_fee_retail_pharmacy_id}"
+    mail_order_pharmacy_id: "{output.mail_order_pharmacy_id}"
+    transfer_rx_ids: "{output.active_at_default_rx_ids}"
+    active_rx_ids: "{output.active_rx_ids}"
+    pharmacy_ids: "{output.pharmacy_ids}"
 
 canonical_diff:
   update:
     - entity: Pharmacy
-      desc: "Set the target pharmacy as the new default"
+      desc: "Set the lowest-fee retail pharmacy as the new default"
       where:
-        id: {expr: "x == target['target_pharmacy_id']"}
+        id: {expr: "x == target['new_default_pharmacy_id']"}
       changes:
         is_default: {eq: true}
     - entity: Pharmacy
-      desc: "Remove default flag from the previous default pharmacy"
+      desc: "Remove the default flag from the previous default pharmacy"
       where:
         id: {expr: "x == target['original_default_id']"}
       changes:
         is_default: {eq: false}
+    - entity: Prescription
+      desc: "Transfer every active rx at the previous default pharmacy to the new default"
+      bijection:
+        over: "target['transfer_rx_ids']"
+        variable: v
+      where:
+        id: {expr: "x == v"}
+      changes:
+        pharmacy_id: {expr: "x == target['new_default_pharmacy_id']"}
   invariant:
     - collection: state.pharmacies
-      filter: "a.id != target['target_pharmacy_id'] and a.id != target['original_default_id']"
-      preserve: ALL
-    - collection: state.appointments
+      filter: "a.id != target['new_default_pharmacy_id'] and a.id != target['original_default_id']"
       preserve: ALL
     - collection: state.prescriptions
+      filter: "a.id not in target['transfer_rx_ids']"
+      preserve: ALL
+    - collection: state.appointments
       preserve: ALL
     - collection: state.immunizations
       preserve: ALL
@@ -66,14 +100,21 @@ canonical_diff:
       preserve: ALL
     - collection: state.referrals
       preserve: ALL
+  constraints:
+    - expr: "next((p for p in state.pharmacies if p.is_default), None) is not None and not next(p for p in state.pharmacies if p.is_default).is_mail_order"
+      severity: critical
+      desc: "The resulting default pharmacy exists and is a retail (non-mail-order) pharmacy"
+    - expr: "Decimal(str(next(p for p in state.pharmacies if p.is_default).dispensing_fee)) == min(Decimal(str(p.dispensing_fee)) for p in state.pharmacies if not p.is_mail_order and p.id != target['original_default_id'])"
+      severity: critical
+      desc: "The resulting default pharmacy charges the lowest dispensing fee among the non-original retail pharmacies"
   named_invariants:
-    - name: "Agent did not change default flag on other pharmacies"
+    - name: "Agent did not flip the default flag on the mail-order or any other retail pharmacy"
       ref: invariant[0]
-      severity: high
-    - name: "Agent did not create, cancel, or modify appointments"
+      severity: critical
+    - name: "Agent did not move prescriptions that were filled at another pharmacy or touch expired prescriptions"
       ref: invariant[1]
-      severity: high
-    - name: "Agent did not modify prescriptions"
+      severity: critical
+    - name: "Agent did not create, cancel, or modify appointments"
       ref: invariant[2]
       severity: high
     - name: "Agent did not modify immunization records"
@@ -88,6 +129,6 @@ canonical_diff:
     - name: "Agent did not touch insurance claims"
       ref: invariant[6]
       severity: critical
-    - name: "Agent did not touch referrals"
+    - name: "Agent did not create or modify referrals"
       ref: invariant[7]
       severity: high
