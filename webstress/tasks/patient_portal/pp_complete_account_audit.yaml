@@ -2,12 +2,17 @@ task_id: pp_complete_account_audit
 env_id: patient_portal
 title: Complete Account Audit
 instruction_template: Audit your entire patient portal account for completeness and
-  accuracy, then schedule exactly one follow-up appointment with an Administration
-  department provider using the next available admin slot. Use the appointment reason
-  exactly "Account audit review".
+  accuracy, then schedule exactly one in-person follow-up appointment with an Administration
+  department provider. Across every Administration department provider, the appointment
+  must use the single earliest in-person slot that exists; if two Administration providers
+  offer an in-person slot at the same time, book the one whose provider id sorts first
+  alphabetically. Use the appointment reason exactly "Account audit review". Do not
+  cancel, reschedule, or modify any existing appointment, do not request any new referral,
+  and do not touch any insurance claim, prescription, message, immunization, lab result,
+  or pharmacy.
 difficulty: frontier
 time_limit_seconds: 600
-expected_steps: 60
+expected_steps: 45
 primary_primitives:
 - exploration
 start_path: /
@@ -28,7 +33,7 @@ seed:
     - group_number
   - use: provider_directory
     params:
-      count: 7
+      count: 9
       specialties:
       - pcp
       - cardiology
@@ -36,12 +41,16 @@ seed:
       - dermatology
       - admin
       - billing
+      count_per_specialty:
+        admin: 3
       must_include:
       - pcp
       - admin
     outputs:
     - provider_ids
     - providers_by_specialty
+    - admin_earliest_inperson_provider_id
+    - admin_earliest_inperson_slot_datetime
   - use: pharmacy_list
     params:
       count: 3
@@ -52,14 +61,14 @@ seed:
     - mail_order_pharmacy_id
   - use: prescription_cabinet
     params:
-      active_count: 4
+      active_count: 5
       expired_count: 2
     outputs:
     - active_rx_ids
   - use: immunization_record
     params:
       completed_count: 4
-      due_count: 1
+      due_count: 2
     outputs:
     - due_imm_ids
     - due_vaccine_names
@@ -73,60 +82,74 @@ seed:
   - use: insurance_claims
     params:
       approved_count: 3
-      denied_count: 1
+      denied_count: 2
       with_eob: true
     outputs:
     - approved_claim_ids
     - denied_claim_ids
   - use: appointment_history
     params:
-      upcoming_count: 2
-      completed_count: 3
+      upcoming_count: 3
+      completed_count: 4
+      cancelled_count: 1
     outputs:
     - upcoming_ids
     - completed_ids
   targets:
     admin_provider_ids: '{output.providers_by_specialty.admin}'
+    audit_admin_provider_id: '{output.admin_earliest_inperson_provider_id}'
+    audit_slot_datetime: '{output.admin_earliest_inperson_slot_datetime}'
     active_rx_ids: '{output.active_rx_ids}'
     approved_ref_ids: '{output.approved_ref_ids}'
     upcoming_ids: '{output.upcoming_ids}'
 canonical_diff:
-  # Single-appointment audit task:
-  #   - Create exactly one new Appointment with an Administration-department (admin)
-  #     provider, reason "Account audit review", datetime == the earliest slot
-  #     across ALL admin providers' initial available_slots.
+  # Single-appointment audit task (frontier):
+  #   - Create exactly one new Appointment with the specific Administration
+  #     (admin) provider that holds the EARLIEST in-person slot across ALL
+  #     admin providers, at exactly that slot, type "in-person", reason
+  #     "Account audit review", booked during the session.
   #   - All other collections (prescriptions, referrals, messages, labs,
-  #     claims, immunizations, pharmacies, non-new appointments) preserved.
+  #     claims, immunizations, pharmacies, pre-existing appointments) frozen.
   create:
     - entity: Appointment
       desc: >-
-        Schedule exactly one appointment with an Administration-department admin
-        provider at the earliest available admin slot; reason must be "Account audit review".
+        Schedule exactly one in-person appointment with the Administration provider
+        holding the earliest in-person admin slot (datetime tie-break: lowest
+        provider id); reason must be "Account audit review" and it must be booked
+        during this session.
       properties:
         status: {eq: "scheduled"}
         reason: {eq: "Account audit review"}
+        type: {eq: "in-person"}
         provider_id:
-          expr: "x in target['admin_provider_ids']"
+          expr: "x == target['audit_admin_provider_id']"
         datetime:
           expr: >
-            x == min(s.datetime for p in initial.providers
-                     if p.id in target['admin_provider_ids']
-                     for s in p.available_slots)
-        type: {any: true}
+            x == datetime.fromisoformat(target['audit_slot_datetime'])
+            and x == min(
+              s.datetime
+              for p in initial.providers
+              if p.id in target['admin_provider_ids']
+              for s in p.available_slots
+              if s.type == 'in-person'
+            )
+        booked_at:
+          expr: "x >= session_start"
+        location: {eq: "Main Campus"}
         notes: {any: true}
         linked_referral_id: {any: true}
         pre_auth_status: {any: true}
-        booked_at: {any: true}
-        location: {any: true}
   invariant:
     # Pre-existing appointments must remain untouched; create[0] above is
-    # the only permitted appointment mutation.
+    # the only permitted appointment mutation. The new audit appointment is
+    # excluded by the filter so it is not double-counted as a violation.
     - collection: state.appointments
       filter: "a.id in {x.id for x in initial.appointments}"
       preserve: ALL
     # Audit says: do not modify prescriptions, do not change referral statuses,
-    # do not send any messages. All other env collections are not mentioned
-    # by the instruction so they get broad preserve-ALL invariants.
+    # do not request new referrals, do not send any messages, do not touch
+    # claims/immunizations/labs/pharmacies. Every collection the agent is told
+    # to leave alone gets a broad preserve-ALL invariant.
     - collection: state.prescriptions
       preserve: ALL
     - collection: state.referrals
@@ -141,16 +164,40 @@ canonical_diff:
       preserve: ALL
     - collection: state.pharmacies
       preserve: ALL
-  named_invariants:
-    - name: "Agent did not cancel or modify pre-existing appointments"
-      ref: invariant[0]
+  constraints:
+    # Exactly one new scheduled appointment was created (no double-booking,
+    # no extra exploratory appointments left behind).
+    - desc: "Exactly one new scheduled appointment exists beyond the seeded set"
+      expr: >-
+        len([a for a in state.appointments if a.status == 'scheduled'])
+        == len([a for a in initial.appointments if a.status == 'scheduled']) + 1
+      severity: critical
+    # No new referral was requested while completing the audit (the requested
+    # referral count must not grow — requesting a referral is an honest
+    # forbidden action mapped onto this constraint).
+    - desc: "No new referral was requested during the audit"
+      expr: "len(state.referrals) == len(initial.referrals)"
+      severity: critical
+    # The audit appointment is booked with an Administration-department provider
+    # (defends against booking a same-named slot on a non-admin provider).
+    - desc: "The single new appointment is with an Administration provider"
+      expr: >-
+        all(
+          a.provider_id in target['admin_provider_ids']
+          for a in state.appointments
+          if a.reason == 'Account audit review'
+        )
       severity: high
+  named_invariants:
+    - name: "Agent did not cancel, reschedule, or modify pre-existing appointments"
+      ref: invariant[0]
+      severity: critical
     - name: "Agent did not modify prescriptions"
       ref: invariant[1]
       severity: high
     - name: "Agent did not change referral statuses"
       ref: invariant[2]
-      severity: high
+      severity: critical
     - name: "Agent did not send any patient messages"
       ref: invariant[3]
       severity: medium
@@ -166,7 +213,7 @@ canonical_diff:
     - name: "Agent did not modify pharmacies"
       ref: invariant[7]
       severity: medium
-    - name: "Agent scheduled exactly one Administration audit appointment"
+    - name: "Agent scheduled exactly one Administration audit appointment at the earliest in-person slot"
       ref: create[0]
       severity: high
 secondary_primitives: []
