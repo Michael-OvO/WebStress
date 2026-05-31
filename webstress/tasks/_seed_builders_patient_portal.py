@@ -238,6 +238,31 @@ _MAIL_ORDER_PHARMACY: dict[str, str] = {
     "phone": "(800) 555-1234",
 }
 
+# Additional mail-order pharmacy templates used when ``mail_order_count`` > 1.
+# The first mail-order pharmacy always uses ``_MAIL_ORDER_PHARMACY`` (the
+# legacy single-entry default); these supply distinct names/addresses for the
+# 2nd+ entries so a cost-comparison task can seed several mail-order options
+# the agent must price-compare. Order is fixed (not shuffled) so the
+# cheapest-by-cost answer depends purely on the rng-drawn cost values, not on
+# template ordering.
+_EXTRA_MAIL_ORDER_PHARMACIES: list[dict[str, str]] = [
+    {
+        "name": "OptumRx Home Delivery",
+        "address": "PO Box 30050, Salt Lake City, UT 84130",
+        "phone": "(800) 555-2233",
+    },
+    {
+        "name": "CarePlus Mail Pharmacy",
+        "address": "PO Box 9100, Orlando, FL 32819",
+        "phone": "(800) 555-3344",
+    },
+    {
+        "name": "Cornerstone Mail-Order Rx",
+        "address": "PO Box 4400, Columbus, OH 43215",
+        "phone": "(800) 555-4455",
+    },
+]
+
 
 # ---------------------------------------------------------------------------
 # PatientPortalSeedContext
@@ -611,6 +636,13 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
     Params:
         count (2-3)
         include_mail_order (bool)
+        mail_order_count (int): number of distinct mail-order pharmacies to
+            create, each with its own rng-drawn ``cost_per_90day_supply``.
+            Defaults to 1 when ``include_mail_order`` is True, 0 otherwise.
+            When > 1 the builder exposes ``mail_order_pharmacy_ids`` (all of
+            them), ``mail_order_costs`` (id → cost string), and
+            ``cheapest_mail_order_pharmacy_id`` (min cost, ties broken by
+            ascending pharmacy id).
         must_include_name (str | list[str]): case-insensitive substring(s) of
             pharmacy template names that MUST be present in the selected
             pharmacies. Each matched template is pinned before other
@@ -621,7 +653,9 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
             (or the caller must guarantee it ends up in the selection) —
             otherwise `target_pharmacy_id` may be None.
     Outputs: pharmacy_ids, default_pharmacy_id, mail_order_pharmacy_id,
-             target_pharmacy_id, new_default_pharmacy_id
+             mail_order_pharmacy_ids, mail_order_costs,
+             cheapest_mail_order_pharmacy_id, target_pharmacy_id,
+             new_default_pharmacy_id
 
     ``new_default_pharmacy_id`` is the first non-default, non-mail-order
     retail pharmacy in ``pharmacy_ids`` (i.e. ``selected[1]`` when count >= 2).
@@ -631,6 +665,15 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
     """
     count = params.get("count", 2)
     include_mail_order = params.get("include_mail_order", False)
+    # Number of distinct mail-order pharmacies to create, each with its own
+    # rng-drawn ``cost_per_90day_supply``. Defaults to 1 when
+    # ``include_mail_order`` is True (legacy single-mail-order behavior), 0
+    # otherwise. When > 1, the builder exposes the full ``mail_order_pharmacy_ids``
+    # list plus a precomputed ``cheapest_mail_order_pharmacy_id`` (min cost,
+    # ties broken by ascending pharmacy id) so cost-comparison tasks can pin
+    # the single correct destination without re-deriving the min inside a
+    # canonical_diff predicate (Class 6 hazard).
+    mail_order_count = int(params.get("mail_order_count", 1 if include_mail_order else 0))
     must_include_raw = params.get("must_include_name") or []
     if isinstance(must_include_raw, str):
         must_include_names = [must_include_raw]
@@ -702,21 +745,48 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
         ):
             target_pharmacy_id = pharm_id
 
-    if include_mail_order:
-        pharm_id = ctx.next_id("pharm")
-        pharm_dict = {
-            "id": pharm_id,
-            "name": _MAIL_ORDER_PHARMACY["name"],
-            "address": _MAIL_ORDER_PHARMACY["address"],
-            "phone": _MAIL_ORDER_PHARMACY["phone"],
-            "is_default": False,
-            "is_mail_order": True,
-            "dispensing_fee": "0",
-            "cost_per_90day_supply": str(Decimal(str(ctx.rng.randint(15, 45)))),
-        }
-        ctx.base["pharmacies"].append(pharm_dict)
-        pharmacy_ids.append(pharm_id)
-        mail_order_pharmacy_id = pharm_id
+    mail_order_pharmacy_ids: list[str] = []
+    mail_order_costs: dict[str, str] = {}
+    if mail_order_count > 0:
+        # Template 0 is always the legacy Express Scripts entry so existing
+        # single-mail-order tasks are byte-identical; entries 1+ pull from the
+        # extra pool. We never shuffle these so the cheapest answer is decided
+        # purely by the rng-drawn cost, never by template position.
+        mail_order_templates = [_MAIL_ORDER_PHARMACY] + _EXTRA_MAIL_ORDER_PHARMACIES
+        for mo_idx in range(mail_order_count):
+            tmpl = mail_order_templates[mo_idx % len(mail_order_templates)]
+            pharm_id = ctx.next_id("pharm")
+            cost = Decimal(str(ctx.rng.randint(15, 45)))
+            pharm_dict = {
+                "id": pharm_id,
+                "name": tmpl["name"],
+                "address": tmpl["address"],
+                "phone": tmpl["phone"],
+                "is_default": False,
+                "is_mail_order": True,
+                "dispensing_fee": "0",
+                "cost_per_90day_supply": str(cost),
+            }
+            ctx.base["pharmacies"].append(pharm_dict)
+            pharmacy_ids.append(pharm_id)
+            mail_order_pharmacy_ids.append(pharm_id)
+            mail_order_costs[pharm_id] = str(cost)
+            if mail_order_pharmacy_id is None:
+                # Preserve legacy semantics: ``mail_order_pharmacy_id`` is the
+                # FIRST mail-order pharmacy created (Express Scripts).
+                mail_order_pharmacy_id = pharm_id
+
+    # Precompute the single cheapest mail-order pharmacy by 90-day-supply cost
+    # (ties broken by ascending pharmacy id). Tasks that ask the agent to pick
+    # "the lowest-cost mail-order pharmacy" pin this scalar as the canonical
+    # destination so the bijection/where predicate never has to compute a min
+    # over a collection inside the filter scope.
+    cheapest_mail_order_pharmacy_id: str | None = None
+    if mail_order_pharmacy_ids:
+        cheapest_mail_order_pharmacy_id = min(
+            mail_order_pharmacy_ids,
+            key=lambda pid: (float(mail_order_costs[pid]), pid),
+        )
 
     # Update patient's pharmacy_ids
     if "patient" in ctx.base:
@@ -726,6 +796,9 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
         "pharmacy_ids": pharmacy_ids,
         "default_pharmacy_id": default_pharmacy_id,
         "mail_order_pharmacy_id": mail_order_pharmacy_id,
+        "mail_order_pharmacy_ids": mail_order_pharmacy_ids,
+        "mail_order_costs": mail_order_costs,
+        "cheapest_mail_order_pharmacy_id": cheapest_mail_order_pharmacy_id,
         "target_pharmacy_id": target_pharmacy_id,
         "new_default_pharmacy_id": new_default_pharmacy_id,
     }
@@ -983,8 +1056,8 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             expiring_soon_count (int), expiring_zero_refill_count (int),
             interaction_pair (bool)
     Outputs: active_rx_ids, zero_refill_rx_id, expiring_rx_ids,
-             expiring_zero_refill_rx_ids, interacting_rx_ids,
-             interacting_medications
+             expiring_zero_refill_rx_ids, retail_refillable_active_rx_ids,
+             interacting_rx_ids, interacting_medications
 
     Note on ``expiring_zero_refill_count``: forces the first N entries of
     the ``expiring_rx_ids`` subset to have ``refills_remaining == 0``. This
@@ -1201,6 +1274,28 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         if rid not in expiring_zero_refill_rx_ids
     ]
 
+    # Cost-optimization eligibility set: the active prescriptions that are both
+    # (a) currently dispensed by a RETAIL (non-mail-order) pharmacy and
+    # (b) have at least one refill remaining (so they can actually be filled at
+    # a new pharmacy without first requiring a renewal). These are the only
+    # prescriptions a "move my refillable retail prescriptions to mail order"
+    # task should transfer. Active rxes that are already at a mail-order
+    # pharmacy, or that have zero refills remaining, are deliberately EXCLUDED
+    # and must be left frozen. Precomputed here as a scalar list so the
+    # canonical_diff bijection can iterate it directly (Class 6: never compute
+    # this set inside a filter/where predicate). Ids are returned in
+    # active_rx_ids order for determinism.
+    mail_order_pharm_ids = {
+        p["id"] for p in pharmacies if p.get("is_mail_order")
+    }
+    rx_by_id = {rx["id"]: rx for rx in ctx.base["prescriptions"]}
+    retail_refillable_active_rx_ids = [
+        rid for rid in active_rx_ids
+        if (rx := rx_by_id.get(rid)) is not None
+        and rx.get("pharmacy_id") not in mail_order_pharm_ids
+        and int(rx.get("refills_remaining", 0)) >= 1
+    ]
+
     return {
         "active_rx_ids": active_rx_ids,
         "zero_refill_rx_id": zero_refill_rx_id,
@@ -1209,6 +1304,7 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         "expiring_rx_ids": expiring_rx_ids,
         "expiring_zero_refill_rx_ids": expiring_zero_refill_rx_ids,
         "expiring_with_refills_rx_ids": expiring_with_refills_rx_ids,
+        "retail_refillable_active_rx_ids": retail_refillable_active_rx_ids,
         "interacting_rx_ids": interacting_rx_ids,
         "interacting_medications": interacting_medications,
     }
