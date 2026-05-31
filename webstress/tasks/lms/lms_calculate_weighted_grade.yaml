@@ -1,15 +1,21 @@
 task_id: lms_calculate_weighted_grade
 env_id: lms
 title: Calculate Current Weighted Grade
-instruction_template: Navigate to the grades page for {target.course_code}. Verify
-  the overall weighted grade displayed matches what you compute from the syllabus
-  weights and individual assignment scores. If you find a discrepancy of more than
-  1 point from the displayed score, resubmit the most recently graded assignment with
-  file 'grade_dispute.pdf'. If the grade is correct (within 1 point), mark the course's
-  latest announcement as read to confirm you've reviewed your standing.
-difficulty: medium
-time_limit_seconds: 180
-expected_steps: 8
+instruction_template: Navigate to the grades page for {target.course_code} and review
+  the grades page for every course you are enrolled in. For each course, recompute
+  the overall weighted grade from the syllabus category weights, the individual
+  assignment scores, and the drop-lowest policy, then compare your computed value
+  to the weighted grade the system displays. A course has a discrepancy when your
+  computed grade differs from the displayed grade by more than 1 point. If at least
+  one course has a discrepancy, resubmit the single most recently graded assignment
+  (the graded assignment with the latest due date across all your courses) with file
+  'grade_dispute.pdf'. If no course has a discrepancy, instead mark the latest
+  announcement in {target.course_code} as read to confirm you reviewed your standing.
+  Do not modify any grade record, do not drop or complete any course or module, and
+  do not send any messages.
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 16
 primary_primitives:
 - verification
 start_path: /courses
@@ -22,7 +28,7 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 3
+      count: 4
       must_include:
       - CS101
     outputs:
@@ -35,7 +41,7 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 8
+      per_course_count: 10
       graded_fraction: 0.6
     outputs:
     - assignment_ids
@@ -47,10 +53,13 @@ seed:
     - dropped_grade_ids
     - has_discrepancy
     - most_recent_graded_id
+    - discrepant_course_ids
+    - discrepant_resubmit_assignment_ids
+    - non_discrepant_course_ids
   - use: announcements_feed
     params:
-      count: 2
-      unread_count: 2
+      count: 4
+      unread_count: 3
     outputs:
     - announcement_ids
     - latest_announcement_id
@@ -60,14 +69,19 @@ seed:
     has_discrepancy: '{output.has_discrepancy}'
     most_recent_graded_id: '{output.most_recent_graded_id}'
     latest_announcement_id: '{output.latest_announcement_id}'
+    discrepant_course_ids: '{output.discrepant_course_ids}'
+    non_discrepant_course_ids: '{output.non_discrepant_course_ids}'
 canonical_diff:
   oneof:
-    # Branch discriminator baked into the Update where-clause (was previously
-    # a critical-severity constraint). Branch 1 only matches when target has a
-    # weighted-grade discrepancy.
+    # ── Branch 1 — at least one enrolled course has a weighted-grade discrepancy.
+    # The agent must recompute every course's weighted grade (with drop-lowest)
+    # to confirm has_discrepancy is 'true', then resubmit the single most recently
+    # graded assignment (latest due_at across all courses) with grade_dispute.pdf.
+    # The attempt-count gate is re-derived from the initial snapshot (not a literal)
+    # so a no-op submit on an already-attempted assignment cannot satisfy it.
     - update:
         - entity: Assignment
-          desc: Resubmit the most recently graded assignment with grade_dispute.pdf (target has discrepancy)
+          desc: Resubmit the most_recent_graded_id assignment with grade_dispute.pdf (a course has_discrepancy)
           where:
             id:
               expr: "x == target['most_recent_graded_id'] and target['has_discrepancy'] == 'true'"
@@ -79,7 +93,7 @@ canonical_diff:
             file_name:
               eq: grade_dispute.pdf
             attempt_count:
-              expr: "x >= 2"
+              expr: "x >= initial.get_assignment(target['most_recent_graded_id']).attempt_count + 1"
             submitted_at:
               expr: "x >= session_start"
       invariant:
@@ -109,9 +123,18 @@ canonical_diff:
         - collection: state.student
           preserve: ALL
       constraints:
-        - desc: Agent did not send messages
+        - desc: Agent did not send any messages
           expr: "len(state.sent_messages) == 0"
+          severity: high
+        - desc: Agent did not drop or complete any course (every enrollment stays enrolled)
+          expr: "all(e.status == 'enrolled' for e in state.enrollments)"
+          severity: high
+        - desc: Agent did not complete any module (no module flipped to completed)
+          expr: "len([m for m in state.modules if m.status == 'completed']) == len([m for m in initial.modules if m.status == 'completed'])"
           severity: medium
+        - desc: Exactly one assignment was resubmitted (only the most_recent_graded_id one)
+          expr: "len([a for a in state.assignments if a.attempt_count > initial.get_assignment(a.id).attempt_count]) == 1"
+          severity: high
       named_invariants:
         - name: Agent resubmitted the most recent graded assignment
           ref: update[0]
@@ -137,22 +160,24 @@ canonical_diff:
         - name: Agent did not alter peer reviews
           ref: invariant[6]
           severity: medium
-        - name: Agent did not modify announcements
+        - name: Agent did not mark any announcement read (wrong branch)
           ref: invariant[7]
-          severity: medium
-        - name: Agent did not modify grades
-          ref: invariant[8]
           severity: high
+        - name: Agent did not modify any grade record
+          ref: invariant[8]
+          severity: critical
         - name: Agent did not modify calendar events
           ref: invariant[9]
           severity: low
         - name: Agent did not send messages
           ref: invariant[10]
-          severity: medium
-    # Branch 2: only matches when there is no discrepancy.
+          severity: high
+    # ── Branch 2 — no enrolled course has a weighted-grade discrepancy.
+    # The agent must recompute every course's weighted grade, confirm has_discrepancy
+    # is 'false', and mark the latest announcement in the target course as read.
     - update:
         - entity: Announcement
-          desc: Mark the latest announcement as read after reviewing the grade (no discrepancy)
+          desc: Mark the latest announcement in the target course as read (no course has_discrepancy)
           where:
             id:
               expr: "x == target['latest_announcement_id'] and target['has_discrepancy'] == 'false'"
@@ -186,9 +211,15 @@ canonical_diff:
         - collection: state.student
           preserve: ALL
       constraints:
-        - desc: Agent did not send messages
+        - desc: Agent did not send any messages
           expr: "len(state.sent_messages) == 0"
-          severity: medium
+          severity: high
+        - desc: Agent did not drop or complete any course (every enrollment stays enrolled)
+          expr: "all(e.status == 'enrolled' for e in state.enrollments)"
+          severity: high
+        - desc: Agent did not resubmit any assignment (wrong branch — most_recent_graded_id untouched)
+          expr: "all(a.attempt_count == initial.get_assignment(a.id).attempt_count for a in state.assignments)"
+          severity: high
       named_invariants:
         - name: Agent marked the latest announcement as read
           ref: update[0]
@@ -202,9 +233,9 @@ canonical_diff:
         - name: Agent did not drop or alter enrollments
           ref: invariant[2]
           severity: high
-        - name: Agent did not modify assignments
+        - name: Agent did not modify assignments (wrong branch)
           ref: invariant[3]
-          severity: medium
+          severity: high
         - name: Agent did not modify modules
           ref: invariant[4]
           severity: medium
@@ -217,13 +248,13 @@ canonical_diff:
         - name: Agent did not alter peer reviews
           ref: invariant[7]
           severity: medium
-        - name: Agent did not modify grades
+        - name: Agent did not modify any grade record
           ref: invariant[8]
-          severity: high
+          severity: critical
         - name: Agent did not modify calendar events
           ref: invariant[9]
           severity: low
         - name: Agent did not send messages
           ref: invariant[10]
-          severity: medium
+          severity: high
 secondary_primitives: []
