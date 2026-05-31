@@ -1,12 +1,17 @@
 task_id: lms_complete_prerequisite_module
 env_id: lms
-title: Complete Prerequisite Module to Unlock Next
-instruction_template: In {target.course_code}, complete module "{target.module_title}"
-  so that the next module in the sequence becomes unlocked. Make sure all content
-  items in the module are completed before marking it done.
-difficulty: medium
-time_limit_seconds: 180
-expected_steps: 10
+title: Advance the Prerequisite Chain Through the Min-Score Gate
+instruction_template: In {target.course_code}, advance the prerequisite chain by completing
+  exactly two consecutive modules. First complete "{target.module_title}" (the next available
+  module in the course). Then complete the single module that sits immediately after it in
+  the prerequisite sequence, whose unlock condition is a minimum-score gate satisfied by
+  completing the earlier module. For each of the two modules, mark every content item complete
+  before marking the module itself done, and complete the modules in sequence order so the
+  later module's prerequisite is met first. Do not mark any other module complete, and do not
+  send any messages.
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 18
 primary_primitives:
 - planning
 start_path: /courses
@@ -19,7 +24,7 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 2
+      count: 3
       must_include:
       - CS101
     outputs:
@@ -30,10 +35,16 @@ seed:
     params: {}
     outputs:
     - enrollment_ids
+  - use: assignment_battery
+    params:
+      per_course_count: 5
+      graded_fraction: 0.4
+    outputs:
+    - assignment_ids
   - use: module_sequence
     params:
-      count: 4
-      chain_type: linear
+      count: 5
+      chain_type: mixed
       completed_count: 1
     outputs:
     - module_ids
@@ -42,6 +53,7 @@ seed:
   targets:
     course_code: '{output.course_code}'
     target_course_id: '{output.target_course_id}'
+    module_ids: '{output.module_ids}'
     next_available_module_id: '{output.next_available_module_id}'
     first_locked_module_id: '{output.first_locked_module_id}'
     module_title: Module 2
@@ -49,24 +61,33 @@ seed:
 canonical_diff:
   update:
   - entity: Module
-    desc: Complete the specified module after finishing all of its content items
+    desc: Complete exactly the next available module and the min-score-gated module after
+      it, each only after all of its content items are marked complete
+    bijection:
+      over: "target['module_ids'].split(',')[1:3]"
+      variable: v
     where:
       id:
-        expr: "x == target['next_available_module_id']"
+        expr: "x == v"
     changes:
       status: {eq: completed}
       content_items:
-        expr: "all(item.get('completed') is True for item in x)"
+        expr: "len(x) >= 2 and all(item.get('completed') is True for item in x)"
   - entity: Module
-    desc: Unlock the next module in the sequence
+    desc: The module immediately downstream of the completed pair becomes available via the
+      server cascade
     where:
       id:
-        expr: "x == target['first_locked_module_id']"
+        expr: "x == target['module_ids'].split(',')[3]"
     changes:
       status: {eq: available}
   invariant:
     - collection: state.modules
-      filter: "a.id not in [target['next_available_module_id'], target['first_locked_module_id']]"
+      # Indices [1:4] cover the two intended completions (module index 1 = next available,
+      # index 2 = min-score-gated successor) plus index 3, which the server auto-unlocks
+      # (locked -> available) the instant index 2 is completed. Penalising that cascade would
+      # be a false positive. Index 0 (already completed) and index 4 (still locked) stay frozen.
+      filter: "a.id not in target['module_ids'].split(',')[1:4]"
       preserve: ALL
       comprehensive: true
     - collection: state.courses
@@ -94,12 +115,18 @@ canonical_diff:
   constraints:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
-    severity: medium
+    severity: critical
+  - desc: Within the target chain, exactly three modules are completed (the one already done plus the two named) and no further chain module was marked complete
+    expr: "len([m for m in state.modules if m.status == 'completed' and m.id in target['module_ids'].split(',')]) == 3"
+    severity: critical
   named_invariants:
+  - name: Agent completed exactly the next available module and its min-score-gated successor
+    ref: update[0]
+    severity: critical
   - name: Agent did not modify other modules
     ref: invariant[0]
-    severity: high
-  - name: Agent unlocked the next module
+    severity: critical
+  - name: Agent unlocked the downstream module via the cascade
     ref: update[1]
     severity: high
   - name: Agent did not modify course records
@@ -110,7 +137,7 @@ canonical_diff:
     severity: high
   - name: Agent did not modify assignments
     ref: invariant[3]
-    severity: medium
+    severity: high
   - name: Agent did not modify discussions
     ref: invariant[4]
     severity: medium
