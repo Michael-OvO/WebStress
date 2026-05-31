@@ -3267,6 +3267,14 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
     course_id = params.get("course_id", "")
     statuses = params.get("statuses", ["assigned", "in_progress", "submitted"])
     returned_review_count = params.get("returned_review_count", 0)
+    # When True, the reviews flagged "returned for revision" are placed at the
+    # TAIL indices instead of the head. This keeps peer_reviews[0] a NON-returned
+    # review, which matters for tasks whose intervention variant clones
+    # peer_reviews[0] as a decoy template — otherwise the cloned decoys would
+    # inherit returned_for_revision=True and there would be more than one
+    # "returned" review, breaking a "find the single returned review" framing.
+    # Default False preserves head-placement for all existing tasks.
+    returned_at_end = bool(params.get("returned_at_end", False))
     assignments = ctx.base.get("assignments", [])
 
     if not assignment_id:
@@ -3313,7 +3321,11 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
             f"Main Argument:\n{ctx.fake.paragraph(nb_sentences=4)}\n\n"
             f"Conclusion:\n{ctx.fake.paragraph(nb_sentences=2)}"
         )
-        returned_for_revision = i < returned_review_count
+        returned_for_revision = (
+            i >= count - returned_review_count
+            if returned_at_end
+            else i < returned_review_count
+        )
 
         rubric_scores: dict[str, int] = {}
         comments = ""
@@ -3376,6 +3388,35 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
             peer_review_assignment_id_list.append(aid)
             seen_aid.add(aid)
 
+    # ── Returned-review discriminators ──
+    # When at least one review was returned for revision, expose scalar targets
+    # for the FIRST returned review so "redo" tasks can gate on (a) the precise
+    # target review, (b) the reviewee name the comment must address, and
+    # (c) the previously-recorded rubric scores the agent must change. These
+    # let a canonical_diff require the new scores to DIFFER from the old ones on
+    # every previously-scored criterion (a re-derived discriminator) without
+    # the eval having to introspect read-only proxy dicts at scoring time.
+    returned_review_target_id = ""
+    returned_review_reviewee_name = ""
+    returned_prev_clarity = ""
+    returned_prev_depth = ""
+    returned_prev_originality = ""
+    if returned_review_ids:
+        returned_review_target_id = returned_review_ids[0]
+        _rt = next(
+            (pr for pr in ctx.base["peer_reviews"] if pr["id"] == returned_review_target_id),
+            None,
+        )
+        if _rt is not None:
+            returned_review_reviewee_name = _rt.get("reviewee_name", "")
+            _prev = _rt.get("previous_rubric_scores", {}) or {}
+            if "clarity" in _prev:
+                returned_prev_clarity = str(_prev["clarity"])
+            if "depth" in _prev:
+                returned_prev_depth = str(_prev["depth"])
+            if "originality" in _prev:
+                returned_prev_originality = str(_prev["originality"])
+
     return {
         "review_ids": review_ids,
         "pending_review_ids": pending_review_ids,
@@ -3383,4 +3424,9 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
         "returned_review_ids": returned_review_ids,
         "target_review_id": pending_review_ids[0] if pending_review_ids else (review_ids[0] if review_ids else ""),
         "peer_review_assignment_ids": peer_review_assignment_id_list,
+        "returned_review_target_id": returned_review_target_id,
+        "returned_review_reviewee_name": returned_review_reviewee_name,
+        "returned_prev_clarity": returned_prev_clarity,
+        "returned_prev_depth": returned_prev_depth,
+        "returned_prev_originality": returned_prev_originality,
     }
