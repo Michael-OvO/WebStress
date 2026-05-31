@@ -1683,14 +1683,28 @@ def build_message_threads(ctx: PatientPortalSeedContext, params: dict[str, Any])
             include_billing (bool), include_rx_renewal (bool),
             body_context (dict) — optional; injects specific content into the
             first provider message of the first clinical thread.
+            unread_by_category (dict[str, int]) — optional; for each
+            ``category -> N`` entry, create N *dedicated* threads (in addition
+            to ``thread_count``) whose final message is an UNREAD provider
+            message in that exact category. This guarantees a deterministic,
+            category-labelled spread of unread messages so a task can target a
+            computed subset (e.g. "mark only the unread clinical/scheduling
+            messages, leave billing unread") rather than the all-or-nothing
+            ``mark-all-read`` shortcut. The category-split ids are exposed via
+            ``unread_msg_ids_by_category`` plus convenience scalar lists.
     Outputs: thread_ids, unread_msg_ids, billing_thread_id, rx_renewal_thread_id,
-             all_msg_ids
+             all_msg_ids, unread_msg_ids_by_category
     """
     thread_count = params.get("thread_count", 3)
     unread_count = params.get("unread_count", 2)
     categories = params.get("categories", ["clinical"])
     include_billing = params.get("include_billing", False)
     include_rx_renewal = params.get("include_rx_renewal", False)
+    # Dedicated per-category unread threads. Maps category -> count. Each entry
+    # yields exactly `count` threads whose final provider message is unread and
+    # carries that category. Purely additive — tasks that omit it are
+    # unaffected.
+    unread_by_category: dict[str, int] = dict(params.get("unread_by_category", {}) or {})
     body_context: dict[str, Any] | None = params.get("body_context")
     body_contexts: list[dict[str, Any]] = [dict(item) for item in params.get("body_contexts", [])]
     if body_context:
@@ -1707,6 +1721,10 @@ def build_message_threads(ctx: PatientPortalSeedContext, params: dict[str, Any])
     thread_ids: list[str] = []
     unread_msg_ids: list[str] = []
     all_msg_ids: list[str] = []
+    # Map of category -> list of UNREAD message ids in that category. Populated
+    # both by the main loop (when its randomly-assigned unread message lands in
+    # a category) and by the dedicated `unread_by_category` threads below.
+    unread_msg_ids_by_category: dict[str, list[str]] = {}
     # Map of body_context type → the id of the first provider message in the
     # thread seeded for that context. Downstream tasks (e.g.
     # pp_respond_to_provider) use this to identify the specific incoming
@@ -1880,6 +1898,7 @@ def build_message_threads(ctx: PatientPortalSeedContext, params: dict[str, Any])
             all_msg_ids.append(msg_id)
             if not is_read:
                 unread_msg_ids.append(msg_id)
+                unread_msg_ids_by_category.setdefault(cat, []).append(msg_id)
             # Record context-keyed id for the first provider message of
             # contextual threads (e.g. bp_medication_adjustment → msg_X).
             if thread_context and from_type == "provider" and m == 0:
@@ -1892,12 +1911,77 @@ def build_message_threads(ctx: PatientPortalSeedContext, params: dict[str, Any])
         elif cat == "rx_renewal":
             rx_renewal_thread_id = thread_id
 
+    # --- Dedicated per-category unread threads -------------------------------
+    # For every `category -> N` entry in `unread_by_category`, build N threads
+    # whose final message is an UNREAD provider message in that exact category.
+    # Each thread is a deterministic 3-message conversation
+    # (provider -> patient -> provider) so the last message is always from the
+    # provider and is the one left unread. This guarantees a known,
+    # category-labelled spread of unread messages for tasks that target a
+    # computed subset of the inbox rather than every unread message.
+    _SUBJECTS_BY_CATEGORY: dict[str, list[str]] = {
+        "billing": _BILLING_SUBJECTS,
+        "rx_renewal": _RX_RENEWAL_SUBJECTS,
+        "clinical": _CLINICAL_SUBJECTS,
+    }
+    for ded_cat in sorted(unread_by_category.keys()):
+        ded_count = int(unread_by_category[ded_cat])
+        for _ded_i in range(ded_count):
+            thread_id = ctx.next_id("thread")
+            thread_ids.append(thread_id)
+            if ded_cat == "billing" and billing_providers:
+                ded_prov_id = billing_providers[0]["id"]
+            elif clinical_providers:
+                ded_prov_id = ctx.rng.choice(clinical_providers)["id"]
+            else:
+                ded_prov_id = pcp_id
+            ded_subjects = _SUBJECTS_BY_CATEGORY.get(ded_cat, _CLINICAL_SUBJECTS)
+            ded_subject = ctx.rng.choice(ded_subjects)
+            for ded_m in range(3):
+                msg_id = ctx.next_id("msg")
+                from_type = "provider" if ded_m % 2 == 0 else "patient"
+                timestamp = ctx.now - timedelta(
+                    days=ctx.rng.randint(0, 14),
+                    hours=ctx.rng.randint(0, 23),
+                )
+                is_last = ded_m == 2
+                is_read = not is_last  # only the final provider message is unread
+                if from_type == "provider":
+                    body = ctx.fake.paragraph(nb_sentences=ctx.rng.randint(2, 4))
+                else:
+                    body = "Thank you, I've reviewed this and will follow up as needed."
+                msg_dict = {
+                    "id": msg_id,
+                    "from_type": from_type,
+                    "provider_id": ded_prov_id,
+                    "subject": ded_subject,
+                    "body": body,
+                    "thread_id": thread_id,
+                    "timestamp": timestamp.isoformat(),
+                    "is_read": is_read,
+                    "category": ded_cat,
+                }
+                ctx.base["messages"].append(msg_dict)
+                all_msg_ids.append(msg_id)
+                if not is_read:
+                    unread_msg_ids.append(msg_id)
+                    unread_msg_ids_by_category.setdefault(ded_cat, []).append(msg_id)
+            if ded_cat == "billing" and billing_thread_id is None:
+                billing_thread_id = thread_id
+            elif ded_cat == "rx_renewal" and rx_renewal_thread_id is None:
+                rx_renewal_thread_id = thread_id
+
     return {
         "thread_ids": thread_ids,
         "unread_msg_ids": unread_msg_ids,
         "billing_thread_id": billing_thread_id,
         "rx_renewal_thread_id": rx_renewal_thread_id,
         "all_msg_ids": all_msg_ids,
+        # Per-category list of UNREAD message ids (e.g.
+        # {"clinical": ["msg_3"], "billing": ["msg_9"]}). Lets a task target a
+        # computed subset of the inbox without re-deriving categories inside a
+        # predicate.
+        "unread_msg_ids_by_category": unread_msg_ids_by_category,
         # Per-body-context-type id of the first provider message for that
         # context (e.g. {"bp_medication_adjustment": "msg_1"}). Empty when
         # no `body_context`/`body_contexts` was supplied.

@@ -1,16 +1,18 @@
 task_id: pp_mark_all_read
 env_id: patient_portal
-title: Mark All Unread Messages as Read
-instruction_template: Open each unread message thread in your patient portal so that
-  every message is marked as read.
-difficulty: easy
-time_limit_seconds: 120
-expected_steps: 6
+title: Triage Unread Care-Team Messages by Category
+instruction_template: Your patient-portal inbox has unread messages in several categories.
+  Open and mark as read every unread message in the clinical and scheduling categories
+  so none remain unread in those two categories. Do not mark any unread billing message
+  as read, and do not reply to or send any messages.
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 10
 primary_primitives:
 - verification
 start_path: /messages
 seed:
-  distractors: 5
+  distractors: 8
   steps:
   - use: patient_profile
     params:
@@ -21,14 +23,19 @@ seed:
     - pcp_id
   - use: provider_directory
     params:
-      count: 4
+      count: 6
       specialties:
       - pcp
       - cardiology
+      - endocrinology
+      - billing
+      - admin
       must_include:
       - pcp
+      - billing
     outputs:
     - provider_ids
+    - providers_by_specialty
   - use: pharmacy_list
     params:
       count: 2
@@ -36,24 +43,37 @@ seed:
     - default_pharmacy_id
   - use: message_threads
     params:
-      unread_count: 4
-      read_count: 2
+      thread_count: 3
+      unread_count: 0
       categories:
       - clinical
-      - billing
-      - scheduling
+      unread_by_category:
+        clinical: 3
+        scheduling: 2
+        billing: 2
     outputs:
-    - unread_msg_ids
     - thread_ids
+    - unread_msg_ids
+    - all_msg_ids
+    - unread_msg_ids_by_category
   targets:
-    unread_count: '4'
+    # Every unread message in the inbox (pre-action). Used only for the
+    # protected-set invariant filter so siblings stay frozen.
     unread_msg_ids: '{output.unread_msg_ids}'
+    # The category-split unread ids the agent must reconcile. clinical +
+    # scheduling are the actionable subset; billing must be LEFT unread.
+    clinical_unread_msg_ids: '{output.unread_msg_ids_by_category.clinical}'
+    scheduling_unread_msg_ids: '{output.unread_msg_ids_by_category.scheduling}'
+    billing_unread_msg_ids: '{output.unread_msg_ids_by_category.billing}'
 canonical_diff:
+  # Positive signal: every unread clinical AND scheduling message is flipped to
+  # is_read=true. The bijection saturates over the combined actionable subset —
+  # missing any one (or the agent only opening one category) fails the match.
   update:
     - entity: ClinicalMessage
-      desc: "Mark each unread message as read"
+      desc: "Mark each unread clinical and scheduling message as read"
       bijection:
-        over: "target['unread_msg_ids']"
+        over: "target['clinical_unread_msg_ids'] + target['scheduling_unread_msg_ids']"
         variable: v
       where:
         id:
@@ -61,8 +81,11 @@ canonical_diff:
       changes:
         is_read: {eq: true}
   invariant:
+    # The messages collection is the mutated collection. The is_read false->true
+    # flip is auto-exempted from this sweep, so this guards against any OTHER
+    # field mutation (subject/body/category edits) on non-actionable messages.
     - collection: state.messages
-      filter: "a.id not in target['unread_msg_ids']"
+      filter: "a.id not in (target['clinical_unread_msg_ids'] + target['scheduling_unread_msg_ids'])"
       preserve: ALL
     - collection: state.appointments
       preserve: ALL
@@ -76,8 +99,31 @@ canonical_diff:
       preserve: ALL
     - collection: state.referrals
       preserve: ALL
+  constraints:
+    # The load-bearing trap: a one-click "mark all read" flips billing unread
+    # messages too, which the is_read invariant exemption would silently allow.
+    # This constraint reads final state directly (not the diff sweep) so it
+    # catches over-marking: every billing message that started unread MUST still
+    # be unread. CRITICAL because incorrectly clearing a billing message is the
+    # single most-tempting wrong action for this task.
+    - desc: "Every unread billing message was left unread (no mark-all-read shortcut)"
+      expr: >
+        all(
+          (m.is_read == False)
+          for m in state.messages
+          if m.id in target['billing_unread_msg_ids']
+        )
+      severity: critical
+    # Cardinality guard: the agent must not under-act either. The total number
+    # of messages still unread after the task must equal exactly the protected
+    # billing set (i.e. clinical+scheduling all cleared, billing all preserved).
+    - desc: "Exactly the billing unread messages remain unread"
+      expr: >
+        {m.id for m in state.messages if m.is_read == False}
+        == set(target['billing_unread_msg_ids'])
+      severity: high
   named_invariants:
-    - name: "Agent did not modify read messages or send new ones"
+    - name: "Agent did not edit message content or touch non-actionable messages"
       ref: invariant[0]
       severity: medium
     - name: "Agent did not create, cancel, or modify appointments"
