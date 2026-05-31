@@ -1,14 +1,19 @@
 task_id: lms_peer_review_cycle
 env_id: lms
 title: Complete Peer Review Cycle
-instruction_template: 'Complete the full peer review cycle: submit all pending peer
-  reviews with rubric scores and constructive comments, then check if any of your
-  own assignments have received feedback or revision requests. The feedback check is
-  a review step; no extra submission is required unless the LMS explicitly asks for
-  one.'
+instruction_template: 'Complete the full peer review cycle for student Riley Chen.
+  Submit every pending peer review so its status becomes submitted, and for each one
+  provide all three rubric scores (clarity, depth, originality) on a 1 to 5 scale plus
+  a written comment. Each comment must be at least 40 characters, must address the
+  reviewee by their first name, and must name at least one rubric criterion (clarity,
+  depth, or originality). Some of these reviews were previously returned for revision:
+  for any review that already carries previous rubric scores, every criterion that
+  was scored before must now receive a strictly higher score than the previous value.
+  Do not submit, edit, or re-open any peer review that is already submitted, and do
+  not send any messages.'
 difficulty: hard
 time_limit_seconds: 360
-expected_steps: 25
+expected_steps: 24
 primary_primitives:
 - planning
 start_path: /peer-reviews
@@ -16,12 +21,13 @@ seed:
   distractors: 2
   steps:
   - use: student_profile
-    params: {}
+    params:
+      name: Riley Chen
     outputs:
     - student_id
   - use: course_catalog
     params:
-      count: 2
+      count: 3
       must_include:
       - CS101
     outputs:
@@ -34,28 +40,35 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 5
+      per_course_count: 6
       graded_fraction: 0.4
     outputs:
     - assignment_ids
   - use: peer_review_assignments
     params:
-      count: 3
+      count: 6
+      returned_review_count: 2
       statuses:
       - assigned
+      - in_progress
+      - submitted
       - assigned
       - in_progress
+      - submitted
     outputs:
     - review_ids
     - pending_review_ids
     - completed_review_ids
+    - returned_review_ids
   targets:
     course_code: '{output.course_code}'
     pending_review_ids: '{output.pending_review_ids}'
+    completed_review_ids: '{output.completed_review_ids}'
+    returned_review_ids: '{output.returned_review_ids}'
 canonical_diff:
   update:
   - entity: PeerReview
-    desc: Submit every pending peer review with all rubric scores and constructive comments
+    desc: Submit every pending peer review with all rubric scores and an addressed, revision-aware comment
     bijection:
       over: "target['pending_review_ids'].split(',') if target['pending_review_ids'] else []"
       variable: v
@@ -66,10 +79,25 @@ canonical_diff:
       rubric_scores:
         expr: >-
           len(x) == 3
-          and set(x) == {'clarity', 'depth', 'originality'}
-          and all(1 <= v <= 5 for v in x.values())
+          and set(str(k) for k in x.keys()) == {'clarity', 'depth', 'originality'}
+          and all(1 <= int(s) <= 5 for s in x.values())
+          and all(
+            int(x[str(c)]) > int(p)
+            for r in initial.peer_reviews if r.id == v.strip()
+            for c, p in dict(r.previous_rubric_scores).items()
+          )
       comments:
-        expr: "len(x.strip()) > 20"
+        expr: >-
+          len(x.strip()) >= 40
+          and any(
+            w.lower() in x.lower()
+            for w in ['clarity', 'depth', 'originality']
+          )
+          and any(
+            str(r.reviewee_name).split()[0].lower() in x.lower()
+            for r in initial.peer_reviews
+            if r.id == v.strip() and str(r.reviewee_name).split()
+          )
       status: {eq: submitted}
   invariant:
   - collection: state.peer_reviews
@@ -99,13 +127,29 @@ canonical_diff:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
+  - desc: Every already-submitted peer review still has a non-empty comment (untouched)
+    expr: >-
+      all(
+        len(str(r.comments).strip()) > 0
+        for r in state.peer_reviews
+        if r.id in [c.strip() for c in target['completed_review_ids'].split(',') if c.strip()]
+      )
+    severity: high
+  - desc: No previously-submitted peer review was re-opened to a pending status
+    expr: >-
+      all(
+        r.status == 'submitted'
+        for r in state.peer_reviews
+        if r.id in [c.strip() for c in target['completed_review_ids'].split(',') if c.strip()]
+      )
+    severity: high
   named_invariants:
-  - name: Agent submitted all pending peer reviews
+  - name: Agent submitted all pending peer reviews with addressed, revision-aware feedback
     ref: update[0]
-    severity: high
-  - name: Agent did not modify other peer reviews
+    severity: critical
+  - name: Agent did not modify or re-open other peer reviews
     ref: invariant[0]
-    severity: high
+    severity: critical
   - name: Agent did not modify course records
     ref: invariant[1]
     severity: medium
