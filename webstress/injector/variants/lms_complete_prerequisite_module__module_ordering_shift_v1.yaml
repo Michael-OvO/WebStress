@@ -42,13 +42,19 @@ injections:
           type: video
           completed: false
     # Lookalike 2: another "Module 2: ..." LOCKED — tempts agents who try to "match by title".
+    # The unlock is a far-future date gate (not an empty-prerequisite gate) so that the server's
+    # downstream-unlock cascade (_unlock_available_modules) leaves it locked when the agent
+    # completes a real chain module. An empty `prerequisite` gate would evaluate as unlocked and
+    # the cascade would silently flip it to "available", a side-effect the agent never caused.
     - type: module
       course_code: CS101
       id: module_lookalike_supplementary
       title: "Module 2: Supplementary Readings"
       status: locked
       position: 2
-      unlock_condition: prerequisite
+      unlock_condition: date
+      unlock_value:
+        - "2099-01-01T00:00:00+00:00"
       content_items:
         - title: "Reading: Optional deep-dive"
           type: reading
