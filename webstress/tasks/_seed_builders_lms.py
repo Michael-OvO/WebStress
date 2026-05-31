@@ -2625,6 +2625,46 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
             )
             lowest_hw_id = _hw_lowest["assignment_id"]
 
+    # ── named-pair comparison (compare_pair_codes) ───────────────────────────
+    # For lms_compare_course_grades: the instruction names exactly two courses
+    # (A, B) and asks the agent to drop the one with the lower *displayed*
+    # weighted grade. The legacy lower_grade_* outputs above are the GLOBAL
+    # minimum across all enrolled courses, which is wrong once the catalog has
+    # more than two courses. These outputs scope the comparison to exactly the
+    # two named courses and use the SAME weighted-score method the agent sees on
+    # the Grades page (LMSState.weighted_score_for_course, which applies late
+    # penalties) so the target always matches what the UI displays.
+    named_pair_lower_course_id = ""
+    named_pair_lower_enrollment_id = ""
+    named_pair_higher_course_id = ""
+    named_pair_higher_enrollment_id = ""
+    named_pair_gap = "0.00"
+    named_pair_gap_above_3 = "false"
+    compare_pair_codes = params.get("compare_pair_codes") or []
+    if len(compare_pair_codes) == 2:
+        from webstress.backend.models.lms import LMSState as _LMSState
+
+        _snapshot = _LMSState.model_validate(ctx.base)
+        _pair = []
+        for _code in compare_pair_codes:
+            _c = next((c for c in courses if c["course_code"] == _code), None)
+            if _c is None:
+                continue
+            _sc = _snapshot.weighted_score_for_course(_c["id"])
+            if _sc is None:
+                continue
+            _pair.append((_c["id"], Decimal(str(_sc))))
+        if len(_pair) == 2:
+            _pair.sort(key=lambda t: t[1])
+            (_lo_cid, _lo_sc), (_hi_cid, _hi_sc) = _pair[0], _pair[1]
+            named_pair_lower_course_id = _lo_cid
+            named_pair_higher_course_id = _hi_cid
+            named_pair_lower_enrollment_id = enrollment_by_course.get(_lo_cid, "")
+            named_pair_higher_enrollment_id = enrollment_by_course.get(_hi_cid, "")
+            _gap = (_hi_sc - _lo_sc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            named_pair_gap = str(_gap)
+            named_pair_gap_above_3 = "true" if _gap > Decimal("3") else "false"
+
     return {
         "grade_ids": grade_ids,
         "dropped_grade_ids": dropped_grade_ids,
@@ -2644,6 +2684,12 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
         "achievable_final_exam_assignment_ids": ",".join(achievable_final_exam_assignment_ids),
         "lower_grade_course_id": lower_grade_course_id,
         "lower_grade_enrollment_id": lower_grade_enrollment_id,
+        "named_pair_lower_course_id": named_pair_lower_course_id,
+        "named_pair_lower_enrollment_id": named_pair_lower_enrollment_id,
+        "named_pair_higher_course_id": named_pair_higher_course_id,
+        "named_pair_higher_enrollment_id": named_pair_higher_enrollment_id,
+        "named_pair_gap": named_pair_gap,
+        "named_pair_gap_above_3": named_pair_gap_above_3,
         "lowest_hw_id": lowest_hw_id,
         "lowest_homework_id": lowest_hw_id,  # alias for YAML outputs that use this key
         "grade_below_80": grade_below_80,
