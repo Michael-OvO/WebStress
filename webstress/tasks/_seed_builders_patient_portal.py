@@ -2022,12 +2022,66 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         approved_ref_ids.append(ref["id"])
         expiring_ref_id = ref["id"]
 
+    # Per-specialty discriminators the canonical_diff pins as scalar targets.
+    # For each specialty named in must_have_specialties, locate the first
+    # approved referral of that specialty, expose its destination provider id
+    # (to_provider_id), and pre-compute that provider's single earliest
+    # available slot. Tasks like pp_provider_transition use these so the
+    # evaluator can require the agent to book with the EXACT provider the
+    # referral names (not "any provider of the right specialty") and in that
+    # provider's earliest slot — without recomputing a min over a comprehension
+    # inside a filter scope (hazard Class 6). Computed here so the values stay
+    # deterministic per (task_id, seed).
+    def _earliest_slot_iso(prov_id: str | None) -> str | None:
+        if not prov_id:
+            return None
+        prov = providers_by_id.get(prov_id)
+        if not prov:
+            return None
+        slot_times = [s.get("datetime") for s in prov.get("available_slots", []) if s.get("datetime")]
+        return min(slot_times) if slot_times else None
+
+    approved_target_provider_by_specialty: dict[str, str | None] = {}
+    approved_target_slot_by_specialty: dict[str, str | None] = {}
+    for spec in must_have_specialties:
+        matching_ref = next(
+            (
+                r for r in ctx.base["referrals"]
+                if r["id"] in approved_ref_ids
+                and r.get("status") == "approved"
+                and r.get("to_specialty") == spec
+            ),
+            None,
+        )
+        target_prov_id = matching_ref.get("to_provider_id") if matching_ref else None
+        approved_target_provider_by_specialty[spec] = target_prov_id
+        approved_target_slot_by_specialty[spec] = _earliest_slot_iso(target_prov_id)
+
+    # Convenience scalars for the most common single-specialty case
+    # (pp_provider_transition's endocrinology transition). When more than one
+    # specialty is requested these fall back to the first one in order.
+    first_spec = must_have_specialties[0] if must_have_specialties else None
+    approved_endo_target_provider_id = (
+        approved_target_provider_by_specialty.get("endocrinology")
+        if "endocrinology" in approved_target_provider_by_specialty
+        else (approved_target_provider_by_specialty.get(first_spec) if first_spec else None)
+    )
+    approved_endo_target_slot = (
+        approved_target_slot_by_specialty.get("endocrinology")
+        if "endocrinology" in approved_target_slot_by_specialty
+        else (approved_target_slot_by_specialty.get(first_spec) if first_spec else None)
+    )
+
     return {
         "approved_ref_ids": approved_ref_ids,
         "pending_ref_ids": pending_ref_ids,
         "denied_ref_ids": denied_ref_ids,
         "prior_auth_ref_id": prior_auth_ref_id,
         "expiring_ref_id": expiring_ref_id,
+        "approved_target_provider_by_specialty": approved_target_provider_by_specialty,
+        "approved_target_slot_by_specialty": approved_target_slot_by_specialty,
+        "approved_endo_target_provider_id": approved_endo_target_provider_id,
+        "approved_endo_target_slot": approved_endo_target_slot,
     }
 
 

@@ -1,15 +1,21 @@
 task_id: pp_provider_transition
 env_id: patient_portal
 title: Provider Transition
-instruction_template: 'Establish endocrinology follow-up without using messages: 1)
-  Find the endocrinologist in the directory who is accepting new patients, 2) Use
-  the approved endocrinology referral to schedule one appointment with that endocrinologist
-  in the next available slot, 3) Use the appointment reason exactly "Endocrinology
-  transfer of care". Do not cancel any existing appointments and do not modify any
-  prescriptions.'
-difficulty: expert
-time_limit_seconds: 420
-expected_steps: 24
+instruction_template: 'Establish endocrinology follow-up without using messages. The
+  approved endocrinology referral names a specific endocrinologist as its destination
+  provider. 1) Read the approved endocrinology referral and identify the destination
+  endocrinologist it names (its to_provider_id), 2) Confirm that endocrinologist is
+  accepting new patients, 3) Schedule one appointment with that exact endocrinologist
+  in their single earliest available slot, linking the appointment to the approved
+  endocrinology referral, 4) Use the appointment reason exactly "Endocrinology transfer
+  of care", 5) Because endocrinology visits require confirmation, complete the booking
+  by confirming the new appointment so its confirmation_state becomes "confirmed".
+  Do not cancel, reschedule, or modify any existing appointments; do not book with
+  any other endocrinologist; do not modify any prescriptions, referrals, claims, labs,
+  or immunizations; and do not send any messages.'
+difficulty: frontier
+time_limit_seconds: 560
+expected_steps: 34
 primary_primitives:
 - planning
 start_path: /appointments
@@ -22,6 +28,8 @@ seed:
       - Type 2 Diabetes
       - Hypothyroidism
       insurance_tier: standard
+      auto_confirm_specialties:
+      - endocrinology
     outputs:
     - pcp_id
     - pcp_name
@@ -34,6 +42,10 @@ seed:
       - cardiology
       - dermatology
       - billing
+      count_per_specialty:
+        endocrinology: 3
+        cardiology: 2
+        dermatology: 2
       must_include:
       - pcp
       - endocrinology
@@ -54,10 +66,14 @@ seed:
     outputs:
     - approved_ref_ids
     - pending_ref_ids
+    - approved_endo_target_provider_id
+    - approved_endo_target_slot
   - use: appointment_history
     params:
       upcoming_count: 2
       completed_count: 2
+      requires_confirmation_specialties:
+      - endocrinology
     outputs:
     - upcoming_ids
   targets:
@@ -65,46 +81,72 @@ seed:
     approved_ref_ids: '{output.approved_ref_ids}'
     upcoming_ids: '{output.upcoming_ids}'
     active_rx_ids: '{output.active_rx_ids}'
+    # Frontier discriminators the agent must RE-DERIVE: the single
+    # endocrinologist named as the approved referral's destination provider,
+    # and that provider's earliest available slot. Precomputed in the seed
+    # builder (referral_chain) so the canonical_diff pins exact scalar values
+    # instead of recomputing a top-K/min over a comprehension inside a filter.
+    referral_target_provider_id: '{output.approved_endo_target_provider_id}'
+    referral_target_slot: '{output.approved_endo_target_slot}'
 canonical_diff:
-  # Positive signal: schedule exactly one new Appointment with an
-  # endocrinologist who is accepting_new, linked to one of the approved
-  # endocrinology referrals, with the exact required reason string, booked
-  # into the earliest available slot offered by that endocrinologist.
+  # Positive signal: schedule exactly one new Appointment with the SPECIFIC
+  # endocrinologist named as the destination provider (to_provider_id) of the
+  # approved endocrinology referral — who must also be accepting new patients —
+  # linked to that approved referral, with the exact required reason string,
+  # booked into THAT provider's single earliest available slot. The booking
+  # must be fresh (booked this session) and, because endocrinology visits
+  # require confirmation, must be confirmed (confirmation_state == "confirmed").
   create:
     - entity: Appointment
-      desc: "Schedule one transfer-of-care endocrinology appointment at the next available slot across endocrinologists accepting new patients, linked to the approved endocrinology referral"
+      desc: "Schedule one transfer-of-care endocrinology appointment with the referral's named endocrinologist in their earliest slot, linked to the approved referral, then confirm it"
       properties:
         status: {eq: "scheduled"}
         reason: {eq: "Endocrinology transfer of care"}
         provider_id:
           expr: >
-            x in target['endo_provider_ids']
-            and any(p.id == x and p.accepting_new and p.specialty == 'endocrinology' for p in initial.providers)
+            x == target['referral_target_provider_id']
+            and x in target['endo_provider_ids']
+            and any(
+              p.id == x and p.accepting_new and p.specialty == 'endocrinology'
+              for p in initial.providers
+            )
         linked_referral_id:
           expr: >
             x is not None
             and x in target['approved_ref_ids']
-            and any(r.id == x and r.status == 'approved' and r.to_specialty == 'endocrinology' for r in initial.referrals)
+            and any(
+              r.id == x and r.status == 'approved' and r.to_specialty == 'endocrinology'
+              and r.to_provider_id == target['referral_target_provider_id']
+              for r in initial.referrals
+            )
         datetime:
           expr: >
-            x == min(
+            x == datetime.fromisoformat(target['referral_target_slot'])
+            and x == min(
               s.datetime
               for p in initial.providers
-              if p.id in target['endo_provider_ids']
-              and p.accepting_new
-              and p.specialty == 'endocrinology'
+              if p.id == target['referral_target_provider_id']
               for s in p.available_slots
             )
+        # Freshness: the appointment must have been booked during this session
+        # (a pre-existing appointment carries an older booked_at and cannot
+        # satisfy the create).
+        booked_at:
+          expr: "x is not None and x >= session_start"
+        # Two-step workflow: endocrinology visits require confirmation, so the
+        # agent must confirm the new appointment after scheduling it.
+        confirmation_state: {eq: "confirmed"}
+        requires_confirmation: {eq: true}
         type: {any: true}
         notes: {any: true}
         pre_auth_status: {any: true}
-        booked_at: {any: true}
         location: {any: true}
   invariant:
     # Existing appointments (upcoming + completed history) must not be
-    # cancelled or modified. The new create above is scoped to IDs not in
-    # the initial snapshot, so a filter over initial.appointments ids is
-    # equivalent to "preserve every pre-existing appointment".
+    # cancelled, rescheduled, or modified. The new create above is scoped to
+    # IDs not in the initial snapshot, so a filter over initial.appointments
+    # ids preserves every pre-existing appointment while excluding the
+    # newly-created (and newly-confirmed) one.
     - collection: state.appointments
       filter: "a.id in {x.id for x in initial.appointments}"
       preserve: ALL
@@ -124,10 +166,31 @@ canonical_diff:
       preserve: ALL
     - collection: state.claims
       preserve: ALL
+  constraints:
+    # Exactly one new endocrinology appointment is created — the agent must not
+    # book with any of the OTHER endocrinologists (search-space noise) nor
+    # double-book the correct one. Count scheduled appointments with any
+    # endocrinologist that did not exist in the initial snapshot; require
+    # exactly one, and it must be with the referral's named provider.
+    - desc: "Exactly one new endocrinology appointment was created, and it is with the referral's named endocrinologist"
+      severity: critical
+      expr: >
+        len([
+          a for a in state.appointments
+          if a.id not in {b.id for b in initial.appointments}
+          and a.provider_id in target['endo_provider_ids']
+          and a.status == 'scheduled'
+        ]) == 1
+        and all(
+          a.provider_id == target['referral_target_provider_id']
+          for a in state.appointments
+          if a.id not in {b.id for b in initial.appointments}
+          and a.provider_id in target['endo_provider_ids']
+        )
   named_invariants:
-    - name: "Agent did not cancel or modify any existing appointments"
+    - name: "Agent did not cancel, reschedule, or modify any existing appointments"
       ref: invariant[0]
-      severity: high
+      severity: critical
     - name: "Agent did not modify any prescriptions"
       ref: invariant[1]
       severity: high
