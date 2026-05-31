@@ -3214,6 +3214,121 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
                     break
             conflicting_cids = [courses[0]["id"], courses[1]["id"]]
 
+    # ── structured_exam_conflict: build a HARD multi-cluster conflict layout ──
+    # Unlike force_exam_conflict (which lumps every course onto one shared exam
+    # day), this lever stages exams across DISTINCT days so the agent must
+    # actually isolate the right cluster before reasoning about grades:
+    #   * PRIMARY cluster  : primary_conflict_size courses share day D_primary.
+    #                        This is the cluster the agent must act on. Its
+    #                        members are chosen so the LOWEST weighted grade is
+    #                        STRICTLY unique (no tie at the bottom) and the two
+    #                        lowest members are deliberately CLOSE, so eyeballing
+    #                        fails and exact weighted-grade math is required.
+    #   * DECOY cluster    : decoy_conflict_size courses share a different day
+    #                        D_decoy. These conflict too, but the agent must NOT
+    #                        touch them (smaller cluster than the primary).
+    #   * Remaining courses: pushed to their own distinct, non-conflicting days.
+    # All new outputs are precomputed scalars/lists (rule 6) — no set logic runs
+    # inside any invariant filter.
+    structured = params.get("structured_exam_conflict", False)
+    primary_conflict_course_ids: list[str] = []
+    decoy_conflict_course_ids: list[str] = []
+    primary_conflict_day = ""
+    second_lowest_primary_conflict_course_id = ""
+    if structured:
+        primary_size = int(params.get("primary_conflict_size", 3))
+        decoy_size = int(params.get("decoy_conflict_size", 2))
+        current_scores = ctx.outputs.get("current_weighted_scores", {})
+        # Only courses with a real (non-zero, present) weighted grade are eligible
+        # for the primary cluster — the discriminator must be well-defined.
+        scored = sorted(
+            (
+                (c["id"], Decimal(str(current_scores[c["id"]])))
+                for c in courses
+                if c["id"] in current_scores
+            ),
+            key=lambda x: (x[1], x[0]),
+        )
+        if len(scored) < primary_size + decoy_size:
+            raise ValueError(
+                "structured_exam_conflict needs at least "
+                f"{primary_size + decoy_size} scored courses, found {len(scored)}"
+            )
+        # Choose the primary cluster as the lowest-scored courses, then GUARANTEE
+        # a strictly-unique minimum: if the two lowest tie, swap the 2nd member
+        # for the next distinct-scored course so the bottom is unambiguous.
+        primary = scored[:primary_size]
+        if primary_size >= 2 and primary[0][1] == primary[1][1]:
+            replacement = next(
+                (entry for entry in scored[primary_size:] if entry[1] != primary[0][1]),
+                None,
+            )
+            if replacement is not None:
+                primary[1] = replacement
+                primary.sort(key=lambda x: (x[1], x[0]))
+            else:
+                raise ValueError("structured_exam_conflict: cannot break tie at cluster minimum")
+        if primary[0][1] == primary[1][1]:
+            raise ValueError("structured_exam_conflict: primary cluster minimum is not unique")
+        primary_ids = [cid for cid, _ in primary]
+        # Decoy cluster: distinct courses NOT in the primary cluster (any scores).
+        decoy_pool = [c["id"] for c in courses if c["id"] not in primary_ids]
+        decoy_ids = decoy_pool[:decoy_size]
+        if len(decoy_ids) < decoy_size:
+            raise ValueError("structured_exam_conflict: not enough courses for decoy cluster")
+        # The primary cluster MUST be strictly larger than the decoy cluster so
+        # "the day with the most overlapping exams" is unambiguous.
+        if not (len(primary_ids) > len(decoy_ids)):
+            raise ValueError("structured_exam_conflict: primary cluster must exceed decoy cluster")
+
+        # Stage exam dates: every course gets its own distinct day first, then
+        # the cluster members are pinned onto the two shared days.
+        exam_events = {
+            ev["course_id"]: ev
+            for ev in ctx.base["calendar_events"]
+            if ev["event_type"] == "exam"
+        }
+        base_day = (ctx.now + timedelta(days=30)).replace(hour=9, minute=0, second=0, microsecond=0)
+        # Distinct days for non-cluster courses (offset each by a unique week).
+        spread_offset = 0
+        for c in courses:
+            cid = c["id"]
+            ev = exam_events.get(cid)
+            if ev is None:
+                continue
+            if cid in primary_ids or cid in decoy_ids:
+                continue
+            day = base_day + timedelta(days=14 + spread_offset * 5)
+            spread_offset += 1
+            ev["start_datetime"] = day.isoformat() if isinstance(ev["start_datetime"], str) else day
+            ev["end_datetime"] = (day + timedelta(hours=3)).isoformat() if isinstance(ev["end_datetime"], str) else day + timedelta(hours=3)
+        # Primary shared day.
+        primary_day_dt = base_day
+        for offset, cid in enumerate(primary_ids):
+            ev = exam_events.get(cid)
+            if ev is None:
+                continue
+            start = primary_day_dt.replace(hour=9 + offset * 3)
+            ev["start_datetime"] = start.isoformat() if isinstance(ev["start_datetime"], str) else start
+            ev["end_datetime"] = (start + timedelta(hours=2)).isoformat() if isinstance(ev["end_datetime"], str) else start + timedelta(hours=2)
+        # Decoy shared day (7 days after primary).
+        decoy_day_dt = base_day + timedelta(days=7)
+        for offset, cid in enumerate(decoy_ids):
+            ev = exam_events.get(cid)
+            if ev is None:
+                continue
+            start = decoy_day_dt.replace(hour=9 + offset * 3)
+            ev["start_datetime"] = start.isoformat() if isinstance(ev["start_datetime"], str) else start
+            ev["end_datetime"] = (start + timedelta(hours=2)).isoformat() if isinstance(ev["end_datetime"], str) else start + timedelta(hours=2)
+
+        primary_conflict_course_ids = primary_ids
+        decoy_conflict_course_ids = decoy_ids
+        primary_conflict_day = primary_day_dt.strftime("%Y-%m-%d")
+        second_lowest_primary_conflict_course_id = primary[1][0]
+        # Recompute conflicting_cids from the freshly-staged exam dates so the
+        # public output reflects ONLY the primary cluster the agent acts on.
+        conflicting_cids = list(primary_ids)
+
     # ── lower/higher grade conflict course IDs ──
     lower_grade_conflict_course_id = ""
     higher_grade_conflict_course_id = ""
@@ -3224,7 +3339,7 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
         for cid in conflicting_cids:
             sc = current_scores.get(cid, "50")
             scored_conflicts.append((cid, Decimal(str(sc))))
-        scored_conflicts.sort(key=lambda x: x[1])
+        scored_conflicts.sort(key=lambda x: (x[1], x[0]))
         lower_grade_conflict_course_id = scored_conflicts[0][0]
         higher_grade_conflict_course_id = scored_conflicts[-1][0]
         for enrollment in ctx.base.get("enrollments", []):
@@ -3243,6 +3358,11 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
         "lower_grade_conflict_course_id": lower_grade_conflict_course_id,
         "higher_grade_conflict_course_id": higher_grade_conflict_course_id,
         "lower_grade_conflict_enrollment_id": lower_grade_conflict_enrollment_id,
+        # ── structured_exam_conflict outputs (precomputed scalars/lists) ──
+        "primary_conflict_course_ids": ",".join(primary_conflict_course_ids),
+        "decoy_conflict_course_ids": ",".join(decoy_conflict_course_ids),
+        "primary_conflict_day": primary_conflict_day,
+        "second_lowest_primary_conflict_course_id": second_lowest_primary_conflict_course_id,
     }
 
 
