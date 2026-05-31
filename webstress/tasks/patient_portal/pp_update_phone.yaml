@@ -1,57 +1,170 @@
 task_id: pp_update_phone
 env_id: patient_portal
-title: Update Phone Number
-instruction_template: Update your phone number to {target.new_phone}.
-difficulty: easy
-time_limit_seconds: 90
-expected_steps: 4
+title: Update Contact Details After a Move
+instruction_template: >-
+  You recently moved and switched carriers, so your contact information on file
+  is out of date. On your profile, update your phone number to {target.new_phone}
+  and your email address to {target.new_email}. Then replace your emergency
+  contact: set the emergency contact name to {target.ec_name}, the emergency
+  contact phone to {target.ec_new_phone}, and the emergency contact relationship
+  to {target.ec_relationship}. Change only those contact fields. Do not alter any
+  other profile field (name, date of birth, sex, insurance, primary care
+  provider, allergies, conditions, or pharmacies), do not send any messages, and
+  do not create, cancel, or modify any appointment, prescription, lab result,
+  referral, or insurance claim.
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 9
 primary_primitives:
 - verification
 start_path: /profile
 seed:
+  # NOTE: `distractors` is a no-op in the Patient Portal seeder. Real search
+  # space noise comes from the builder count params below (providers across
+  # specialties, prescriptions, appointments, claims, labs, message threads).
   distractors: 5
   steps:
   - use: patient_profile
     params:
       conditions:
       - Hypertension
+      - Type 2 Diabetes
       insurance_tier: standard
     outputs:
     - pcp_id
+    - patient_name
+    - insurance_plan_name
+    - member_id
   - use: provider_directory
     params:
-      count: 3
+      count: 5
       specialties:
       - pcp
+      - cardiology
+      - endocrinology
+      - billing
       must_include:
       - pcp
     outputs:
     - provider_ids
   - use: pharmacy_list
     params:
-      count: 2
+      count: 3
     outputs:
     - default_pharmacy_id
+    - pharmacy_ids
+  - use: prescription_cabinet
+    params:
+      active_count: 3
+      expired_count: 1
+    outputs:
+    - active_rx_ids
+  - use: appointment_history
+    params:
+      upcoming_count: 2
+      completed_count: 2
+      cancelled_count: 1
+    outputs:
+    - upcoming_ids
+    - completed_ids
+  - use: lab_results_panel
+    params:
+      resulted_count: 2
+      abnormal_count: 1
+    outputs:
+    - resulted_lab_ids
+  - use: message_threads
+    params:
+      thread_count: 3
+      unread_count: 2
+      include_billing: true
+    outputs:
+    - thread_ids
+    - unread_msg_ids
+  - use: insurance_claims
+    params:
+      approved_count: 1
+      denied_count: 1
+      with_eob: true
+    outputs:
+    - approved_claim_ids
+    - denied_claim_ids
   targets:
+    # `new_phone` is preserved verbatim from the original easy task so the paired
+    # intervention variant keeps resolving. The remaining targets are the new
+    # contact values the agent must write through POST /profile/demographics.
     new_phone: (555) 867-5309
+    new_email: jordan.casey@meridianhealth.org
+    ec_name: Avery Sloane
+    ec_new_phone: (555) 318-7742
+    ec_relationship: Spouse
 canonical_diff:
-  # `state.patient` is now diffed (opt-in singleton with id field). Phone
-  # change appears as Update("patient", "<id>", {phone: ...}). Field-level
-  # `expr: x == initial.patient.<field>` guards untouched fields because
-  # the singleton invariant cannot do field-level guarding when an Update
-  # already covers the same row.
+  # `state.patient` is a diffable singleton with a real id field, so the
+  # contact-info change appears as a single Update("patient", "<id>", {...}).
+  # Because one Update already covers the patient row, untouched fields cannot
+  # be guarded by a singleton preserve:ALL invariant — they MUST be pinned with
+  # field-level `expr: x == initial.patient.<field>` predicates inside the same
+  # changes: block (Singleton Update field-guard rule). The three contact
+  # fields are exact-matched; every other patient field is frozen.
   update:
     - entity: patient
-      desc: Patient phone updated to the target value
+      desc: >-
+        Phone, email, and emergency contact updated to the exact target values
+        via the demographics endpoint, with every other profile field frozen.
       where: { id: { any: true } }
       changes:
         phone: { eq: "(555) 867-5309" }
-        email:
-          expr: "x == initial.patient.email"
+        email: { eq: "jordan.casey@meridianhealth.org" }
+        emergency_contact:
+          expr: >-
+            x.get('name') == target['ec_name']
+            and x.get('phone') == target['ec_new_phone']
+            and x.get('relationship') == target['ec_relationship']
+        # --- frozen singleton fields (untouched-field guard) ---
         name:
           expr: "x == initial.patient.name"
-        emergency_contact:
-          expr: "x.get('phone') == initial.patient.emergency_contact.phone"
+        dob:
+          expr: "str(x) == str(initial.patient.dob)"
+        sex:
+          expr: "x == initial.patient.sex"
+        pcp_id:
+          expr: "x == initial.patient.pcp_id"
+        allergies:
+          expr: "list(x) == list(initial.patient.allergies)"
+        conditions:
+          expr: "list(x) == list(initial.patient.conditions)"
+        pharmacy_ids:
+          expr: "list(x) == list(initial.patient.pharmacy_ids)"
+        insurance_plan:
+          expr: >-
+            x.get('plan_name') == initial.patient.insurance_plan.plan_name
+            and x.get('member_id') == initial.patient.insurance_plan.member_id
+            and x.get('group_number') == initial.patient.insurance_plan.group_number
+            and str(x.get('copay')) == str(initial.patient.insurance_plan.copay)
+            and str(x.get('deductible')) == str(initial.patient.insurance_plan.deductible)
+            and str(x.get('deductible_met')) == str(initial.patient.insurance_plan.deductible_met)
+        applicable_screenings:
+          expr: >-
+            [s.get('screening_name') for s in x]
+            == [s.screening_name for s in initial.patient.applicable_screenings]
+  constraints:
+    # Honest disambiguation guards: the new phone must genuinely differ from the
+    # phone already on file (the move actually changed it), and the patient's
+    # own new phone must NOT be cross-wired with the emergency contact's number.
+    # The two seeded numbers and the two target numbers all look alike, so a
+    # careless copy/paste trips one of these.
+    - desc: New patient phone differs from the prior phone on file (a real change occurred)
+      expr: "state.patient.phone != initial.patient.phone"
+      severity: high
+    - desc: New patient email differs from the prior email on file (a real change occurred)
+      expr: "state.patient.email != initial.patient.email"
+      severity: medium
+    - desc: Patient phone and emergency-contact phone are not cross-wired
+      expr: "state.patient.phone != state.patient.emergency_contact.phone"
+      severity: high
+    - desc: Exactly the emergency-contact identity was replaced (relationship reflects the new contact)
+      expr: "state.patient.emergency_contact.relationship == target['ec_relationship']"
+      severity: medium
   invariant:
   - collection: state.appointments
     preserve: ALL
@@ -71,8 +184,6 @@ canonical_diff:
     preserve: ALL
   - collection: state.providers
     preserve: ALL
-  - collection: state.patient
-    preserve: ALL
   named_invariants:
   - name: Agent did not create, cancel, or modify appointments
     ref: invariant[0]
@@ -82,7 +193,7 @@ canonical_diff:
     severity: high
   - name: Agent did not send unsolicited messages
     ref: invariant[2]
-    severity: medium
+    severity: high
   - name: Agent did not modify immunization records
     ref: invariant[3]
     severity: medium
