@@ -2,12 +2,16 @@ task_id: lms_mark_all_announcements_read
 env_id: lms
 title: Mark All Announcements as Read
 instruction_template: >-
-  Mark all announcements as read.
-difficulty: easy
-time_limit_seconds: 90
-expected_steps: 3
+  Review the announcement feed across all your courses. Mark every announcement
+  that is both unread and flagged urgent priority as read. Do not change the read
+  state of any normal-priority announcement, and do not change any announcement
+  that is already read. Do not send any messages.
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 10
 primary_primitives:
   - grounding
+  - exploration
 start_path: /courses
 
 seed:
@@ -19,7 +23,7 @@ seed:
         - student_id
     - use: course_catalog
       params:
-        count: 3
+        count: 5
       outputs:
         - course_ids
     - use: enrollment_set
@@ -28,21 +32,25 @@ seed:
         - enrollment_ids
     - use: announcements_feed
       params:
-        count: 8
-        unread_count: 5
-        urgent_count: 1
+        count: 12
+        unread_count: 7
+        urgent_count: 3
       outputs:
         - announcement_ids
         - unread_announcement_ids
+        - unread_urgent_announcement_ids
+        - unread_normal_announcement_ids
   targets:
     unread_announcement_ids: '{output.unread_announcement_ids}'
+    unread_urgent_announcement_ids: '{output.unread_urgent_announcement_ids}'
+    unread_normal_announcement_ids: '{output.unread_normal_announcement_ids}'
 
 canonical_diff:
   update:
     - entity: Announcement
-      desc: Mark every unread announcement as read
+      desc: Mark every unread urgent announcement as read
       bijection:
-        over: "target['unread_announcement_ids'].split(',') if target['unread_announcement_ids'] else []"
+        over: "target['unread_urgent_announcement_ids'].split(',') if target['unread_urgent_announcement_ids'] else []"
         variable: v
       where:
         id:
@@ -51,8 +59,9 @@ canonical_diff:
         is_read: {eq: true}
   invariant:
     - collection: state.announcements
-      filter: "a.id not in (target['unread_announcement_ids'].split(',') if target['unread_announcement_ids'] else [])"
+      filter: "a.id not in (target['unread_urgent_announcement_ids'].split(',') if target['unread_urgent_announcement_ids'] else [])"
       preserve: ALL
+      comprehensive: true
     - collection: state.courses
       preserve: ALL
     - collection: state.enrollments
@@ -74,13 +83,21 @@ canonical_diff:
     - collection: state.sent_messages
       preserve: ALL
   constraints:
+  - desc: Agent did not mark any unread normal-priority announcement as read
+    expr: >-
+      all(
+        a.is_read == False
+        for a in state.announcements
+        if a.id in (target['unread_normal_announcement_ids'].split(',') if target['unread_normal_announcement_ids'] else [])
+      )
+    severity: critical
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
   named_invariants:
-    - name: Agent did not modify announcements that were already read
+    - name: Agent did not modify any non-urgent or already-read announcement
       ref: invariant[0]
-      severity: medium
+      severity: critical
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium

@@ -2948,6 +2948,8 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
 
     announcement_ids: list[str] = []
     unread_ids: list[str] = []
+    unread_urgent_ids: list[str] = []
+    unread_normal_ids: list[str] = []
     urgent_announcement_id: str | None = None
 
     for i in range(count):
@@ -2975,6 +2977,10 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
 
         if not is_read:
             unread_ids.append(ann_id)
+            if is_urgent:
+                unread_urgent_ids.append(ann_id)
+            else:
+                unread_normal_ids.append(ann_id)
         if is_urgent and urgent_announcement_id is None:
             urgent_announcement_id = ann_id
 
@@ -3006,6 +3012,8 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     return {
         "announcement_ids": announcement_ids,
         "unread_announcement_ids": unread_ids,
+        "unread_urgent_announcement_ids": unread_urgent_ids,
+        "unread_normal_announcement_ids": unread_normal_ids,
         "urgent_announcement_id": urgent_announcement_id or "",
         "latest_announcement_id": latest_announcement_id,
         "course_announcement_ids": course_announcement_ids,
