@@ -514,11 +514,29 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         the same specialty (e.g. immunizations administered by different PCPs).
       must_include (list[str]): specialties that must be present; merged with
         `specialties` with duplicates collapsed.
-    Outputs: provider_ids, providers_by_specialty
+      non_accepting_provider_specs (dict[str, int]): mark the first N providers
+        created of each named specialty as ``accepting_new=False``. Lets a task
+        seed a closed-panel decoy provider in a specialty the agent must
+        otherwise book — the agent must filter those out before picking the
+        earliest slot. Requires `count_per_specialty[spec] > N` so at least one
+        accepting provider of that specialty remains.
+      min_slot_specialty (str): compute the earliest available slot among the
+        ACCEPTING providers of this specialty and expose it as
+        ``earliest_slot_dt`` (ISO string) plus the tied provider id list
+        ``earliest_slot_provider_ids``. To make the computation a genuine
+        discriminator, a strictly-earlier decoy slot is injected into one
+        non-accepting provider of the same specialty (when one exists), so the
+        globally-earliest slot belongs to a provider the agent must reject.
+    Outputs: provider_ids, providers_by_specialty, earliest_slot_dt,
+             earliest_slot_provider_ids
     """
     specialties = params.get("specialties", ["pcp"])
     count_per_specialty = params.get("count_per_specialty", {}) or {}
     must_include = set(params.get("must_include", []))
+    non_accepting_provider_specs: dict[str, int] = {
+        str(k): int(v) for k, v in (params.get("non_accepting_provider_specs", {}) or {}).items()
+    }
+    min_slot_specialty: str | None = params.get("min_slot_specialty")
     # Merge specialties + must_include, deduped. count_per_specialty controls
     # how many providers of each specialty are created (default 1).
     all_specialties = list(dict.fromkeys(specialties + list(must_include)))
@@ -532,6 +550,9 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
     # Track which names have already been used per specialty so multiple
     # providers of the same specialty don't collide on name.
     used_names_per_spec: dict[str, set[str]] = {}
+    # Per-specialty count of providers created so far (this builder call), so
+    # `non_accepting_provider_specs` can target the first N of a specialty.
+    created_count_per_spec: dict[str, int] = {}
 
     for base_spec in all_specialties:
         n_of_this = max(1, int(count_per_specialty.get(base_spec, 1)))
@@ -555,6 +576,14 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
             prov_name = ctx.rng.choice(available_names)
             used.add(prov_name)
             accepting = spec not in ("billing", "admin")
+            # `non_accepting_provider_specs` forces the first N created providers
+            # of a specialty to be closed-panel (accepting_new=False) so a task
+            # can seed a tempting-but-ineligible provider in a bookable
+            # specialty. The index is per-specialty within this builder call.
+            spec_index = created_count_per_spec.get(spec, 0)
+            if spec_index < non_accepting_provider_specs.get(spec, 0):
+                accepting = False
+            created_count_per_spec[spec] = spec_index + 1
             npi = f"{ctx.rng.randint(1000000000, 9999999999)}"
 
             # Generate 3-6 available slots over the next 2 weeks
@@ -594,9 +623,56 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         if pcp_prov:
             ctx.outputs["pcp_name"] = pcp_prov["name"]
 
+    # --- Earliest-accepting-slot discriminator (min_slot_specialty) ---------
+    # Compute the earliest available slot among ACCEPTING providers of the
+    # named specialty. To make this a genuine discriminator (rather than a
+    # trivial single-provider min), inject a strictly-earlier decoy slot into a
+    # NON-accepting provider of the same specialty when one exists — the
+    # globally-earliest slot then belongs to a provider the agent must reject.
+    earliest_slot_dt: str | None = None
+    earliest_slot_provider_ids: list[str] = []
+    if min_slot_specialty:
+        spec_providers = [
+            p for p in ctx.base["providers"]
+            if p.get("specialty") == min_slot_specialty
+        ]
+        accepting_providers = [p for p in spec_providers if p.get("accepting_new")]
+        non_accepting = [p for p in spec_providers if not p.get("accepting_new")]
+
+        # Earliest slot across accepting providers (the correct answer).
+        accepting_slot_dts = [
+            s["datetime"]
+            for p in accepting_providers
+            for s in p.get("available_slots", [])
+        ]
+        if accepting_slot_dts:
+            earliest_accept = min(accepting_slot_dts)
+            # Inject a decoy slot one hour BEFORE the earliest accepting slot
+            # into the first non-accepting provider (if any) so the closed-panel
+            # provider holds the globally-earliest slot.
+            if non_accepting:
+                decoy_dt = (
+                    datetime.fromisoformat(earliest_accept) - timedelta(hours=1)
+                )
+                decoy_provider = non_accepting[0]
+                decoy_provider.setdefault("available_slots", []).append({
+                    "datetime": decoy_dt.isoformat(),
+                    "type": "in-person",
+                    "duration_minutes": 30,
+                })
+                decoy_provider["available_slots"].sort(key=lambda s: s["datetime"])
+            earliest_slot_dt = earliest_accept
+            earliest_slot_provider_ids = sorted(
+                p["id"]
+                for p in accepting_providers
+                if any(s["datetime"] == earliest_accept for s in p.get("available_slots", []))
+            )
+
     return {
         "provider_ids": provider_ids,
         "providers_by_specialty": providers_by_specialty,
+        "earliest_slot_dt": earliest_slot_dt,
+        "earliest_slot_provider_ids": earliest_slot_provider_ids,
     }
 
 
@@ -1904,15 +1980,32 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
 
     Params: approved_count (int), pending_count (int), denied_count (int),
             with_prior_auth (bool), expiring_soon (bool),
+            pending_preauth_count (int) — number of APPROVED referrals whose
+              prior_auth is required but still PENDING (a trap: the referral is
+              "approved" but the backend gate rejects scheduling because
+              pre-auth is not approved). These consume approved slots AFTER the
+              guaranteed `must_have_specialties` referral(s), so the
+              fully-eligible referral stays distinct from the pending-preauth
+              decoys.
             must_have_specialties (list[str]) — approved referrals guaranteed for these specialties
     Outputs: approved_ref_ids, pending_ref_ids, denied_ref_ids,
-             prior_auth_ref_id, expiring_ref_id
+             prior_auth_ref_id, expiring_ref_id, eligible_ref_id,
+             eligible_specialty, preauth_pending_ref_ids
+
+    ``eligible_ref_id`` is the single APPROVED referral whose specialty is the
+    first ``must_have_specialties`` entry AND that is schedulable right now
+    (``status == 'approved'`` and (not ``prior_auth_required`` or
+    ``prior_auth_status == 'approved'``)). It is the canonical answer for
+    referral-to-schedule tasks: the agent must select exactly this referral and
+    reject the pending-preauth approved decoys. ``preauth_pending_ref_ids`` is
+    the list of approved-but-blocked decoys.
     """
     approved_count = params.get("approved_count", 1)
     pending_count = params.get("pending_count", 1)
     denied_count = params.get("denied_count", 0)
     with_prior_auth = params.get("with_prior_auth", False)
     expiring_soon = params.get("expiring_soon", False)
+    pending_preauth_count = int(params.get("pending_preauth_count", 0))
     must_have_specialties: list[str] = list(params.get("must_have_specialties", []))
 
     if "referrals" not in ctx.base:
@@ -1934,7 +2027,8 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
     expiring_ref_id: str | None = None
 
     def _make_ref(status: str, expires_days: int, prior_auth: bool = False,
-                  specialty: str | None = None) -> dict[str, Any]:
+                  specialty: str | None = None,
+                  prior_auth_status_override: str | None = None) -> dict[str, Any]:
         ref_id = ctx.next_id("ref")
         candidate_appointments = [
             apt for apt in appointments
@@ -1976,6 +2070,11 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         prior_auth_status = "not_required"
         if prior_auth:
             prior_auth_status = "approved" if status == "approved" else "pending"
+        # Explicit override lets a caller seed an APPROVED referral whose
+        # pre-auth is still pending (a schedulable-looking but gate-blocked
+        # decoy). The override only applies when prior_auth is required.
+        if prior_auth and prior_auth_status_override is not None:
+            prior_auth_status = prior_auth_status_override
 
         return {
             "id": ref_id,
@@ -1993,15 +2092,69 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
 
     # Approved — guarantee must_have_specialties first, then fill remaining randomly
     guaranteed = list(must_have_specialties)  # consume in order
+    # The eligible specialty is the first guaranteed specialty (the schedulable
+    # target). Pending-preauth decoys must use OTHER specialties so that, for
+    # the decoy specialty, the only approved referral is gate-blocked.
+    eligible_specialty: str | None = must_have_specialties[0] if must_have_specialties else None
+    preauth_pending_ref_ids: list[str] = []
+    # Specialties available for pending-preauth decoys: distinct from every
+    # guaranteed specialty and from each other.
+    decoy_specialty_pool = [
+        s for s in available_specialties if s not in set(must_have_specialties)
+    ]
+    decoy_specialty_idx = 0
+    # Decide which approved indices become pending-preauth decoys: the LAST
+    # `pending_preauth_count` approved slots (so the guaranteed eligible
+    # referral at i==0 is never a decoy).
+    n_pending_preauth = max(0, min(pending_preauth_count, max(0, approved_count - 1)))
+    pending_preauth_indices = set(
+        range(approved_count - n_pending_preauth, approved_count)
+    ) if n_pending_preauth else set()
+
     for i in range(approved_count):
         needs_auth = with_prior_auth and prior_auth_ref_id is None and i == 0
         forced_specialty = guaranteed.pop(0) if guaranteed else None
+        is_pending_preauth_decoy = i in pending_preauth_indices and i != 0
+        if is_pending_preauth_decoy:
+            # Assign a distinct decoy specialty so this approved referral is the
+            # sole approved referral for that specialty — and it is gate-blocked
+            # because pre-auth is required but still pending.
+            if forced_specialty is None and decoy_specialty_idx < len(decoy_specialty_pool):
+                forced_specialty = decoy_specialty_pool[decoy_specialty_idx]
+                decoy_specialty_idx += 1
+            ref = _make_ref(
+                "approved", ctx.rng.randint(60, 180), prior_auth=True,
+                specialty=forced_specialty, prior_auth_status_override="pending",
+            )
+            ctx.base["referrals"].append(ref)
+            approved_ref_ids.append(ref["id"])
+            preauth_pending_ref_ids.append(ref["id"])
+            continue
         ref = _make_ref("approved", ctx.rng.randint(60, 180), prior_auth=needs_auth,
                         specialty=forced_specialty)
         ctx.base["referrals"].append(ref)
         approved_ref_ids.append(ref["id"])
         if needs_auth:
             prior_auth_ref_id = ref["id"]
+
+    # The eligible referral: the single approved referral for `eligible_specialty`
+    # that is schedulable right now (status approved AND (no prior auth required
+    # OR prior_auth approved)). Computed from the freshly-seeded referrals so the
+    # canonical answer never has to be reconstructed inside a diff predicate.
+    eligible_ref_id: str | None = None
+    if eligible_specialty is not None:
+        eligible_ref_id = next(
+            (
+                r["id"] for r in ctx.base["referrals"]
+                if r["to_specialty"] == eligible_specialty
+                and r["status"] == "approved"
+                and (
+                    not r["prior_auth_required"]
+                    or r["prior_auth_status"] == "approved"
+                )
+            ),
+            None,
+        )
 
     # Pending
     for _ in range(pending_count):
@@ -2028,6 +2181,9 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         "denied_ref_ids": denied_ref_ids,
         "prior_auth_ref_id": prior_auth_ref_id,
         "expiring_ref_id": expiring_ref_id,
+        "eligible_ref_id": eligible_ref_id,
+        "eligible_specialty": eligible_specialty,
+        "preauth_pending_ref_ids": preauth_pending_ref_ids,
     }
 
 
