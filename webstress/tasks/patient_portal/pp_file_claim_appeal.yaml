@@ -1,12 +1,17 @@
 task_id: pp_file_claim_appeal
 env_id: patient_portal
-title: File Claim Appeal with Evidence
-instruction_template: File an appeal for the denied insurance claim whose appeal
-  deadline is approaching soonest (and which has an available EOB). If multiple denied
-  claims qualify, pick the one with the earliest appeal deadline.
-difficulty: hard
-time_limit_seconds: 300
-expected_steps: 18
+title: File Claim Appeals for the Two Most-Urgent Denied Claims
+instruction_template: Review every insurance claim on the account. Among the denied
+  claims that are still eligible for appeal (an EOB is available and the appeal deadline
+  has not yet passed), find the two whose appeal deadline is closest to now. Order
+  the eligible claims by appeal deadline from earliest to latest; if two claims share
+  the same appeal deadline, order those two by claim ID in ascending order. File an
+  appeal on exactly those two most-urgent eligible claims using the claim appeal action,
+  and on no others. Do not pay or appeal any other claim, do not modify or appeal
+  any approved or processing claim, and do not send any messages.
+difficulty: expert
+time_limit_seconds: 420
+expected_steps: 30
 primary_primitives:
 - state_tracking
 start_path: /billing
@@ -17,18 +22,20 @@ seed:
     params:
       conditions:
       - Hypertension
+      - Back Pain
       insurance_tier: basic
     outputs:
     - pcp_id
     - pcp_name
   - use: provider_directory
     params:
-      count: 6
+      count: 7
       specialties:
       - pcp
       - cardiology
       - orthopedics
       - dermatology
+      - radiology
       - billing
       - admin
       must_include:
@@ -46,7 +53,7 @@ seed:
   - use: appointment_history
     params:
       upcoming_count: 1
-      completed_count: 3
+      completed_count: 5
     outputs:
     - completed_ids
   - use: referral_chain
@@ -58,8 +65,8 @@ seed:
     - pending_ref_ids
   - use: insurance_claims
     params:
-      approved_count: 1
-      denied_count: 2
+      approved_count: 2
+      denied_count: 5
       processing_count: 1
       with_eob: true
       near_appeal_deadline: true
@@ -67,25 +74,37 @@ seed:
     - approved_claim_ids
     - denied_claim_ids
     - appealable_claim_id
+    - top_2_urgent_appealable_claim_ids
+    - appealable_claim_ids_by_deadline
   targets:
     pcp_id: '{output.pcp_id}'
     approved_claim_ids: '{output.approved_claim_ids}'
     denied_claim_ids: '{output.denied_claim_ids}'
     appealable_claim_id: '{output.appealable_claim_id}'
+    top_2_urgent_appealable_claim_ids: '{output.top_2_urgent_appealable_claim_ids}'
+    appealable_claim_ids_by_deadline: '{output.appealable_claim_ids_by_deadline}'
     approved_ref_ids: '{output.approved_ref_ids}'
     completed_ids: '{output.completed_ids}'
 canonical_diff:
   update:
     - entity: InsuranceClaim
-      desc: "File an appeal on the specific appealable denied claim (status → appealed)"
+      desc: "Appeal exactly the two most-urgent eligible denied claims (earliest appeal_deadline first, cid tiebreaker)"
+      bijection:
+        over: "target['top_2_urgent_appealable_claim_ids']"
+        variable: v
       where:
         id:
-          expr: "x == target['appealable_claim_id']"
+          expr: "x == v"
       changes:
         status: {eq: appealed}
   invariant:
+    # Every claim NOT in the two-most-urgent set must be preserved untouched:
+    # this freezes the OTHER eligible denied claims (the most-tempting siblings),
+    # plus all approved/processing claims and any variant decoy claims. The
+    # filter scope exposes only `a` + `target` (no `initial`, no lambdas), so the
+    # urgency-ranked set is precomputed in the seed builder as a scalar list.
     - collection: state.claims
-      filter: "a.id != target['appealable_claim_id']"
+      filter: "a.id not in target['top_2_urgent_appealable_claim_ids']"
       preserve: ALL
     - collection: state.appointments
       preserve: ALL
@@ -101,8 +120,10 @@ canonical_diff:
       preserve: ALL
     - collection: state.pharmacies
       preserve: ALL
+    - collection: state.providers
+      preserve: ALL
   named_invariants:
-    - name: "Agent did not modify, pay, or appeal any other claim"
+    - name: "Agent did not appeal, pay, or modify any claim outside the two most-urgent eligible set (incl. other appealable denied claims, approved, and processing claims)"
       ref: invariant[0]
       severity: critical
     - name: "Agent did not create, cancel, or modify appointments"
@@ -119,11 +140,17 @@ canonical_diff:
       severity: high
     - name: "Agent did not send unsolicited messages"
       ref: invariant[5]
-      severity: medium
+      severity: critical
     - name: "Agent did not touch referrals"
       ref: invariant[6]
       severity: high
     - name: "Agent did not modify pharmacies"
       ref: invariant[7]
       severity: medium
+    - name: "Agent did not modify providers"
+      ref: invariant[8]
+      severity: medium
+    - name: "Agent appealed exactly the two most-urgent eligible claims (no more, no fewer)"
+      ref: update[0]
+      severity: high
 secondary_primitives: []
