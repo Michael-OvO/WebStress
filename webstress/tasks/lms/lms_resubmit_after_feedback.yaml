@@ -1,12 +1,16 @@
 task_id: lms_resubmit_after_feedback
 env_id: lms
-title: Resubmit Assignment After Reading Feedback
-instruction_template: Find the assignment in {target.course_code} that has been flagged
-  for resubmission. Read the instructor's feedback, then resubmit the assignment with
-  an updated file named "{target.resubmit_file_name}".
-difficulty: medium
-time_limit_seconds: 180
-expected_steps: 10
+title: Resubmit Every Flagged Assignment With Category-Named Revisions
+instruction_template: Across your courses, find every assignment whose submission
+  status is "resubmit_requested". Read the instructor feedback on each one, then resubmit
+  it. Name each resubmission file "revision_<category>_v2.pdf", where <category> is
+  that assignment's own weight category (for example a homework assignment becomes
+  "revision_homework_v2.pdf" and a project becomes "revision_project_v2.pdf"). Resubmit
+  only the flagged assignments. Do not submit or resubmit any other assignment in {target.course_code}
+  or any other course, do not mark any announcement as read, and do not send any messages.
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 16
 primary_primitives:
 - planning
 start_path: /courses
@@ -19,7 +23,7 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 3
+      count: 4
       must_include:
       - CS201
     outputs:
@@ -32,9 +36,9 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 6
+      per_course_count: 8
       graded_fraction: 0.5
-      resubmit_count: 1
+      resubmit_count: 3
     outputs:
     - assignment_ids
     - resubmit_assignment_ids
@@ -43,29 +47,33 @@ seed:
     course_code: '{output.course_code}'
     target_course_id: '{output.target_course_id}'
     resubmit_assignment_id: '{output.resubmit_assignment_ids[0]}'
+    resubmit_assignment_ids: '{output.resubmit_assignment_ids}'
     decoy_assignment_id: '{output.decoy_assignment_id}'
     resubmit_file_name: revision_v2.pdf
 canonical_diff:
   update:
   - entity: Assignment
-    desc: Resubmit the flagged assignment after reviewing instructor feedback
+    desc: Resubmit every flagged assignment with a category-named revision file
+    bijection:
+      over: "target['resubmit_assignment_ids'].split(',') if target['resubmit_assignment_ids'] else []"
+      variable: v
     where:
       id:
-        expr: "x == target['resubmit_assignment_id']"
+        expr: "x == v"
     changes:
       submission_status:
         in:
         - submitted
         - late
       file_name:
-        expr: "x == target['resubmit_file_name']"
+        expr: "x == 'revision_' + initial.get_assignment(v).weight_category + '_v2.pdf'"
       attempt_count:
         expr: "x >= 2"
       submitted_at:
         expr: "x >= session_start"
   invariant:
   - collection: state.assignments
-    filter: "a.id != target['resubmit_assignment_id']"
+    filter: "a.id not in (target['resubmit_assignment_ids'].split(',') if target['resubmit_assignment_ids'] else [])"
     preserve: ALL
   - collection: state.courses
     preserve: ALL
@@ -87,17 +95,22 @@ canonical_diff:
     preserve: ALL
   - collection: state.sent_messages
     preserve: ALL
+  - collection: state.student
+    preserve: ALL
   constraints:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
+    severity: high
+  - desc: Agent did not mark any announcement as read
+    expr: "all(a.is_read == ia.is_read for a, ia in zip(sorted(state.announcements, key=lambda x: x.id), sorted(initial.announcements, key=lambda x: x.id)))"
     severity: medium
   named_invariants:
-  - name: Agent resubmitted the flagged assignment
+  - name: Agent resubmitted every flagged assignment with the correct category-named file
     ref: update[0]
-    severity: high
-  - name: Agent did not modify other assignments
+    severity: critical
+  - name: Agent did not submit or resubmit any other assignment
     ref: invariant[0]
-    severity: high
+    severity: critical
   - name: Agent did not modify course records
     ref: invariant[1]
     severity: medium
@@ -118,7 +131,7 @@ canonical_diff:
     severity: medium
   - name: Agent did not modify announcements
     ref: invariant[7]
-    severity: medium
+    severity: high
   - name: Agent did not modify grades
     ref: invariant[8]
     severity: high
@@ -127,5 +140,8 @@ canonical_diff:
     severity: low
   - name: Agent did not send messages
     ref: invariant[10]
+    severity: high
+  - name: Agent did not modify the student profile
+    ref: invariant[11]
     severity: medium
 secondary_primitives: []
