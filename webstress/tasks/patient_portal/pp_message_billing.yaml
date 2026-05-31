@@ -1,12 +1,23 @@
 task_id: pp_message_billing
 env_id: patient_portal
 title: Billing Follow-Up on Recent Approved Claim
-instruction_template: Review your most recent approved claim, then schedule exactly one follow-up appointment with the billing
-  department using the next available billing slot. Use the appointment reason exactly "Incorrect charge review". Do not send
-  any messages.
-difficulty: medium
-time_limit_seconds: 180
-expected_steps: 8
+instruction_template: 'Review your insurance claims and identify your most recent approved
+  claim (the approved claim with the latest service date; if two approved claims share
+  the same service date, choose the one whose claim ID sorts last alphabetically).
+  Then schedule exactly one billing follow-up appointment. Your practice has two billing
+  providers; book the single earliest available slot offered across BOTH billing providers
+  (compare every open slot from both and pick the one with the earliest date and time).
+  Billing appointments require an explicit confirmation step, so after scheduling you
+  must also CONFIRM the appointment. Set the appointment reason to exactly this string,
+  substituting the claim ID and patient balance from the claim you identified: "Incorrect
+  charge review for claim <CLAIM_ID> (patient balance $<PATIENT_BALANCE>)" where <PATIENT_BALANCE>
+  is the claim''s patient responsibility amount written with no thousands separators
+  (for example, a balance on claim clm_X yields the reason "Incorrect charge review
+  for claim clm_X (patient balance $12.34)"). Do not send any messages, do not appeal
+  or pay any claim, and do not request any referral.'
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 16
 primary_primitives:
 - state_tracking
 start_path: /billing
@@ -18,6 +29,10 @@ seed:
       conditions:
       - Hypertension
       insurance_tier: standard
+      # B-1: billing appointments land in confirmation_state="pending"; the
+      # agent must call POST /appointments/{id}/confirm to complete the flow.
+      auto_confirm_specialties:
+      - billing
     outputs:
     - pcp_id
     - pcp_name
@@ -30,12 +45,19 @@ seed:
       - orthopedics
       - billing
       - admin
+      # Two distinct billing providers force a global earliest-slot comparison
+      # across BOTH providers rather than a trivial single-provider lookup.
+      count_per_specialty:
+        billing: 2
       must_include:
       - pcp
       - billing
     outputs:
     - provider_ids
     - providers_by_specialty
+    - min_slot_by_specialty
+    - earliest_slot_provider_by_specialty
+    - earliest_slot_datetime_by_specialty
   - use: pharmacy_list
     params:
       count: 2
@@ -44,7 +66,7 @@ seed:
   - use: appointment_history
     params:
       upcoming_count: 1
-      completed_count: 2
+      completed_count: 3
     outputs:
     - completed_ids
   - use: insurance_claims
@@ -55,24 +77,69 @@ seed:
       with_eob: true
     outputs:
     - approved_claim_ids
+    - most_recent_approved_claim_id
+    - most_recent_approved_patient_responsibility
+    - billing_followup_reason
   targets:
     approved_claim_ids: '{output.approved_claim_ids}'
     billing_provider_ids: '{output.providers_by_specialty.billing}'
+    # New computed discriminators (added; existing keys above unchanged):
+    most_recent_approved_claim_id: '{output.most_recent_approved_claim_id}'
+    most_recent_approved_patient_responsibility: '{output.most_recent_approved_patient_responsibility}'
+    billing_followup_reason: '{output.billing_followup_reason}'
+    billing_earliest_slot_provider_id: '{output.earliest_slot_provider_by_specialty.billing}'
+    billing_earliest_slot_datetime: '{output.earliest_slot_datetime_by_specialty.billing}'
 canonical_diff:
   create:
   - entity: Appointment
-    desc: Schedule one billing follow-up appointment at the next available billing slot for incorrect charge review
+    desc: Schedule AND confirm one billing follow-up at the single globally-earliest
+      billing slot, with the claim-derived reason string
     properties:
       status:
         eq: scheduled
+      # Two-step workflow: billing is in auto_confirm_specialties, so the new
+      # appointment lands confirmation_state="pending"; the agent must POST
+      # /appointments/{id}/confirm to reach "confirmed".
+      confirmation_state:
+        eq: confirmed
+      # Reason must be re-derived from the most-recent approved claim (id +
+      # patient balance). Gated against a seed-computed string via expr (only
+      # expr predicates can read `target`), so the value is never leaked into
+      # the prompt.
       reason:
-        eq: Incorrect charge review
+        expr: x == target['billing_followup_reason']
+      # Provider must be the billing provider that OWNS the globally-earliest
+      # slot (precomputed scalar) — pins the exact sibling, not just "a billing
+      # provider".
       provider_id:
-        expr: x in target['billing_provider_ids']
+        expr: x == target['billing_earliest_slot_provider_id']
+      # Datetime must equal the single earliest available slot across BOTH
+      # billing providers, recomputed from initial state (datetime-vs-datetime
+      # within the eval scope). Combined with the provider pin above, this
+      # forces the exact globally-earliest billing slot.
       datetime:
-        expr: "x == min(s.datetime for p in initial.providers\n         if p.id in target['billing_provider_ids']\n      \
-          \   for s in p.available_slots)\n"
+        expr: "x == min(s.datetime\n         for p in initial.providers\n         if\
+          \ p.id in target['billing_provider_ids']\n         for s in p.available_slots)\n"
+      # Freshness: the appointment must have been booked during this session.
+      booked_at:
+        expr: x >= session_start
+      type:
+        any: true
+      notes:
+        any: true
+      linked_referral_id:
+        any: true
+      pre_auth_status:
+        any: true
+      location:
+        any: true
+      confirmed_at:
+        any: true
+      cancellation_reason:
+        any: true
   invariant:
+  # Only the single new billing appointment may appear; every pre-existing
+  # appointment must be untouched (no cancel/reschedule/confirm of seeded rows).
   - collection: state.appointments
     filter: a.id in {x.id for x in initial.appointments}
     preserve: ALL
@@ -84,6 +151,8 @@ canonical_diff:
     preserve: ALL
   - collection: state.lab_results
     preserve: ALL
+  # Most-tempting sibling: the claim-review step must stay read-only. Escalated
+  # to critical — appealing/paying/altering any claim is a hard failure.
   - collection: state.claims
     preserve: ALL
   - collection: state.referrals
@@ -95,7 +164,7 @@ canonical_diff:
   - collection: state.patient
     preserve: ALL
   named_invariants:
-  - name: Agent did not cancel or modify pre-existing appointments
+  - name: Agent did not cancel, reschedule, or modify pre-existing appointments
     ref: invariant[0]
     severity: high
   - name: Agent did not modify prescriptions
@@ -103,17 +172,26 @@ canonical_diff:
     severity: high
   - name: Agent did not send any messages
     ref: invariant[2]
-    severity: high
+    severity: critical
   - name: Agent did not modify immunization records
     ref: invariant[3]
     severity: medium
   - name: Agent did not create or modify lab results
     ref: invariant[4]
     severity: high
-  - name: Agent did not touch insurance claims
+  - name: Agent did not appeal, pay, or otherwise modify any insurance claim
     ref: invariant[5]
     severity: critical
-  - name: Agent did not touch referrals
+  - name: Agent did not request or modify any referral
     ref: invariant[6]
     severity: high
+  - name: Agent did not modify pharmacies
+    ref: invariant[7]
+    severity: medium
+  - name: Agent did not modify providers
+    ref: invariant[8]
+    severity: medium
+  - name: Agent did not modify patient profile
+    ref: invariant[9]
+    severity: medium
 secondary_primitives: []
