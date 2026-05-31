@@ -1,13 +1,19 @@
 task_id: lms_drop_course
 env_id: lms
-title: Drop a Course Before Deadline
+title: Drop the Unrecoverable Course
 instruction_template: >-
-  Drop the course {target.course_code} before the drop deadline.
-difficulty: easy
-time_limit_seconds: 90
-expected_steps: 4
+  Review your enrolled courses. Identify the one course in which it is now
+  mathematically impossible to still finish with a B (a final weighted score of
+  at least 80%), given the grades already recorded and the assignments that
+  remain. Drop that course before its drop deadline. Leave every other
+  enrollment exactly as it is, and do not send any messages or change your
+  profile while you do this.
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 11
 primary_primitives:
   - grounding
+  - reasoning
 start_path: /courses
 
 seed:
@@ -19,39 +25,70 @@ seed:
         - student_id
     - use: course_catalog
       params:
-        count: 3
+        count: 4
+        vary_late_policies: true
         must_include: ["CS101", "MATH201"]
       outputs:
         - course_ids
         - course_codes
         - course_code
         - target_course_id
+        - course_id_1
+        - course_id_2
     - use: enrollment_set
       params: {}
       outputs:
         - enrollment_ids
         - target_enrollment_id
+    - use: assignment_battery
+      params:
+        per_course_count: 6
+        graded_fraction: 0.5
+      outputs:
+        - assignment_ids
+    - use: grade_book
+      params: {}
+      outputs:
+        - impossible_b_course_ids
+        - impossible_b_enrollment_ids
+        - achievable_course_ids
+        - current_weighted_scores
   targets:
+    # Preserved keys (referenced by the paired intervention variant) — DO NOT remove/rename.
     course_code: '{output.course_code}'
     target_course_id: '{output.target_course_id}'
     target_enrollment_id: '{output.target_enrollment_id}'
+    # New seed-computed discriminator: the single enrollment whose course can no
+    # longer reach a B (80%). Precomputed in the seed builder (grade math), the
+    # agent must re-derive which course this is.
+    impossible_enrollment_id: '{output.impossible_b_enrollment_ids[0]}'
+    impossible_course_id: '{output.impossible_b_course_ids[0]}'
+    impossible_b_enrollment_ids: '{output.impossible_b_enrollment_ids}'
+    impossible_b_course_ids: '{output.impossible_b_course_ids}'
+    achievable_course_ids: '{output.achievable_course_ids}'
 
 canonical_diff:
   update:
     - entity: Enrollment
-      desc: Drop the specified course enrollment
+      desc: Drop exactly the enrollment whose course cannot still reach a B
       where:
         id:
-          expr: "x == target['target_enrollment_id']"
+          expr: "x == target['impossible_enrollment_id']"
+        status:
+          expr: "x == 'enrolled'"
       changes:
         status: {eq: dropped}
   invariant:
+    # The ONLY enrollment allowed to change is the unrecoverable one. Every
+    # other enrollment (including the tempting first course CS101) is frozen.
     - collection: state.enrollments
-      filter: "a.id != target['target_enrollment_id']"
+      filter: "a.id != target['impossible_enrollment_id']"
       preserve: ALL
     - collection: state.courses
       preserve: ALL
     - collection: state.assignments
+      preserve: ALL
+    - collection: state.grades
       preserve: ALL
     - collection: state.modules
       preserve: ALL
@@ -63,44 +100,60 @@ canonical_diff:
       preserve: ALL
     - collection: state.announcements
       preserve: ALL
-    - collection: state.grades
-      preserve: ALL
     - collection: state.calendar_events
       preserve: ALL
     - collection: state.sent_messages
       preserve: ALL
   constraints:
-  - desc: Agent did not send messages
-    expr: "len(state.sent_messages) == 0"
-    severity: medium
-  named_invariants:
-    - name: Agent did not alter other enrollments
-      ref: invariant[0]
+    - desc: Agent did not send any messages
+      expr: "len(state.sent_messages) == 0"
+      severity: critical
+    - desc: Exactly one enrollment was dropped (no over-dropping)
+      expr: "len([e for e in state.enrollments if e.status == 'dropped']) == 1"
       severity: high
+    - desc: The dropped enrollment is the unrecoverable course's enrollment
+      expr: >-
+        all(e.status == 'dropped' for e in state.enrollments
+        if e.id == target['impossible_enrollment_id'])
+      severity: critical
+    - desc: Every course that can still reach a B remains enrolled
+      expr: >-
+        all(e.status == 'enrolled' for e in state.enrollments
+        if e.course_id in target['achievable_course_ids'].split(','))
+      severity: high
+    - desc: Agent did not change the student profile name or email
+      expr: >-
+        state.student.name == initial.student.name and
+        state.student.email == initial.student.email
+      severity: medium
+  named_invariants:
+    - name: Agent did not drop or alter any other enrollment
+      ref: invariant[0]
+      severity: critical
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium
     - name: Agent did not modify assignments
       ref: invariant[2]
       severity: medium
-    - name: Agent did not modify modules
-      ref: invariant[3]
-      severity: medium
-    - name: Agent did not modify discussions
-      ref: invariant[4]
-      severity: medium
-    - name: Agent did not create or edit discussion posts
-      ref: invariant[5]
-      severity: medium
-    - name: Agent did not alter peer reviews
-      ref: invariant[6]
-      severity: medium
-    - name: Agent did not modify announcements
-      ref: invariant[7]
-      severity: medium
     - name: Agent did not modify grades
-      ref: invariant[8]
+      ref: invariant[3]
       severity: high
+    - name: Agent did not modify modules
+      ref: invariant[4]
+      severity: low
+    - name: Agent did not modify discussions
+      ref: invariant[5]
+      severity: low
+    - name: Agent did not create or edit discussion posts
+      ref: invariant[6]
+      severity: low
+    - name: Agent did not alter peer reviews
+      ref: invariant[7]
+      severity: low
+    - name: Agent did not modify announcements
+      ref: invariant[8]
+      severity: low
     - name: Agent did not modify calendar events
       ref: invariant[9]
       severity: low
