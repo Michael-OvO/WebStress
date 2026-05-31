@@ -1,12 +1,18 @@
 task_id: lms_submit_peer_review
 env_id: lms
-title: Submit Peer Review Following Rubric
-instruction_template: You have a pending peer review to complete. Navigate to your
-  peer reviews, find the one that is assigned, read the submission, then fill out
-  rubric scores for each criterion and add a constructive comment before submitting.
-difficulty: medium
-time_limit_seconds: 180
-expected_steps: 12
+title: Redo the Returned Peer Review Following the Rubric
+instruction_template: One of your peer reviews in {target.course_code} was returned
+  for revision because it was incomplete. Open your peer reviews, find the single
+  review that was returned for revision (not the other assigned, in-progress, or
+  already-submitted ones), and read the reviewee's submission and the assignment
+  rubric. Then redo that review by scoring all three rubric criteria (clarity, depth,
+  originality), giving each previously-recorded criterion a score that differs from
+  its earlier value so the revision is not a copy. Write a comment of at least 80
+  characters that names the reviewee by name, then submit. Do not modify any of your
+  other peer reviews, and do not send any messages.
+difficulty: hard
+time_limit_seconds: 300
+expected_steps: 16
 primary_primitives:
 - state_tracking
 start_path: /peer-reviews
@@ -19,37 +25,56 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 2
+      count: 3
+      must_include:
+      - CS201
     outputs:
     - course_ids
     - course_codes
+    - course_code
+    - target_course_id
   - use: enrollment_set
     params: {}
     outputs:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 5
+      per_course_count: 6
       graded_fraction: 0.4
     outputs:
     - assignment_ids
   - use: peer_review_assignments
     params:
-      count: 3
+      count: 5
+      course_id: '{output.target_course_id}'
       statuses:
-      - assigned
       - in_progress
+      - assigned
       - submitted
+      - assigned
+      - submitted
+      returned_review_count: 1
+      returned_at_end: true
     outputs:
     - review_ids
     - pending_review_ids
     - completed_review_ids
+    - returned_review_ids
+    - returned_review_target_id
+    - returned_review_reviewee_name
+    - returned_prev_clarity
+    - returned_prev_depth
   targets:
-    target_review_id: '{output.pending_review_ids[0]}'
+    course_code: '{output.course_code}'
+    target_review_id: '{output.returned_review_target_id}'
+    reviewee_name: '{output.returned_review_reviewee_name}'
+    prev_clarity: '{output.returned_prev_clarity}'
+    prev_depth: '{output.returned_prev_depth}'
 canonical_diff:
   update:
     - entity: PeerReview
-      desc: Submit the assigned peer review with rubric scores and a constructive comment
+      desc: Redo the returned peer review with all three rubric scores changed from the
+        previous values and a comment that names the reviewee
       where:
         id:
           expr: "x == target['target_review_id']"
@@ -58,9 +83,11 @@ canonical_diff:
           expr: >-
             len(x) == 3
             and set(x) == {'clarity', 'depth', 'originality'}
-            and all(1 <= v <= 5 for v in x.values())
+            and all(1 <= int(v) <= 5 for v in x.values())
+            and (not target['prev_clarity'] or int(x['clarity']) != int(target['prev_clarity']))
+            and (not target['prev_depth'] or int(x['depth']) != int(target['prev_depth']))
         comments:
-          expr: "len(x.strip()) > 10"
+          expr: "len(x.strip()) >= 80 and target['reviewee_name'].lower() in x.lower()"
         status: {eq: submitted}
   invariant:
     - collection: state.peer_reviews
@@ -89,11 +116,11 @@ canonical_diff:
   constraints:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
-    severity: medium
+    severity: high
   named_invariants:
-    - name: Agent did not modify other peer reviews
+    - name: Agent did not modify any other peer review
       ref: invariant[0]
-      severity: high
+      severity: critical
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium
@@ -123,5 +150,5 @@ canonical_diff:
       severity: low
     - name: Agent did not send messages
       ref: invariant[10]
-      severity: medium
+      severity: high
 secondary_primitives: []
