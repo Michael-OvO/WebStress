@@ -568,6 +568,17 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     resubmit_count = params.get("resubmit_count", 0)
     target_status = params.get("target_assignment_status", None)
     exclude_course_id = params.get("exclude_course_id", "")
+    # When True, force EXACTLY ONE past-due not_submitted assignment to remain
+    # inside its course's late-submission window (all other past-due missing
+    # work is pushed beyond max_late_days so it is unrecoverable). Lets a task
+    # state an unambiguous "the only recoverable past-due assignment" rule that
+    # the agent must re-derive from each course's late policy. Default False so
+    # every existing task that shares this builder is unaffected (additive).
+    sole_recoverable_missing = bool(params.get("sole_recoverable_missing", False))
+    # When True, restrict TARGET assignment selection to the recoverable-missing
+    # set (size 1 once sole_recoverable_missing has run), so the standard
+    # target_* outputs deterministically resolve to that single assignment.
+    target_recoverable_missing = bool(params.get("target_recoverable_missing", False))
 
     courses = ctx.base.get("courses", [])
     courses_by_id = {course["id"]: course for course in courses}
@@ -996,6 +1007,88 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
                 missing_ids.append(assignment["id"])
             break
 
+    # ── Force a UNIQUE recoverable past-due missing assignment ──
+    # When sole_recoverable_missing is set, keep EXACTLY ONE past-due
+    # not_submitted assignment inside its course's late window and make every
+    # other not_submitted assignment unambiguous w.r.t. that window. The seed
+    # anchor (ctx.now) floats within ~1 day of wall-clock and the evaluator
+    # measures "days late" against wall-clock, so the guarantee is made robust
+    # to ±1 day of drift:
+    #   • the sole assignment is pinned to exactly 1 day past due (slack =
+    #     max_late_days − 1 ≥ 2 days for the lenient/moderate presets), so a
+    #     +1 day drift cannot push it out of its window;
+    #   • every other not_submitted assignment is forced to be EITHER clearly
+    #     unrecoverable (≥ max_late_days + 3 days past due) OR clearly future
+    #     (≥ 5 days out), so a ±1 day drift cannot make a second assignment
+    #     simultaneously past-due AND inside its window.
+    # The retained "sole" assignment is the recoverable past-due one with the
+    # least slack remaining, tie-broken by highest points, then earliest due,
+    # then id — deterministic for a given seed.
+    sole_recoverable_id: str = ""
+    if sole_recoverable_missing:
+        def _due_dt(a: dict[str, Any]) -> datetime:
+            raw = a["due_at"]
+            return datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+
+        rec_missing = [a for a in all_assignments if _is_recoverable_missing(a)]
+        if rec_missing:
+            def _slack(a: dict[str, Any]) -> int:
+                course = courses_by_id.get(a["course_id"], {})
+                ml = int(course["syllabus"]["late_policy"]["max_late_days"])
+                return ml - (ctx.now - _due_dt(a)).days
+
+            ranked = sorted(
+                rec_missing,
+                key=lambda a: (
+                    _slack(a),
+                    -Decimal(str(a["points_possible"])),
+                    _due_dt(a),
+                    a["id"],
+                ),
+            )
+            sole = ranked[0]
+            sole_recoverable_id = sole["id"]
+            # Pin the sole assignment to 2 days past due. With the late-policy
+            # presets (max_late_days ∈ {7, 5, 3}) this leaves slack ≥ 1 day, and
+            # the 2-day cushion keeps it past-due-and-recoverable even when the
+            # floating seed anchor sits up to ~24h ahead of wall-clock at eval.
+            sole["due_at"] = (ctx.now - timedelta(days=2)).isoformat()
+            sole["submission_status"] = "not_submitted"
+            sole["score"] = None
+            sole["feedback"] = None
+            sole["submitted_at"] = None
+            sole["file_name"] = None
+            sole["attempt_count"] = 0
+
+        # Make every OTHER not_submitted assignment unambiguous.
+        for a in all_assignments:
+            if a["submission_status"] != "not_submitted":
+                continue
+            if a["id"] == sole_recoverable_id:
+                continue
+            course = courses_by_id.get(a["course_id"])
+            if not course:
+                continue
+            ml = int(course["syllabus"]["late_policy"]["max_late_days"])
+            due = _due_dt(a)
+            # Near the boundary (within a generous drift margin of "now") or
+            # already past due → force clearly unrecoverable.
+            if due < ctx.now + timedelta(days=2):
+                a["due_at"] = (ctx.now - timedelta(days=ml + 3)).isoformat()
+            else:
+                # Comfortably future → keep future but at least 5 days out so
+                # drift cannot make it past-due-and-recoverable.
+                if due < ctx.now + timedelta(days=5):
+                    a["due_at"] = (ctx.now + timedelta(days=5)).isoformat()
+            a["submission_status"] = "not_submitted"
+            a["score"] = None
+            a["feedback"] = None
+            a["submitted_at"] = None
+            a["file_name"] = None
+            a["attempt_count"] = 0
+            if a["due_at"] and _due_dt(a) < ctx.now and a["id"] not in missing_ids:
+                missing_ids.append(a["id"])
+
     # Select target and decoy assignments
     target_assignment_id: str | None = None
     target_assignment_title: str = ""
@@ -1008,6 +1101,14 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         candidates = [a for a in candidates if a["course_id"] != exclude_course_id]
     if target_status:
         candidates = [a for a in candidates if a["submission_status"] == target_status]
+    if target_recoverable_missing:
+        # Pin the target to the (now unique) recoverable past-due missing
+        # assignment so the standard target_* outputs resolve to it.
+        rec_only = [a for a in candidates if _is_recoverable_missing(a)]
+        if rec_only:
+            if sole_recoverable_id:
+                rec_only = [a for a in rec_only if a["id"] == sole_recoverable_id] or rec_only
+            candidates = rec_only
     if not candidates:
         if exclude_course_id:
             raise ValueError(
@@ -1636,6 +1737,103 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
                 decoy_pool,
                 key=lambda a: (-Decimal(str(a["points_possible"])), _id_num(a["id"])),
             )[0]["id"]
+    # ── FINAL uniqueness pass for sole_recoverable_missing ──
+    # This is the AUTHORITATIVE enforcement and runs as the last mutation, after
+    # every quiz/project/essay/exam reset above (any of which can flip an extra
+    # assignment back to not_submitted with a past-due-recoverable date). It
+    # recomputes the sole recoverable assignment from scratch over the CURRENT
+    # not_submitted set, pins it to 1 day past due (slack = max_late_days − 1),
+    # and forces every other not_submitted assignment to be unambiguously
+    # unrecoverable or comfortably future — so exactly one assignment sits inside
+    # its course's late window with margin against the ±1 day seed-anchor drift.
+    # The standard target_* outputs are re-pointed at the recomputed sole so the
+    # task's instruction ("submit that one") stays consistent with the seed.
+    if sole_recoverable_missing:
+        def _due_dt_final(a: dict[str, Any]) -> datetime:
+            raw = a["due_at"]
+            return datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+
+        def _is_rec_now(a: dict[str, Any]) -> bool:
+            if a["submission_status"] != "not_submitted":
+                return False
+            course = courses_by_id.get(a["course_id"])
+            if not course:
+                return False
+            due = _due_dt_final(a)
+            if due >= ctx.now:
+                return False
+            ml = int(course["syllabus"]["late_policy"]["max_late_days"])
+            return (ctx.now - due).days <= ml
+
+        rec_now = [a for a in all_assignments if _is_rec_now(a)]
+        if rec_now:
+            def _slack_now(a: dict[str, Any]) -> int:
+                ml = int(courses_by_id[a["course_id"]]["syllabus"]["late_policy"]["max_late_days"])
+                return ml - (ctx.now - _due_dt_final(a)).days
+
+            ranked = sorted(
+                rec_now,
+                key=lambda a: (
+                    _slack_now(a),
+                    -Decimal(str(a["points_possible"])),
+                    _due_dt_final(a),
+                    a["id"],
+                ),
+            )
+            sole = ranked[0]
+            sole_recoverable_id = sole["id"]
+            sole["due_at"] = (ctx.now - timedelta(days=2)).isoformat()
+            sole["submission_status"] = "not_submitted"
+            sole["score"] = None
+            sole["feedback"] = None
+            sole["submitted_at"] = None
+            sole["file_name"] = None
+            sole["attempt_count"] = 0
+            # Re-point the task target at the (authoritative) sole assignment.
+            target_assignment_id = sole["id"]
+            target_assignment_title = sole["title"]
+            target_course_id = sole["course_id"]
+            for c in courses:
+                if c["id"] == target_course_id:
+                    target_course_code = c["course_code"]
+                    break
+
+        for a in all_assignments:
+            if a["submission_status"] != "not_submitted" or a["id"] == sole_recoverable_id:
+                continue
+            course = courses_by_id.get(a["course_id"])
+            if not course:
+                continue
+            ml = int(course["syllabus"]["late_policy"]["max_late_days"])
+            due = _due_dt_final(a)
+            if due < ctx.now + timedelta(days=2):
+                a["due_at"] = (ctx.now - timedelta(days=ml + 3)).isoformat()
+            elif due < ctx.now + timedelta(days=5):
+                a["due_at"] = (ctx.now + timedelta(days=5)).isoformat()
+            a["score"] = None
+            a["feedback"] = None
+            a["submitted_at"] = None
+            a["file_name"] = None
+            a["attempt_count"] = 0
+            if _due_dt_final(a) < ctx.now and a["id"] not in missing_ids:
+                missing_ids.append(a["id"])
+
+        # Re-pick the decoy from a DIFFERENT course than the (possibly updated)
+        # target so the decoy invariant/constraint references a real sibling.
+        if not decoy_assignment_id or any(
+            a["id"] == decoy_assignment_id and a["course_id"] == target_course_id
+            for a in all_assignments
+        ):
+            decoy_pool = [
+                a for a in all_assignments
+                if a["course_id"] != target_course_id and a["id"] != target_assignment_id
+                and a["submission_status"] in ("not_submitted", "graded")
+            ] or [
+                a for a in all_assignments
+                if a["course_id"] != target_course_id and a["id"] != target_assignment_id
+            ]
+            if decoy_pool:
+                decoy_assignment_id = decoy_pool[0]["id"]
 
     return {
         "assignment_ids": all_assignment_ids,
@@ -1654,6 +1852,10 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         "target_course_code": target_course_code,
         "decoy_assignment_id": decoy_assignment_id or "",
         "file_name": file_name,
+        # ── Sole-recoverable discriminator (lms_submit_late hardening) ──
+        # The unique past-due not_submitted assignment kept inside its course's
+        # late window when sole_recoverable_missing is set; "" otherwise.
+        "sole_recoverable_missing_id": sole_recoverable_id,
         # ── New outputs ──
         "score_below_70": score_below_70,
         "feedback_assignment_id": feedback_assignment_id,
