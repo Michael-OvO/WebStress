@@ -3003,12 +3003,37 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         f"{cid}:{','.join(aids)}" for cid, aids in course_ann_map.items()
     )
 
+    # ── exam-scoped unread sets (depends on calendar_events output) ──
+    # Precompute the intersection the agent must re-derive: unread announcements
+    # whose course has an exam in the upcoming window, and the complementary set
+    # of unread announcements in courses WITHOUT an upcoming exam. This is the
+    # canonical eligible-set for exam-prep tasks; it is computed here (not inside
+    # a diff filter) per the canonical_diff set-precomputation rule. When the
+    # task did not run calendar_events first, both lists fall back to empty and
+    # the legacy unread_announcement_ids output is used instead.
+    exam_courses_raw = ctx.outputs.get("courses_with_upcoming_exams", "")
+    exam_course_ids = {c for c in str(exam_courses_raw).split(",") if c}
+    unread_in_exam_courses: list[str] = []
+    unread_in_non_exam_courses: list[str] = []
+    if exam_course_ids:
+        for ann in all_announcements:
+            if ann.get("is_read", True):
+                continue
+            if ann["course_id"] in exam_course_ids:
+                unread_in_exam_courses.append(ann["id"])
+            else:
+                unread_in_non_exam_courses.append(ann["id"])
+
     return {
         "announcement_ids": announcement_ids,
         "unread_announcement_ids": unread_ids,
         "urgent_announcement_id": urgent_announcement_id or "",
         "latest_announcement_id": latest_announcement_id,
         "course_announcement_ids": course_announcement_ids,
+        # ── New computed outputs (exam-prep tasks) ──
+        "unread_in_exam_courses_ids": ",".join(unread_in_exam_courses),
+        "unread_in_non_exam_courses_ids": ",".join(unread_in_non_exam_courses),
+        "unread_in_exam_courses_count": str(len(unread_in_exam_courses)),
     }
 
 
