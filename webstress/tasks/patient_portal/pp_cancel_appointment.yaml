@@ -1,13 +1,19 @@
 task_id: pp_cancel_appointment
 env_id: patient_portal
-title: Cancel an Upcoming Appointment
-instruction_template: 'Cancel your upcoming appointment with {target.provider_name} on {target.apt_date}. Provide a brief cancellation reason when cancelling.'
-difficulty: easy
-time_limit_seconds: 120
-expected_steps: 4
+title: Cancel a Duplicate Appointment Booking
+instruction_template: 'You accidentally booked the same visit with {target.provider_name}
+  twice: there are two scheduled appointments with that provider on {target.apt_date},
+  at the same time. Cancel the duplicate you created first (the one with the earlier
+  booked_at timestamp) and keep the later booking. When cancelling, set a
+  cancellation reason that contains the word duplicate.'
+difficulty: medium
+time_limit_seconds: 180
+expected_steps: 9
 primary_primitives:
 - grounding
-start_path: /
+secondary_primitives:
+- backtracking
+start_path: /appointments
 seed:
   distractors: 15
   steps:
@@ -18,49 +24,91 @@ seed:
       insurance_tier: standard
     outputs:
     - pcp_id
+    - pcp_name
   - use: provider_directory
     params:
-      count: 4
+      count: 6
       specialties:
       - pcp
       - cardiology
       - dermatology
+      - orthopedics
+      - neurology
       must_include:
       - pcp
+      - cardiology
+      - dermatology
     outputs:
     - provider_ids
+    - providers_by_specialty
   - use: pharmacy_list
     params:
-      count: 2
+      count: 3
     outputs:
     - default_pharmacy_id
   - use: appointment_history
     params:
       upcoming_count: 4
-      completed_count: 1
+      completed_count: 3
+      cancelled_count: 2
+      conflict_pair: true
+      conflict_same_provider: true
     outputs:
     - upcoming_ids
+    - conflict_apt_ids
+    - conflict_apt_date
+    - conflict_provider_name
     - pcp_apt_id
     - pcp_apt_date
+  - use: prescription_cabinet
+    params:
+      active_count: 3
+      expired_count: 1
+    outputs:
+    - active_rx_ids
+  - use: referral_chain
+    params:
+      approved_count: 1
+      pending_count: 1
+    outputs:
+    - approved_ref_ids
+  - use: insurance_claims
+    params:
+      approved_count: 1
+      denied_count: 1
+      with_eob: true
+    outputs:
+    - denied_claim_ids
   targets:
-    target_apt_id: '{output.upcoming_ids.0}'
-    provider_name: '{output.pcp_name}'
-    apt_date: '{output.pcp_apt_date}'
+    target_apt_id: '{output.conflict_apt_ids.0}'
+    earlier_booked_apt_id: '{output.conflict_apt_ids.0}'
+    later_booked_apt_id: '{output.conflict_apt_ids.1}'
+    conflict_apt_ids: '{output.conflict_apt_ids}'
+    provider_name: '{output.conflict_provider_name}'
+    apt_date: '{output.conflict_apt_date}'
 canonical_diff:
   update:
   - entity: Appointment
-    desc: Cancel the specified appointment with a non-empty cancellation reason
+    desc: Cancel the earlier-booked of the two same-provider duplicate appointments,
+      with a cancellation reason containing the word "duplicate"
     where:
       id:
-        expr: x == target['target_apt_id']
+        expr: >-
+          x == min(
+            target['conflict_apt_ids'],
+            key=lambda aid: (initial.get_appointment(aid).booked_at, aid),
+          )
     changes:
       status:
         eq: cancelled
       cancellation_reason:
-        expr: "x is not None and len(x.strip()) > 0"
+        regex: (?i)duplicate
   invariant:
   - collection: state.appointments
-    filter: a.id != target['target_apt_id']
+    filter: a.id != target['earlier_booked_apt_id']
+    preserve: ALL
+  - collection: state.appointments
+    filter: a.id == target['later_booked_apt_id']
     preserve: ALL
   - collection: state.immunizations
     preserve: ALL
@@ -85,24 +133,27 @@ canonical_diff:
   - collection: state.patient
     preserve: ALL
   named_invariants:
-  - name: Agent did not modify other appointments
+  - name: Agent did not modify any appointment other than the earlier-booked duplicate
     ref: invariant[0]
     severity: high
-  - name: Agent did not modify immunization records
+  - name: Agent kept the later-booked appointment of the duplicate pair intact
     ref: invariant[1]
+    severity: critical
+  - name: Agent did not modify immunization records
+    ref: invariant[2]
     severity: medium
   - name: Agent did not modify prescriptions
-    ref: invariant[2]
-    severity: high
-  - name: Agent did not create or modify lab results
     ref: invariant[3]
     severity: high
-  - name: Agent did not send unsolicited messages
+  - name: Agent did not create or modify lab results
     ref: invariant[4]
+    severity: high
+  - name: Agent did not send unsolicited messages
+    ref: invariant[5]
     severity: medium
   - name: Agent did not touch insurance claims
-    ref: invariant[5]
+    ref: invariant[6]
     severity: critical
   - name: Agent did not touch referrals
-    ref: invariant[6]
+    ref: invariant[7]
     severity: high
