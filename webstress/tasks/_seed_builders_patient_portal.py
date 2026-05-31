@@ -741,13 +741,17 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
 
     Params: upcoming_count, completed_count, cancelled_count,
             include_specialist (bool), conflict_pair (bool),
+            conflict_count (int, default 2) — number of appointments sharing
+            the same datetime when conflict_pair is set; >2 produces a
+            triple-or-more overlap whose keep/cancel partition is exposed via
+            conflict_keep_apt_id / conflict_cancel_apt_ids,
             target_specialty (str | None) — when set, the upcoming
             appointment for that specialty is exposed as `target_apt_id`
             (PP-5). When unset, `target_apt_id` falls back to
             `specialist_apt_id` (the first non-PCP upcoming).
     Outputs: upcoming_ids, completed_ids, cancelled_ids, next_appointment_id,
-             conflict_apt_ids, pcp_apt_id, specialist_apt_id, telehealth_apt_id,
-             target_apt_id
+             conflict_apt_ids, conflict_keep_apt_id, conflict_cancel_apt_ids,
+             pcp_apt_id, specialist_apt_id, telehealth_apt_id, target_apt_id
     """
     upcoming_count = params.get("upcoming_count", 2)
     completed_count = params.get("completed_count", 2)
@@ -921,15 +925,42 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         ctx.base["appointments"].append(apt_dict)
         cancelled_ids.append(apt_id)
 
-    # --- Conflict pair: two overlapping scheduled appointments ---
-    if conflict_pair and len(providers) >= 2:
+    # --- Conflict cluster: N overlapping scheduled appointments ---
+    # `conflict_count` controls how many appointments share the exact same
+    # datetime. Defaults to 2 so legacy callers (conflict_pair: true) keep the
+    # ORIGINAL two-appointment behaviour BYTE-FOR-BYTE — same RNG draw order
+    # and same "first-created is earlier-booked, second is one day later"
+    # ordering — so sibling tasks that read `conflict_apt_ids.1` as the
+    # later-booked appointment continue to resolve correctly.
+    #
+    # For conflict_count > 2 (a triple-or-more overlap) the booked_at ordering
+    # is DELIBERATELY decoupled from the creation/id order: distinct booked_at
+    # offsets are shuffled so the agent cannot infer "keep the earliest" from
+    # id suffix alone — it must read booked_at on each cluster member. The
+    # keep/cancel partition is exposed via conflict_keep_apt_id /
+    # conflict_cancel_apt_ids.
+    conflict_count = int(params.get("conflict_count", 2))
+    conflict_keep_apt_id: str | None = None
+    conflict_cancel_apt_ids: list[str] = []
+    conflict_last_booked_apt_id: str | None = None
+    if conflict_pair and len(providers) >= 2 and conflict_count >= 2:
         conflict_dt = ctx.now.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=ctx.rng.randint(3, 10))
-        # First appointment booked earlier, second booked 1 day later so
-        # booked_at values are always distinct and ordering is deterministic.
-        first_booked_at = ctx.now - timedelta(days=ctx.rng.randint(2, 7))
-        second_booked_at = first_booked_at + timedelta(days=1)
-        conflict_booked_ats = [first_booked_at, second_booked_at]
-        for j in range(2):
+        if conflict_count == 2:
+            # LEGACY path (unchanged RNG draws / ordering).
+            first_booked_at = ctx.now - timedelta(days=ctx.rng.randint(2, 7))
+            second_booked_at = first_booked_at + timedelta(days=1)
+            conflict_booked_ats = [first_booked_at, second_booked_at]
+        else:
+            # Distinct booked_at offsets (whole days apart), shuffled so the
+            # earliest-booked member is not predictable from id order.
+            base_booked_at = ctx.now - timedelta(days=ctx.rng.randint(conflict_count + 1, 12))
+            booked_offsets = list(range(conflict_count))
+            ctx.rng.shuffle(booked_offsets)
+            conflict_booked_ats = [
+                base_booked_at + timedelta(days=off) for off in booked_offsets
+            ]
+        cluster: list[dict[str, Any]] = []
+        for j in range(conflict_count):
             apt_id = ctx.next_id("apt")
             prov = providers[j % len(providers)]
             booked_at = conflict_booked_ats[j]
@@ -950,6 +981,19 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
             ctx.base["appointments"].append(apt_dict)
             conflict_apt_ids.append(apt_id)
             upcoming_ids.append(apt_id)
+            cluster.append(apt_dict)
+
+        # Earliest-booked appointment is the one to KEEP; every other member
+        # of the cluster must be cancelled. Tie-break on id for total order
+        # (booked_at values are distinct here, so the tie-break never fires —
+        # it mirrors the canonical_diff predicate for safety).
+        ordered = sorted(cluster, key=lambda a: (a["booked_at"], a["id"]))
+        conflict_keep_apt_id = ordered[0]["id"]
+        conflict_cancel_apt_ids = [a["id"] for a in ordered[1:]]
+        # Last-booked (max by booked_at, id) member of the cluster — preserved
+        # as a back-compat output so the original `later_booked_apt_id` target
+        # still resolves. It is always one of the appointments to cancel.
+        conflict_last_booked_apt_id = ordered[-1]["id"]
 
     # PP-5: when target_specialty is unset (or no matching provider was
     # found), fall back to specialist_apt_id so consumers can read a
@@ -963,6 +1007,9 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         "cancelled_ids": cancelled_ids,
         "next_appointment_id": next_appointment_id,
         "conflict_apt_ids": conflict_apt_ids,
+        "conflict_keep_apt_id": conflict_keep_apt_id,
+        "conflict_cancel_apt_ids": conflict_cancel_apt_ids,
+        "conflict_last_booked_apt_id": conflict_last_booked_apt_id,
         "pcp_apt_id": pcp_apt_id,
         "pcp_apt_date": pcp_apt_date,
         "specialist_apt_id": specialist_apt_id,
