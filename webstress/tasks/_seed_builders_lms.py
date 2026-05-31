@@ -3003,9 +3003,33 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         f"{cid}:{','.join(aids)}" for cid, aids in course_ann_map.items()
     )
 
+    # ── unread_target_announcement_ids: unread announcements that belong to the
+    # target course only (course_catalog runs first, so target_course_id is in
+    # ctx.outputs). Tasks that scope an "acknowledge announcements" action to a
+    # single course use this to require the agent to mark exactly the target
+    # course's unread announcements while leaving other courses' unread ones
+    # untouched. Order is the announcement-creation order so the bijection slice
+    # is deterministic. ──
+    _ann_target_cid = ctx.outputs.get("target_course_id", "")
+    unread_target_ids: list[str] = [
+        a["id"]
+        for a in all_announcements
+        if a["course_id"] == _ann_target_cid and not a.get("is_read", True)
+    ]
+    # ── read_target_announcement_ids: already-read announcements in the target
+    # course. Exposed so an invariant can pin them as frozen (they must not be
+    # un-read or otherwise mutated). ──
+    read_target_ids: list[str] = [
+        a["id"]
+        for a in all_announcements
+        if a["course_id"] == _ann_target_cid and a.get("is_read", True)
+    ]
+
     return {
         "announcement_ids": announcement_ids,
         "unread_announcement_ids": unread_ids,
+        "unread_target_announcement_ids": unread_target_ids,
+        "read_target_announcement_ids": read_target_ids,
         "urgent_announcement_id": urgent_announcement_id or "",
         "latest_announcement_id": latest_announcement_id,
         "course_announcement_ids": course_announcement_ids,
