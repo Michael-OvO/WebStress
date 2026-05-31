@@ -594,9 +594,39 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         if pcp_prov:
             ctx.outputs["pcp_name"] = pcp_prov["name"]
 
+    # -- Computed discriminator: earliest IN-PERSON Administration slot --------
+    # Tasks like pp_complete_account_audit require the agent to schedule a
+    # single in-person front-desk (Administration) visit at the EARLIEST
+    # in-person slot across ALL admin providers. With multiple admin providers
+    # this is a genuine cross-provider top-K computation that the agent must
+    # re-derive (not just read one provider's slot list). We pre-compute the
+    # canonical answer here and expose it as scalar targets so the
+    # canonical_diff predicate can pin an exact (provider_id, datetime) without
+    # reconstructing a min() over a comprehension scope it cannot see (Class 6
+    # filter-scope hazard).
+    #
+    # Tie-break is lexicographic on (datetime_iso, provider_id) so the winner
+    # is deterministic when two admin providers share the earliest slot time.
+    # Only in-person slots are eligible (a front-desk records visit is on-site).
+    admin_provider_ids = providers_by_specialty.get("admin", [])
+    admin_providers = [p for p in ctx.base["providers"] if p["id"] in admin_provider_ids]
+    _inperson_candidates: list[tuple[str, str]] = []
+    for p in admin_providers:
+        for s in p.get("available_slots", []):
+            if s.get("type") == "in-person":
+                _inperson_candidates.append((s["datetime"], p["id"]))
+    admin_earliest_inperson_slot_datetime: str | None = None
+    admin_earliest_inperson_provider_id: str | None = None
+    if _inperson_candidates:
+        _inperson_candidates.sort(key=lambda t: (t[0], t[1]))
+        admin_earliest_inperson_slot_datetime = _inperson_candidates[0][0]
+        admin_earliest_inperson_provider_id = _inperson_candidates[0][1]
+
     return {
         "provider_ids": provider_ids,
         "providers_by_specialty": providers_by_specialty,
+        "admin_earliest_inperson_slot_datetime": admin_earliest_inperson_slot_datetime,
+        "admin_earliest_inperson_provider_id": admin_earliest_inperson_provider_id,
     }
 
 
