@@ -2683,6 +2683,16 @@ def _build_module_sequence(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
     completed_count = params.get("completed_count", 2)
     output_prefix = params.get("output_prefix", "")
     linked_assignment_id = params.get("linked_assignment_id", "")
+    # Number of off-chain decoy modules to add to the SAME course. Each decoy is
+    # an independently "available" module (unlock_condition="none") that is NOT
+    # part of the prerequisite chain — it raises search-space noise so the agent
+    # must distinguish the real chain from look-alikes.
+    decoy_count = params.get("decoy_count", 0)
+    # Length of the "next completable chain segment" exposed as a re-derivable
+    # discriminator. The agent must complete exactly the next ``chain_segment``
+    # available/locked chain modules in prerequisite order (not the decoys, and
+    # not modules beyond the requested segment).
+    chain_segment = params.get("chain_segment", 0)
 
     if not course_id:
         courses = ctx.base.get("courses", [])
@@ -2766,10 +2776,66 @@ def _build_module_sequence(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
         if status == "available" and next_available_id is None:
             next_available_id = module_id
 
+    # -- Off-chain decoy modules -------------------------------------------
+    # Independently "available" modules that look completable but are NOT part
+    # of the prerequisite chain. They share the course (and a similar title
+    # style) so the agent cannot identify the real chain by "available" status
+    # alone — it must follow the prerequisite links.
+    decoy_module_ids: list[str] = []
+    for j in range(decoy_count):
+        decoy_id = ctx.next_id("module")
+        decoy_module_ids.append(decoy_id)
+        decoy = Module(
+            id=decoy_id,
+            course_id=course_id,
+            # Interleave decoy positions among the real chain so display order
+            # does not separate them from the chain modules.
+            title=f"Module {count + j + 1}: Optional {ctx.rng.choice(_TOPICS)}",
+            position=count + j,
+            unlock_condition="none",
+            unlock_value=[],
+            status="available",
+            content_items=[
+                ContentItem(
+                    title=f"Reading: Supplement {j + 1}",
+                    type="reading",
+                    completed=False,
+                ),
+                ContentItem(
+                    title=f"Video Supplement {j + 1}",
+                    type="video",
+                    completed=False,
+                ),
+            ],
+        )
+        ctx.base["modules"].append(decoy.model_dump())
+
+    # -- Re-derivable chain discriminator ----------------------------------
+    # ``next_chain_module_ids`` is the ordered list of the next ``chain_segment``
+    # completable chain modules, starting at the first non-completed chain
+    # module (index ``completed_count``). For a linear chain these are simply
+    # the modules at indices [completed_count : completed_count + chain_segment].
+    # When ``chain_segment`` is 0 the segment is empty (callers that don't use
+    # this discriminator are unaffected). ``cascade_unlocked_module_id`` is the
+    # single chain module the server auto-unlocks (locked -> available) as a
+    # side effect of completing the last module in the segment, if one exists.
+    next_chain_module_ids: list[str] = []
+    cascade_unlocked_id = ""
+    if chain_segment > 0:
+        seg_start = completed_count
+        seg_end = min(completed_count + chain_segment, count)
+        next_chain_module_ids = module_ids[seg_start:seg_end]
+        if seg_end < count:
+            cascade_unlocked_id = module_ids[seg_end]
+
     result = {
         "module_ids": module_ids,
         "first_locked_module_id": first_locked_id or "",
         "next_available_module_id": next_available_id or "",
+        "chain_module_ids": module_ids,
+        "next_chain_module_ids": next_chain_module_ids,
+        "cascade_unlocked_module_id": cascade_unlocked_id,
+        "decoy_module_ids": decoy_module_ids,
     }
     if linked_assignment_id:
         result["linked_assignment_id"] = linked_assignment_id

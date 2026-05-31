@@ -1,12 +1,15 @@
 task_id: lms_three_module_chain
 env_id: lms
-title: Unlock and Complete a 3-Module Chain
-instruction_template: In {target.course_code}, complete the next three modules in
-  sequence. Each module must have all content items completed before marking it done.
-  The modules form a prerequisite chain, so you must complete them in order.
-difficulty: hard
-time_limit_seconds: 300
-expected_steps: 20
+title: Unlock and Complete the Next Prerequisite Chain Segment
+instruction_template: In {target.course_code}, the modules form a prerequisite chain
+  where each module unlocks the next. Starting from the chain module that is currently
+  available, complete the next three modules of that prerequisite chain in order.
+  A module can only be marked done after every one of its content items is completed.
+  Other modules in this course that are not part of the prerequisite chain must be
+  left untouched, and you must not send any messages.
+difficulty: expert
+time_limit_seconds: 360
+expected_steps: 22
 primary_primitives:
 - planning
 start_path: /courses
@@ -19,7 +22,7 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 2
+      count: 4
       must_include:
       - CS101
     outputs:
@@ -32,24 +35,40 @@ seed:
     - enrollment_ids
   - use: module_sequence
     params:
-      count: 5
+      course_id: '{output.target_course_id}'
+      count: 6
       chain_type: linear
       completed_count: 1
+      decoy_count: 3
+      chain_segment: 3
     outputs:
     - module_ids
     - next_available_module_id
     - first_locked_module_id
+    - chain_module_ids
+    - next_chain_module_ids
+    - cascade_unlocked_module_id
+    - decoy_module_ids
   targets:
     course_code: '{output.course_code}'
     target_course_id: '{output.target_course_id}'
     module_ids: '{output.module_ids}'
     next_available_module_id: '{output.next_available_module_id}'
+    chain_module_ids: '{output.chain_module_ids}'
+    next_chain_module_ids: '{output.next_chain_module_ids}'
+    cascade_unlocked_module_id: '{output.cascade_unlocked_module_id}'
+    decoy_module_ids: '{output.decoy_module_ids}'
 canonical_diff:
   update:
     - entity: Module
-      desc: Complete the next three modules in the prerequisite chain after finishing all content items
+      desc: Complete exactly the next three prerequisite-chain modules (re-derived from
+        the unlock links), finishing every content item before marking each one done
       bijection:
-        over: "target['module_ids'].split(',')[1:4]"
+        # Precomputed in the seed builder: the ordered next-three completable
+        # chain modules. The agent must re-derive this same set by following the
+        # prerequisite links from the currently-available chain module, NOT by
+        # picking any module that merely shows status "available" (decoys do).
+        over: "target['next_chain_module_ids'].split(',')"
         variable: v
       where:
         id:
@@ -57,15 +76,21 @@ canonical_diff:
       changes:
         status:
           eq: completed
+        unlock_condition:
+          # Real chain modules (after the first) gate on "prerequisite"; the
+          # off-chain decoys gate on "none". This pins the agent to the chain.
+          eq: prerequisite
         content_items:
           expr: "all(item.get('completed') is True for item in x)"
   invariant:
     - collection: state.modules
-      # Range [1:5] covers the 3 intended target modules (indexes 1,2,3 = module_2/3/4)
-      # plus module_5, which the server auto-unlocks as a side-effect of completing
-      # module_4. Penalizing an agent for this cascade is a false positive — the
-      # status change from 'locked' to 'available' is unavoidable.
-      filter: "a.id not in target['module_ids'].split(',')[1:5]"
+      # Freeze every module the agent should NOT change. The mutated set is the
+      # three target chain modules; additionally the server auto-unlocks the
+      # single successor chain module (locked -> available) as a cascade when
+      # the last target is completed, so that one id is also excluded. Every
+      # other module — including the three off-chain decoy modules that sit in
+      # the same course and show status "available" — must be preserved exactly.
+      filter: "a.id not in (target['next_chain_module_ids'].split(',') + [target['cascade_unlocked_module_id']])"
       preserve: ALL
       comprehensive: true
     - collection: state.courses
@@ -92,13 +117,19 @@ canonical_diff:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
+  - desc: Agent did not complete any off-chain decoy module
+    expr: "all(m.status != 'completed' for m in state.modules if m.id in target['decoy_module_ids'].split(','))"
+    severity: critical
+  - desc: Agent did not over-complete the chain beyond the requested three modules
+    expr: "len([m for m in state.modules if m.status == 'completed']) == 1 + len(target['next_chain_module_ids'].split(','))"
+    severity: high
   named_invariants:
-    - name: Agent completed the next three modules
+    - name: Agent completed the next three prerequisite-chain modules
       ref: update[0]
-      severity: high
-    - name: Agent did not modify other modules
+      severity: critical
+    - name: Agent did not modify other or decoy modules
       ref: invariant[0]
-      severity: high
+      severity: critical
     - name: Agent did not modify course records
       ref: invariant[1]
       severity: medium
