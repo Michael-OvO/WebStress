@@ -3347,10 +3347,12 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # NOT eligible, forcing the agent to apply the full eligibility filter
     # (denied AND eob_available AND appeal_deadline >= now) rather than acting
     # on every denied claim. `denied_no_eob_count` denied claims have no EOB;
-    # `denied_expired_count` denied claims have an already-passed appeal
-    # deadline (and DO carry an EOB so the deadline is the only disqualifier).
+    # `denied_expired_count` / `denied_past_deadline_count` denied claims have an
+    # already-passed appeal deadline (and DO carry an EOB so the deadline is the
+    # only disqualifier).
     denied_no_eob_count = params.get("denied_no_eob_count", 0)
     denied_expired_count = params.get("denied_expired_count", 0)
+    denied_past_deadline_count = params.get("denied_past_deadline_count", 0)
 
     if "claims" not in ctx.base:
         ctx.base["claims"] = []
@@ -3539,6 +3541,7 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # look appealable by status) but the appeal route rejects them ("EOB is not
     # yet available"). They carry a high patient_responsibility so a top-K-by-PR
     # selection that ignores the eob filter would wrongly pick them up.
+    # (Also the non-appealable EOB-gate decoy used by pp_complex_claim_dispute.)
     for _ in range(denied_no_eob_count):
         claim = _make_claim("denied", ctx.rng.randint(30, 60), eob=False)
         ctx.base["claims"].append(claim)
@@ -3550,6 +3553,14 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # appeal route rejects them ("Appeal deadline has passed").
     for _ in range(denied_expired_count):
         claim = _make_claim("denied", -ctx.rng.randint(5, 40), eob=True)
+        ctx.base["claims"].append(claim)
+        denied_claim_ids.append(claim["id"])
+        ineligible_denied_ids.append(claim["id"])
+
+    # Non-appealable decoy: denied + EOB but the appeal deadline has passed
+    # (negative appeal_days places the deadline before ctx.now -> fails deadline gate).
+    for _ in range(denied_past_deadline_count):
+        claim = _make_claim("denied", -ctx.rng.randint(5, 40), eob=with_eob)
         ctx.base["claims"].append(claim)
         denied_claim_ids.append(claim["id"])
         ineligible_denied_ids.append(claim["id"])
@@ -3714,6 +3725,15 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     )
     top_2_urgent_appealable_claim_ids = appealable_ids_by_deadline[:2]
 
+    # Derived: the FULL set of appealable denied claims (every denied claim that
+    # passes all three backend appeal gates: status=='denied' AND eob_available
+    # AND appeal_deadline >= ctx.now). Sorted ascending by id for a stable scalar
+    # target list that drives the saturating bijection update. This is the
+    # genuine answer set when the seed also contains non-appealable denied
+    # decoys (no-EOB / past-deadline) that must be EXCLUDED.
+    appealable_denied_claim_ids = sorted(appealable_ids)
+    appealable_denied_count = len(appealable_denied_claim_ids)
+
     return {
         "approved_claim_ids": approved_claim_ids,
         "denied_claim_ids": denied_claim_ids,
@@ -3731,10 +3751,11 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         "payable_cutoff_amount": payable_cutoff_amount,
         "payable_approved_claim_ids": payable_approved_claim_ids,
         "recent_appealable_claim_ids": recent_appealable_claim_ids,
-        "appealable_claim_ids": appealable_ids_sorted,
         "ineligible_denied_ids": ineligible_denied_ids,
         "top_2_urgent_appealable_claim_ids": top_2_urgent_appealable_claim_ids,
         "appealable_claim_ids_by_deadline": appealable_ids_by_deadline,
+        "appealable_denied_claim_ids": appealable_denied_claim_ids,
+        "appealable_denied_count": appealable_denied_count,
         "total_patient_responsibility": str(total_patient_responsibility),
     }
 
