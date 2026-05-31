@@ -741,13 +741,16 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
 
     Params: upcoming_count, completed_count, cancelled_count,
             include_specialist (bool), conflict_pair (bool),
+            conflict_same_provider (bool) — when conflict_pair is set, force
+            both conflicting appointments onto the PCP so booked_at is the
+            only discriminator,
             target_specialty (str | None) — when set, the upcoming
             appointment for that specialty is exposed as `target_apt_id`
             (PP-5). When unset, `target_apt_id` falls back to
             `specialist_apt_id` (the first non-PCP upcoming).
     Outputs: upcoming_ids, completed_ids, cancelled_ids, next_appointment_id,
-             conflict_apt_ids, pcp_apt_id, specialist_apt_id, telehealth_apt_id,
-             target_apt_id
+             conflict_apt_ids, conflict_apt_date, conflict_provider_name,
+             pcp_apt_id, specialist_apt_id, telehealth_apt_id, target_apt_id
     """
     upcoming_count = params.get("upcoming_count", 2)
     completed_count = params.get("completed_count", 2)
@@ -755,6 +758,13 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
     include_specialist = params.get("include_specialist", True)
     conflict_pair = params.get("conflict_pair", False)
     target_specialty: str | None = params.get("target_specialty")
+    # When True, both appointments in the conflict pair are booked with the
+    # *same* provider (the PCP). The two appointments then share provider AND
+    # datetime, so the ONLY field that distinguishes them is ``booked_at`` —
+    # forcing a consumer task to re-derive the earlier/later booking rather
+    # than ground on the provider. Defaults False to preserve the existing
+    # two-different-providers behaviour for tasks that rely on it.
+    conflict_same_provider: bool = bool(params.get("conflict_same_provider", False))
     # B-1: per-specialty list of specialties whose upcoming appointments
     # should be created with `requires_confirmation=True`. Default empty
     # list preserves backward compatibility — existing tasks remain
@@ -779,6 +789,8 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
     completed_ids: list[str] = []
     cancelled_ids: list[str] = []
     conflict_apt_ids: list[str] = []
+    conflict_apt_date: str = ""
+    conflict_provider_name: str = ""
     pcp_apt_id: str | None = None
     specialist_apt_id: str | None = None
     telehealth_apt_id: str | None = None
@@ -924,6 +936,7 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
     # --- Conflict pair: two overlapping scheduled appointments ---
     if conflict_pair and len(providers) >= 2:
         conflict_dt = ctx.now.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=ctx.rng.randint(3, 10))
+        conflict_apt_date = conflict_dt.strftime("%B %-d %Y at %H:%M")
         # First appointment booked earlier, second booked 1 day later so
         # booked_at values are always distinct and ordering is deterministic.
         first_booked_at = ctx.now - timedelta(days=ctx.rng.randint(2, 7))
@@ -931,7 +944,10 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         conflict_booked_ats = [first_booked_at, second_booked_at]
         for j in range(2):
             apt_id = ctx.next_id("apt")
-            prov = providers[j % len(providers)]
+            # When conflict_same_provider is set, both appointments use the
+            # PCP so booked_at is the only discriminator; otherwise keep the
+            # legacy two-different-providers behaviour.
+            prov = pcp_provider if conflict_same_provider else providers[j % len(providers)]
             booked_at = conflict_booked_ats[j]
 
             apt_dict = {
@@ -950,6 +966,11 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
             ctx.base["appointments"].append(apt_dict)
             conflict_apt_ids.append(apt_id)
             upcoming_ids.append(apt_id)
+        conflict_provider_name = (
+            pcp_provider.get("name", "")
+            if conflict_same_provider
+            else providers[0].get("name", "")
+        )
 
     # PP-5: when target_specialty is unset (or no matching provider was
     # found), fall back to specialist_apt_id so consumers can read a
@@ -963,6 +984,8 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         "cancelled_ids": cancelled_ids,
         "next_appointment_id": next_appointment_id,
         "conflict_apt_ids": conflict_apt_ids,
+        "conflict_apt_date": conflict_apt_date,
+        "conflict_provider_name": conflict_provider_name,
         "pcp_apt_id": pcp_apt_id,
         "pcp_apt_date": pcp_apt_date,
         "specialist_apt_id": specialist_apt_id,
