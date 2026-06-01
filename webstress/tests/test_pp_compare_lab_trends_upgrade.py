@@ -291,38 +291,87 @@ def test_correct_but_requested_extra_referral_fails(client: TestClient):
 
 
 # ---------------------------------------------------------------------------
-# Near-miss D — derived the worsening branch correctly and confirmed, but
-# booked the WRONG endocrinologist (the one whose earliest slot is NOT the
-# global earliest across both endos). The datetime expr takes the global min
-# over every endo provider, so this fails the datetime predicate.
+# Freedom path (regression): the instruction scopes the slot to "the earliest
+# available slot for the CHOSEN provider" and lets the agent pick EITHER
+# endocrinologist. Booking the alternate endo's OWN earliest slot (which is NOT
+# the global earliest across both endos) is therefore CORRECT and must PASS.
+# Previously the datetime expr demanded the global minimum and mis-graded this.
 # ---------------------------------------------------------------------------
 
-def test_wrong_endo_not_global_earliest_slot_fails(client: TestClient):
+def test_alt_endo_own_earliest_slot_passes(client: TestClient):
     session = _create(client)
     sid = session["session_id"]
     targets = session["resolved_targets"]
     endo_ids = targets["endo_provider_ids"]
-    assert len(endo_ids) >= 2, "need >=2 endos to exercise the global-min discriminator"
+    assert len(endo_ids) >= 2, "need >=2 endos to exercise per-provider earliest"
 
     global_pid, global_dt = _global_earliest_endo(client, sid, endo_ids)
-    # Pick an endocrinologist whose earliest slot is strictly later than global.
-    wrong_pid = None
-    wrong_dt = None
+    # Pick the OTHER endocrinologist whose OWN earliest slot is strictly later.
+    alt_pid = alt_dt = None
     for pid in endo_ids:
         if pid == global_pid:
             continue
         e = _earliest_slot(client, sid, pid)
         if e > global_dt:
-            wrong_pid, wrong_dt = pid, e
+            alt_pid, alt_dt = pid, e
             break
-    assert wrong_pid is not None, "expected a later-earliest endo to exist"
+    assert alt_pid is not None, "expected a later-earliest endo to exist"
 
     apt = client.post(
         f"/api/env/{ENV}/appointments/create",
         json={
             "session_id": sid,
-            "provider_id": wrong_pid,
-            "slot_datetime": wrong_dt,
+            "provider_id": alt_pid,
+            "slot_datetime": alt_dt,
+            "type": "in-person",
+            "reason": "HbA1c worsening review",
+        },
+    ).json()
+    client.post(f"/api/env/{ENV}/appointments/{apt['id']}/confirm", json={"session_id": sid})
+
+    sm: SessionManager = app.state.session_manager
+    state = sm.get(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(state.resolved_targets),
+        trajectory=[],
+    )
+    assert result.get("success") is True, (
+        f"booking the chosen endo's OWN earliest slot is instruction-compliant: {result}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Near-miss D — right specialty/branch, but booked a slot that is NOT the chosen
+# provider's earliest available slot -> fails the per-provider datetime predicate.
+# ---------------------------------------------------------------------------
+
+def test_endo_non_earliest_slot_fails(client: TestClient):
+    session = _create(client)
+    sid = session["session_id"]
+    targets = session["resolved_targets"]
+    endo_ids = targets["endo_provider_ids"]
+
+    # Find an endo with >=2 distinct slot datetimes; book its LATEST slot.
+    pid = late_dt = None
+    for cand in endo_ids:
+        resp = client.get(
+            f"/api/env/{ENV}/appointments/available-slots",
+            params={"session_id": sid, "provider_id": cand},
+        )
+        dts = sorted({s["datetime"] for s in resp.json()["items"]})
+        if len(dts) >= 2:
+            pid, late_dt = cand, dts[-1]
+            break
+    assert pid is not None, "need an endo with >=2 distinct slots"
+
+    apt = client.post(
+        f"/api/env/{ENV}/appointments/create",
+        json={
+            "session_id": sid,
+            "provider_id": pid,
+            "slot_datetime": late_dt,
             "type": "in-person",
             "reason": "HbA1c worsening review",
         },
@@ -338,7 +387,7 @@ def test_wrong_endo_not_global_earliest_slot_fails(client: TestClient):
         trajectory=[],
     )
     assert result.get("success") is False, (
-        f"booking the non-global-earliest endo slot should fail: {result}"
+        f"booking a non-earliest slot of the chosen endo should fail: {result}"
     )
 
 

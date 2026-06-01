@@ -57,15 +57,15 @@ seed:
       expiring_soon_count: 6
       expiring_zero_refill_count: 4
       expiring_zero_refill_days:
-      - 26
+      - 24
+      - 25
+      - 27
       - 28
-      - 29
-      - 30
       far_zero_refill_count: 4
       far_zero_refill_days:
-      - 31
       - 33
-      - 37
+      - 35
+      - 38
       - 44
     outputs:
     - active_rx_ids

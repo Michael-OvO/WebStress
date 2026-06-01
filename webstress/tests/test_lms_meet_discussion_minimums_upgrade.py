@@ -127,6 +127,56 @@ def test_correct_trajectory_via_backend_passes() -> None:
         sm.destroy(sid)
 
 
+def test_reply_to_non_seed_classmate_parents_passes() -> None:
+    """Freedom path (regression): the instruction allows replying to ANY distinct
+    existing classmate posts, not only the seed's first two. Replying to classmate
+    top-level posts OUTSIDE reply_parent_post_ids must PASS — previously the first-2
+    bijection + set-equality constraint mis-graded this instruction-faithful path as
+    failure."""
+    sm, sid, targets = _create_session()
+    client = TestClient(app)
+    try:
+        tid = targets["target_discussion_id"]
+        state = sm.get_state(sid)
+        seed_parents = set(_parents(targets))
+        # Eligible = classmate top-level posts in the target discussion that are NOT
+        # the seed's first-2 pinned parents.
+        alt_parents = [
+            p.id for p in state.discussion_posts
+            if p.discussion_id == tid and p.parent_post_id is None
+            and p.author_id != state.student.id and p.id not in seed_parents
+        ]
+        assert len(alt_parents) >= 2, f"need >=2 non-seed classmate parents, got {alt_parents}"
+        chosen = alt_parents[:2]
+
+        for i in range(int(targets["target_min_posts"])):
+            resp = client.post(
+                f"/api/env/lms/discussions/{tid}/posts",
+                json={"session_id": sid, "body": f"{_BODY}{i + 1}."},
+            )
+            assert resp.status_code == 200, resp.text
+        for i, parent_id in enumerate(chosen):
+            resp = client.post(
+                f"/api/env/lms/discussions/{tid}/posts/{parent_id}/reply",
+                json={"session_id": sid, "body": f"Engaging with your distinct point, substantive reply {i + 1}."},
+            )
+            assert resp.status_code == 200, resp.text
+
+        state = sm.get_state(sid)
+        result = evaluate(
+            task=get_task(TASK_ID),
+            server_state=state,
+            targets=dict(targets),
+            trajectory=[],
+        )
+        assert result.get("success") is True, (
+            f"replying to non-seed classmate parents is instruction-compliant: {result}"
+        )
+        assert result.get("score", 0.0) >= 0.99, f"score too low: {result}"
+    finally:
+        sm.destroy(sid)
+
+
 def test_reply_to_same_parent_twice_fails() -> None:
     """Near-miss: correct counts but both replies attach to the SAME parent.
 

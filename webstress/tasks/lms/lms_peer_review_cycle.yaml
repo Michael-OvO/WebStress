@@ -95,7 +95,11 @@ canonical_diff:
       rubric_scores:
         expr: 'len(x) == 3 and set(str(k) for k in x.keys()) == {''clarity'', ''depth'', ''originality''} and [int(x[''clarity'']), int(x[''depth'']), int(x[''originality''])] == [int(s) for s in next(e.split(''='')[1] for e in target[''pending_review_req_scores''].split(''|'') if e.split(''='')[0] == v.strip()).split(''~'')]'
       comments:
-        expr: 'len(x.strip()) >= 60 and next(e.split('':'', 1)[1] for e in target[''pending_review_low_crit''].split(''|'') if e.split('':'', 1)[0] == v.strip()).lower() in x.lower() and next(e.split('':'', 1)[1] for e in target[''pending_review_name_tokens''].split(''|'') if e.split('':'', 1)[0] == v.strip()).lower() in x.lower()'
+        # Returned reviews: corrected scores are rule-pinned, but when two criteria
+        # tie at the minimum corrected score (e.g. 4~3~3 -> depth & originality both 3)
+        # the instruction gives no tie-break, so accept ANY criterion whose corrected
+        # score equals the vector minimum (still rejects non-lowest criteria).
+        expr: "len(x.strip()) >= 60 and any(c.lower() in x.lower() for i, c in enumerate(['clarity','depth','originality']) if [int(s) for s in next(e.split('=')[1] for e in target['pending_review_req_scores'].split('|') if e.split('=')[0] == v.strip()).split('~')][i] == min(int(s) for s in next(e.split('=')[1] for e in target['pending_review_req_scores'].split('|') if e.split('=')[0] == v.strip()).split('~'))) and next(e.split(':', 1)[1] for e in target['pending_review_name_tokens'].split('|') if e.split(':', 1)[0] == v.strip()).lower() in x.lower()"
       status: {eq: submitted}
   - entity: PeerReview
     desc: Submit every fresh (never-returned) pending review with three valid scores and an addressed comment naming its lowest-scored criterion

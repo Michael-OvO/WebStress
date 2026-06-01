@@ -87,7 +87,11 @@ seed:
       extra_specialty_referrals:
       - specialty: endocrinology
         status: approved
-        accepting_distinct: true
+        # Pin the EXTRA approved endo referral to a NON-accepting endo (closed-panel
+        # prov_2) so exactly ONE approved endo referral names an accepting destination,
+        # making the instruction's "the one whose destination is accepting" unambiguous.
+        accepting_distinct: false
+        pin_to_specialty_provider: true
     outputs:
     - approved_ref_ids
     - pending_ref_ids

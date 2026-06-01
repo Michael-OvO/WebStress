@@ -50,6 +50,11 @@ seed:
       must_include:
       - pcp
       - cardiology
+      # Guarantee >=1 in-person PCP slot every seed (builder flips slots[0] to
+      # in-person when the PCP drew none) so the canonical "earliest in-person PCP
+      # slot" answer always exists; without this ~8% of seeds are unsolvable.
+      force_in_person_specialties:
+      - pcp
     outputs:
     - provider_ids
     - providers_by_specialty

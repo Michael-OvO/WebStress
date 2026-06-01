@@ -119,11 +119,14 @@ canonical_diff:
           eq: null
         is_anonymous:
           eq: false
+    # Two reply-create checks (target_min_replies == 2). The instruction lets the
+    # student reply to ANY distinct existing classmate top-level posts (7 are seeded),
+    # so each reply's parent must be a member of the eligible classmate-top-level set
+    # rather than a seed-pinned first-2 id. Two identical singleton creates bind two
+    # DISTINCT reply candidates (the matcher excludes already-matched entries);
+    # distinctness + exact count are enforced by the constraints below.
     - entity: DiscussionPost
-      desc: Create one reply attached to each distinct required classmate post
-      bijection:
-        over: "[pid.strip() for pid in target['reply_parent_post_ids'].split(',') if pid.strip()]"
-        variable: v
+      desc: Create a reply attached to a distinct existing classmate top-level post
       properties:
         discussion_id:
           expr: "x == target['target_discussion_id']"
@@ -135,7 +138,27 @@ canonical_diff:
           length:
             expr: "x >= 20"
         parent_post_id:
-          expr: "x == v"
+          expr: "x in {p.id for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.parent_post_id is None and p.author_id != state.student.id}"
+        timestamp:
+          expr: "x >= session_start"
+        updated_at:
+          eq: null
+        is_anonymous:
+          eq: false
+    - entity: DiscussionPost
+      desc: Create a second reply attached to a distinct existing classmate top-level post
+      properties:
+        discussion_id:
+          expr: "x == target['target_discussion_id']"
+        author_id:
+          expr: "x == state.student.id"
+        author_name:
+          expr: "x == state.student.name"
+        body:
+          length:
+            expr: "x >= 20"
+        parent_post_id:
+          expr: "x in {p.id for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.parent_post_id is None and p.author_id != state.student.id}"
         timestamp:
           expr: "x >= session_start"
         updated_at:
@@ -193,8 +216,8 @@ canonical_diff:
   - desc: Each new reply attaches to a distinct existing classmate post
     expr: "len({p.parent_post_id for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.parent_post_id is not None}) == int(target['target_min_replies'])"
     severity: critical
-  - desc: New replies cover exactly the required distinct classmate parents (no duplicate, no off-target parent)
-    expr: "{p.parent_post_id for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.parent_post_id is not None} == {pid.strip() for pid in target['reply_parent_post_ids'].split(',') if pid.strip()}"
+  - desc: Each reply parent is a distinct existing classmate top-level post in the target discussion
+    expr: "{p.parent_post_id for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.parent_post_id is not None}.issubset({p.id for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.parent_post_id is None and p.author_id != state.student.id})"
     severity: critical
   - desc: Every new post and reply the student authored in the target discussion has a substantive body
     expr: "all(len(p.body.strip()) >= 20 for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.timestamp >= session_start)"

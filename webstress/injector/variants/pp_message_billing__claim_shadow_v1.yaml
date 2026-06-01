@@ -28,8 +28,8 @@ injections:
       service_date: '2026-05-26'
       status: approved
       amount_billed: '742.00'
-      amount_covered: '561.00'
-      patient_responsibility: '181.00'
+      amount_covered: '742.00'
+      patient_responsibility: '0.00'
       eob_available: true
       appeal_deadline: '2026-09-01T00:00:00+00:00'
       denial_reason: null
@@ -41,8 +41,8 @@ injections:
       service_date: '2026-05-23'
       status: approved
       amount_billed: '318.50'
-      amount_covered: '254.80'
-      patient_responsibility: '63.70'
+      amount_covered: '318.50'
+      patient_responsibility: '0.00'
       eob_available: true
       appeal_deadline: '2026-08-15T00:00:00+00:00'
       denial_reason: null

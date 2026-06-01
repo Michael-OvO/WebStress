@@ -34,7 +34,7 @@ injections:
       amount_billed: '1990.00'
       amount_covered: '0.00'
       patient_responsibility: '1990.00'
-      eob_available: true
+      eob_available: false
       appeal_deadline: '2026-08-01T00:00:00+00:00'
       denial_reason: Prior authorization not on file
       supporting_referral_id: null

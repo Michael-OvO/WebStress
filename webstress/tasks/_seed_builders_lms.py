@@ -2335,9 +2335,10 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
             due = _due_dt_final(a)
             if due < ctx.now + timedelta(days=2):
                 if lookalike_same_days_late > 0 and not _just_over_done:
-                    # "Just over": 1 day past the window (robust: with ±1 drift
-                    # it stays in [ml, ml+2] days late, never inside the window).
-                    a["due_at"] = (ctx.now - timedelta(days=ml + 2)).isoformat()
+                    # "Just over": with the floating anchor (up to +23h ahead of
+                    # wall-clock) it floors to at least ml+1 days late at eval time,
+                    # staying strictly outside the window.
+                    a["due_at"] = (ctx.now - timedelta(days=ml + 3)).isoformat()
                     _just_over_done = True
                 else:
                     a["due_at"] = (ctx.now - timedelta(days=ml + 3)).isoformat()

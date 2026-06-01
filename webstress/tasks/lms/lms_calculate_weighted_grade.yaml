@@ -12,7 +12,8 @@ instruction_template: Navigate to the grades page for {target.course_code} and r
   your correctly recomputed grade differs from the displayed grade by more than 1
   point. If at least one course has a discrepancy, resubmit the single most recently
   graded assignment (the graded assignment with the latest due date across all your
-  courses) with file 'grade_dispute.pdf'. If no course has a discrepancy, instead mark
+  courses; if two graded assignments share that same latest due date, resubmit the
+  one with the lowest assignment id) with file 'grade_dispute.pdf'. If no course has a discrepancy, instead mark
   the latest announcement in {target.course_code} as read to confirm you reviewed your
   standing. Do not modify any grade record, do not resubmit any other assignment, do
   not drop or complete any course or module, and do not send any messages.

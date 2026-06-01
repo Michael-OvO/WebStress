@@ -81,6 +81,11 @@ seed:
       processing_count: 2
       with_eob: true
       near_appeal_deadline: true
+      # Give eligible (denied+EOB) claims deterministic comfortably-spaced deadlines
+      # (rank1=4d, rank2=18d, then +14d/step) so the two-most-urgent are unambiguous;
+      # the only intentional same-deadline tie is parked on the last two eligible
+      # claims (well past the top-2 boundary) where the cid tiebreaker is harmless.
+      monotonic_appealable_deadlines: true
     outputs:
     - denied_claim_ids
     - appealable_claim_id
