@@ -1,18 +1,22 @@
 """Solvability proof for the upgraded lms_resubmit_after_feedback task.
 
 The upgraded task requires the agent to:
-  * find EVERY assignment whose status is "resubmit_requested" across all
-    courses (multiple, scattered across a 4-course catalog),
-  * resubmit each one through the real /resubmit endpoint,
-  * name each revision file "revision_<weight_category>_v2.pdf" where the
-    <weight_category> must be re-derived per-assignment from that assignment's
-    own weight category.
+  * find every assignment whose status is "resubmit_requested" across all
+    courses (multiple, scattered across a 5-course catalog),
+  * determine, per course's late policy, which flagged assignments are still
+    inside their resubmission window (window OPEN) and resubmit ONLY those —
+    leaving the EXPIRED flagged decoys (status resubmit_requested but window
+    closed) untouched, since resubmitting one mutates a frozen sibling and
+    trips the critical freeze invariant,
+  * name each revision file "revision_<weight_category>_attempt<n>.pdf" where
+    <weight_category> is re-derived per-assignment and <n> is that assignment's
+    NEXT attempt number (its live attempt_count + 1) — a per-row two-fact join.
 
 The correct solution is driven through the REAL backend resubmit endpoint via
 starlette TestClient, confirming achievability past the resubmit gate
-(status == resubmit_requested, attempt_count < max_attempts). A near-miss
-trajectory (uniform filename instead of the per-category computed name) is
-asserted to fail.
+(status == resubmit_requested, attempt_count < max_attempts). Several near-miss
+trajectories (uniform filename, wrong attempt number, missing one, and
+over-acting on an expired-window decoy) are asserted to fail.
 """
 
 from __future__ import annotations
@@ -60,21 +64,33 @@ def _flagged_ids(targets: dict) -> list[str]:
     return [x for x in raw.split(",") if x]
 
 
+def _expired_ids(targets: dict) -> list[str]:
+    raw = targets.get("expired_resubmit_assignment_ids", "")
+    return [x for x in raw.split(",") if x]
+
+
 def _expected_file(state, assignment_id: str) -> str:
+    """revision_<category>_attempt<attempt_count+1>.pdf from the pre-action row."""
     a = state.get_assignment(assignment_id)
-    return f"revision_{a.weight_category}_v2.pdf"
+    return f"revision_{a.weight_category}_attempt{a.attempt_count + 1}.pdf"
 
 
 @pytest.mark.parametrize("seed", SEEDS)
 def test_correct_trajectory_passes(client: TestClient, seed: int) -> None:
-    """Resubmitting every flagged assignment with the per-category file passes."""
+    """Resubmitting every IN-WINDOW flagged assignment with the per-category,
+    per-attempt file passes, while leaving expired-window decoys untouched."""
     sid, targets = _create(client, seed)
     ids = _flagged_ids(targets)
-    assert len(ids) >= 2, f"expected >=2 flagged assignments, got {ids}"
+    expired = _expired_ids(targets)
+    assert len(ids) >= 2, f"expected >=2 in-window flagged assignments, got {ids}"
+    assert len(expired) >= 2, f"expected >=2 expired-window decoys, got {expired}"
+    # The eligible set and the expired-decoy set must be disjoint.
+    assert not (set(ids) & set(expired)), (ids, expired)
 
-    # Read the seeded (pre-action) weight categories before mutating.
+    # Read the seeded (pre-action) weight categories + attempt counts before mutating.
     pre_state = _state(sid)
     expected_files = {aid: _expected_file(pre_state, aid) for aid in ids}
+    pre_attempts = {aid: pre_state.get_assignment(aid).attempt_count for aid in ids}
 
     for aid in ids:
         resp = client.post(
@@ -85,7 +101,8 @@ def test_correct_trajectory_passes(client: TestClient, seed: int) -> None:
         body = resp.json()["assignment"]
         assert body["submission_status"] in ("submitted", "late")
         assert body["file_name"] == expected_files[aid]
-        assert body["attempt_count"] >= 2
+        # attempt_count is the prior count + 1 after a single resubmit.
+        assert body["attempt_count"] == pre_attempts[aid] + 1
 
     state = _state(sid)
     result = evaluate(
@@ -123,14 +140,78 @@ def test_wrong_uniform_filename_fails(client: TestClient) -> None:
     assert result.get("success") is False, f"unexpected pass: {result}"
 
 
+def test_wrong_attempt_number_fails(client: TestClient) -> None:
+    """Using a fixed attempt number (attempt2) for every flagged assignment
+    fails the per-row attempt+1 two-fact join."""
+    sid, targets = _create(client, 42)
+    ids = _flagged_ids(targets)
+    assert len(ids) >= 2
+    pre_state = _state(sid)
+
+    for aid in ids:
+        cat = pre_state.get_assignment(aid).weight_category
+        # Correct category, WRONG (fixed) attempt number.
+        resp = client.post(
+            f"/api/env/lms/assignments/{aid}/resubmit",
+            json={"session_id": sid, "file_name": f"revision_{cat}_attempt2.pdf"},
+        )
+        assert resp.status_code == 200, resp.text
+
+    state = _state(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert result.get("success") is False, f"unexpected pass: {result}"
+
+
+def test_resubmitting_expired_decoy_fails(client: TestClient) -> None:
+    """Resubmitting an EXPIRED-window flagged decoy (the status-filter
+    shortcut) on top of the correct work trips the critical freeze invariant."""
+    sid, targets = _create(client, 42)
+    ids = _flagged_ids(targets)
+    expired = _expired_ids(targets)
+    assert len(ids) >= 2 and len(expired) >= 1
+    pre_state = _state(sid)
+
+    for aid in ids:
+        resp = client.post(
+            f"/api/env/lms/assignments/{aid}/resubmit",
+            json={"session_id": sid, "file_name": _expected_file(pre_state, aid)},
+        )
+        assert resp.status_code == 200, resp.text
+
+    # Over-act on a closed-window decoy with an otherwise plausible name.
+    e = expired[0]
+    e_name = _expected_file(pre_state, e)
+    resp = client.post(
+        f"/api/env/lms/assignments/{e}/resubmit",
+        json={"session_id": sid, "file_name": e_name},
+    )
+    # The endpoint accepts it (it only gates on status/attempts) — the window
+    # rule is a planning obligation enforced by the evaluator, not the backend.
+    assert resp.status_code == 200, resp.text
+
+    state = _state(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert result.get("success") is False, f"unexpected pass: {result}"
+
+
 def test_missing_one_resubmission_fails(client: TestClient) -> None:
-    """Leaving one flagged assignment un-resubmitted fails the bijection."""
+    """Leaving one in-window flagged assignment un-resubmitted fails the bijection."""
     sid, targets = _create(client, 42)
     ids = _flagged_ids(targets)
     assert len(ids) >= 2
 
     pre_state = _state(sid)
-    # Resubmit all but the last one, each with the correct per-category name.
+    # Resubmit all but the last one, each with the correct per-row name.
     for aid in ids[:-1]:
         resp = client.post(
             f"/api/env/lms/assignments/{aid}/resubmit",

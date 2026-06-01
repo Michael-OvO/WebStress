@@ -1,15 +1,18 @@
 task_id: lms_submit_peer_review
 env_id: lms
 title: Redo the Returned Peer Review Following the Rubric
-instruction_template: One of your peer reviews in {target.course_code} was returned
-  for revision because it was incomplete. Open your peer reviews, find the single
-  review that was returned for revision (not the other assigned, in-progress, or
-  already-submitted ones), and read the reviewee's submission and the assignment
-  rubric. Then redo that review by scoring all three rubric criteria (clarity, depth,
-  originality), giving each previously-recorded criterion a score that differs from
-  its earlier value so the revision is not a copy. Write a comment of at least 80
-  characters that names the reviewee by name, then submit. Do not modify any of your
-  other peer reviews, and do not send any messages.
+instruction_template: >-
+  One of your peer reviews in {target.course_code} was returned for revision because
+  it was incomplete. Open your peer reviews, find the single review that was returned
+  for revision (the one with returned_for_revision set; not the other assigned,
+  in-progress, or already-submitted look-alikes), and read the reviewee's submission,
+  the assignment rubric, and that review's previously-recorded scores. Then redo that
+  review by scoring all three rubric criteria (clarity, depth, originality) using the
+  published correction rule EXACTLY -- for each criterion that already had a previous
+  score, the corrected score is exactly that previous score plus 2, capped at 5; for
+  any criterion that had no previous score, use exactly 3. Write a comment of at least
+  80 characters that addresses the reviewee by their first name, then submit. Do not
+  modify any of your other peer reviews, and do not send any messages.
 difficulty: hard
 time_limit_seconds: 300
 expected_steps: 16
@@ -45,13 +48,15 @@ seed:
     - assignment_ids
   - use: peer_review_assignments
     params:
-      count: 5
+      count: 7
       course_id: '{output.target_course_id}'
       statuses:
       - in_progress
       - assigned
       - submitted
       - assigned
+      - submitted
+      - in_progress
       - submitted
       returned_review_count: 1
       returned_at_end: true
@@ -62,19 +67,28 @@ seed:
     - returned_review_ids
     - returned_review_target_id
     - returned_review_reviewee_name
+    - returned_review_reviewee_first
     - returned_prev_clarity
     - returned_prev_depth
+    - req_score_clarity
+    - req_score_depth
+    - req_score_originality
   targets:
     course_code: '{output.course_code}'
     target_review_id: '{output.returned_review_target_id}'
     reviewee_name: '{output.returned_review_reviewee_name}'
+    reviewee_first: '{output.returned_review_reviewee_first}'
     prev_clarity: '{output.returned_prev_clarity}'
     prev_depth: '{output.returned_prev_depth}'
+    req_clarity: '{output.req_score_clarity}'
+    req_depth: '{output.req_score_depth}'
+    req_originality: '{output.req_score_originality}'
 canonical_diff:
   update:
     - entity: PeerReview
-      desc: Redo the returned peer review with all three rubric scores changed from the
-        previous values and a comment that names the reviewee
+      desc: Redo the single returned-for-revision peer review with the three rubric
+        scores re-derived EXACTLY from the published prev+2 (cap 5) / unscored=3 rule
+        and a comment that addresses the reviewee by first name
       where:
         id:
           expr: "x == target['target_review_id']"
@@ -83,11 +97,11 @@ canonical_diff:
           expr: >-
             len(x) == 3
             and set(x) == {'clarity', 'depth', 'originality'}
-            and all(1 <= int(v) <= 5 for v in x.values())
-            and (not target['prev_clarity'] or int(x['clarity']) != int(target['prev_clarity']))
-            and (not target['prev_depth'] or int(x['depth']) != int(target['prev_depth']))
+            and int(x['clarity']) == int(target['req_clarity'])
+            and int(x['depth']) == int(target['req_depth'])
+            and int(x['originality']) == int(target['req_originality'])
         comments:
-          expr: "len(x.strip()) >= 80 and target['reviewee_name'].lower() in x.lower()"
+          expr: "len(x.strip()) >= 80 and target['reviewee_first'].lower() in x.lower()"
         status: {eq: submitted}
   invariant:
     - collection: state.peer_reviews

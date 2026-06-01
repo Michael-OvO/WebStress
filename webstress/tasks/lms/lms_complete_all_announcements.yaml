@@ -5,11 +5,13 @@ instruction_template: >-
   Mark as read every unread announcement whose priority is urgent that belongs
   to a course you are actively enrolled in (enrollment status enrolled). Do not
   mark read any announcement in a course where your enrollment status is
-  waitlisted, and do not mark read any non-urgent announcement. Leave every
-  other announcement in its current state. Do not send any messages.
+  anything other than enrolled (for example waitlisted or dropped), and do not
+  mark read any non-urgent announcement. Note that announcement titles do not
+  indicate priority — you must check each announcement's priority field. Leave
+  every other announcement in its current state. Do not send any messages.
 difficulty: medium
-time_limit_seconds: 180
-expected_steps: 11
+time_limit_seconds: 240
+expected_steps: 16
 primary_primitives:
 - exploration
 start_path: /
@@ -22,7 +24,7 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 5
+      count: 7
       must_include:
       - CS101
       - MATH201
@@ -32,14 +34,16 @@ seed:
   - use: enrollment_set
     params:
       include_waitlisted: true
+      dropped_count: 1
     outputs:
     - enrollment_ids
   - use: announcements_feed
     params:
-      count: 14
-      unread_count: 9
-      urgent_count: 6
+      count: 20
+      unread_count: 14
+      urgent_count: 9
       require_target_in_waitlisted: true
+      plain_urgent_titles: true
     outputs:
     - announcement_ids
     - unread_announcement_ids
@@ -96,8 +100,14 @@ canonical_diff:
   - desc: Every preserved unread announcement is still unread (no mark-all shortcut)
     expr: "all((a.is_read == False) for a in state.announcements if a.id in (target['preserved_unread_announcement_ids'].split(',') if target['preserved_unread_announcement_ids'] else []))"
     severity: critical
-  - desc: No announcement in a waitlisted course was marked read
+  - desc: No announcement in a non-enrolled (waitlisted or dropped) course that started unread was marked read
     expr: "all((a.is_read == False) for a in state.announcements if a.course_id in (target['non_enrolled_course_ids'].split(',') if target['non_enrolled_course_ids'] else []) and (initial.get_announcement(a.id) is not None and initial.get_announcement(a.id).is_read == False))"
+    severity: critical
+  - desc: Every target announcement (enrolled, urgent, unread) was actually marked read (no under-marking)
+    expr: "all((a.is_read == True) for a in state.announcements if a.id in (target['enrolled_unread_urgent_announcement_ids'].split(',') if target['enrolled_unread_urgent_announcement_ids'] else []))"
+    severity: critical
+  - desc: Exactly the target set was newly marked read — count of unread→read transitions equals the target size (no over-marking)
+    expr: "len([a for a in state.announcements if a.is_read == True and (initial.get_announcement(a.id) is not None and initial.get_announcement(a.id).is_read == False)]) == len(target['enrolled_unread_urgent_announcement_ids'].split(',') if target['enrolled_unread_urgent_announcement_ids'] else [])"
     severity: critical
   named_invariants:
   - name: Agent did not modify announcements outside the target set

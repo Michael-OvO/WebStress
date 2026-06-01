@@ -1,11 +1,13 @@
 """Solvability + near-miss proof for the upgraded lms_compare_course_grades task.
 
 The task (hardened to `hard`) seeds five enrolled courses. The agent must
-recompute the displayed weighted grades of exactly the two NAMED courses
-(course_code_a / course_code_b), and — because their grades differ by more than
-3.00 points — drop the enrollment of the lower-grade named course while leaving
-every other enrollment (including lower-grade DECOY courses that are not part of
-the named pair) untouched.
+recompute the DISPLAYED (penalty-adjusted) weighted grades of exactly the two
+NAMED courses (course_code_a / course_code_b). The named pair is calibrated to a
+knife-edge (engine gap 3.41 > 3.00 → DROP) where a NAIVE raw-percentage recompute
+that ignores the visible late_penalty_applied column lands BELOW 3.00 (→ no-op,
+the wrong branch). The agent must therefore drop the enrollment of the lower-grade
+named course while leaving every other enrollment (including a global-lowest DECOY
+course not part of the named pair) untouched.
 
 The correct solution is driven through the REAL backend drop endpoint
 (`webstress.backend.routes.lms.drop_course`), which enforces the live guards
@@ -54,8 +56,70 @@ def test_seed_targets_are_internally_consistent() -> None:
     gap = abs(score_a - score_b)
     assert Decimal(targets["named_pair_gap"]) == gap.quantize(Decimal("0.01"))
     assert targets["named_pair_gap_above_3"] == ("true" if gap > Decimal("3") else "false")
-    # For seed=42 the gap is large, so the DROP branch is the canonical answer.
+    # For the calibrated seed the engine gap is just above the 3-point tolerance,
+    # so the DROP branch is the canonical answer.
     assert targets["named_pair_gap_above_3"] == "true"
+
+
+def test_knife_edge_displayed_gap_drops_but_naive_raw_recompute_would_not() -> None:
+    """The verification trap (LMS-8): the DISPLAYED (penalty-adjusted) gap exceeds
+    3.00 (→ DROP), but a NAIVE raw-percentage recompute that ignores the visible
+    late-penalty column lands at or below 3.00 (→ no-op, the WRONG branch).
+
+    This proves the base is genuinely on a knife-edge: an agent that does not read
+    the late_penalty_applied column computes the wrong branch.
+    """
+    _sm, _sid, targets, state = _new_session()
+    code_to_id = {c.course_code: c.id for c in state.courses}
+    lo_id = targets["named_pair_lower_course_id"]
+    hi_id = targets["named_pair_higher_course_id"]
+
+    # Engine (displayed) gap — applies effective = score * (1 - late_penalty).
+    engine_gap = abs(
+        state.weighted_score_for_course(hi_id) - state.weighted_score_for_course(lo_id)
+    )
+    assert engine_gap > Decimal("3"), engine_gap
+
+    # Naive raw-percentage recompute (ignores late_penalty_applied entirely).
+    def _raw_weighted(course_id: str) -> Decimal:
+        course = state.get_course(course_id)
+        graded_weight = Decimal("0")
+        weighted_sum = Decimal("0")
+        for cat_name, policy in course.syllabus.grading_policy.items():
+            cat_grades = [
+                g for g in state.get_grades_for_course(course_id)
+                if g.weight_category == cat_name and g.score is not None
+            ]
+            if not cat_grades:
+                continue
+            drop_n = policy.drop_lowest
+            ratios = sorted(cat_grades, key=lambda g: g.score / g.points_possible)
+            if len(cat_grades) <= drop_n:
+                drop_n = max(0, len(cat_grades) - 1)
+            keep = ratios[drop_n:]
+            total = sum((g.score / g.points_possible) * Decimal("100") for g in keep)
+            avg = (total / Decimal(len(keep))).quantize(Decimal("0.01"))
+            graded_weight += policy.weight
+            weighted_sum += avg * policy.weight
+        return (weighted_sum / graded_weight).quantize(Decimal("0.01"))
+
+    raw_gap = abs(_raw_weighted(hi_id) - _raw_weighted(lo_id))
+    assert raw_gap <= Decimal("3"), raw_gap
+    # The two recomputes land on OPPOSITE sides of the 3.00 boundary.
+    assert engine_gap > Decimal("3") >= raw_gap
+
+
+def test_naive_noop_due_to_raw_recompute_fails() -> None:
+    """An agent that (wrongly) reads the gap as within tolerance and does NOTHING
+    must fail — the displayed gap is above 3.00 so the no-op branch is wrong."""
+    _sm, sid, targets, state = _new_session()
+    eval_result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert eval_result.get("success") is False
 
 
 def test_correct_drop_via_real_endpoint_passes() -> None:

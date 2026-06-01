@@ -2,18 +2,18 @@
 
 The medium→hard upgrade requires the agent to:
   1. Identify the single ACTIVE↔ACTIVE interacting prescription pair (ignoring
-     a tempting decoy interaction whose partner is EXPIRED).
+     TWO tempting decoy interactions whose partner is EXPIRED).
   2. Schedule exactly one PCP follow-up at the EARLIEST available PCP slot.
   3. CONFIRM that appointment (auto_confirm_specialties=[pcp] → two-step
      workflow).
   4. Use a reason that begins with "Drug interaction review:" and names BOTH
-     active interacting medications.
+     active interacting medications EXACTLY as listed (including strength).
 
 The correct solution is driven through the REAL backend route handlers
 (`create_appointment` + `confirm_appointment`), exercising the slot-consumption
 and confirmation-state machinery, then graded through the canonical_diff
-evaluator. A near-miss (unconfirmed) and a wrong (decoy meds in reason)
-trajectory are asserted to FAIL.
+evaluator. Near-miss (unconfirmed), wrong (decoy meds in reason), wrong-slot,
+and dosage-stripped-name trajectories are asserted to FAIL.
 """
 
 from __future__ import annotations
@@ -47,17 +47,24 @@ def _earliest_pcp_slot(state, pcp_id: str) -> str:
 
 def _derive_active_pair_meds(state) -> list[str]:
     """Independently re-derive the active↔active interacting medication pair
-    from raw state, exactly as a solving agent must (no peeking at targets)."""
+    from raw state, exactly as a solving agent must (no peeking at targets).
+
+    Asserts the pair is UNIQUE: with two expired-interaction decoys now wired
+    into the cabinet, several active prescriptions carry a non-empty
+    ``interactions`` list, but only ONE conflict has both members active. An
+    agent (or grader) that requires mutual active↔active membership lands on a
+    single answer.
+    """
     active = {r.id: r for r in state.prescriptions if r.status == "active"}
+    by_med = {r.medication: r for r in active.values()}
+    found: set[tuple[str, str]] = set()
     for rx in active.values():
         for partner_med in rx.interactions:
-            partner = next(
-                (o for o in active.values() if o.medication == partner_med),
-                None,
-            )
+            partner = by_med.get(partner_med)
             if partner is not None and rx.medication in partner.interactions:
-                return sorted([rx.medication, partner.medication])
-    raise AssertionError("no active-active interacting pair found")
+                found.add(tuple(sorted([rx.medication, partner.medication])))
+    assert len(found) == 1, f"expected exactly one active-active pair, got {found}"
+    return sorted(found.pop())
 
 
 def test_correct_trajectory_via_backend_passes():
@@ -150,6 +157,91 @@ def test_wrong_decoy_meds_in_reason_fails():
     # Ensure the decoy meds are genuinely different from the active pair.
     assert set(decoy_meds) != set(targets["interacting_medications"])
     reason = f"Drug interaction review: {decoy_meds[0]} and {decoy_meds[1]}"
+
+    created = create_appointment(
+        CreateAppointmentRequest(
+            session_id=sid,
+            provider_id=pcp_id,
+            slot_datetime=slot,
+            type="in-person",
+            reason=reason,
+        ),
+        session_manager=sm,
+    )
+    confirm_appointment(
+        created["id"],
+        SessionScopedRequest(session_id=sid),
+        session_manager=sm,
+    )
+
+    result = evaluate(
+        task=get_task("pp_check_interactions"),
+        server_state=sm.get_state(sid),
+        targets=targets,
+        trajectory=[],
+    )
+    assert result.get("success") is False
+
+
+def test_second_decoy_distinct_and_in_reason_fails():
+    """The hardened cabinet wires a SECOND expired-interaction decoy. It must be
+    distinct from the genuine pair and the first decoy, and naming its
+    medications in the reason must fail the discriminator."""
+    sm, sid, targets, state = _bootstrap()
+
+    first = targets["decoy_interaction_rx_ids"]
+    second = targets["second_decoy_interaction_rx_ids"]
+    # Two distinct decoy traps were seeded.
+    assert second, "second_decoy_interaction_rx_ids should be populated"
+    assert set(first) != set(second)
+    assert set(first).isdisjoint(set(second))
+    assert set(targets["interacting_rx_ids"]).isdisjoint(set(first) | set(second))
+
+    pcp_id = targets["pcp_id"]
+    slot = _earliest_pcp_slot(state, pcp_id)
+    rxmap = {r.id: r for r in state.prescriptions}
+    second_meds = [rxmap[rid].medication for rid in second]
+    assert set(second_meds) != set(targets["interacting_medications"])
+    reason = f"Drug interaction review: {second_meds[0]} and {second_meds[1]}"
+
+    created = create_appointment(
+        CreateAppointmentRequest(
+            session_id=sid,
+            provider_id=pcp_id,
+            slot_datetime=slot,
+            type="in-person",
+            reason=reason,
+        ),
+        session_manager=sm,
+    )
+    confirm_appointment(
+        created["id"],
+        SessionScopedRequest(session_id=sid),
+        session_manager=sm,
+    )
+
+    result = evaluate(
+        task=get_task("pp_check_interactions"),
+        server_state=sm.get_state(sid),
+        targets=targets,
+        trajectory=[],
+    )
+    assert result.get("success") is False
+
+
+def test_dosage_stripped_names_fail():
+    """The reason discriminator requires the medication strings EXACTLY as
+    listed (with strength). The instruction discloses this requirement, so a
+    reason that names the bare drug (no dosage) is a legitimate near-miss that
+    must FAIL — this keeps the reason field a strict proof of identification."""
+    sm, sid, targets, state = _bootstrap()
+    pcp_id = targets["pcp_id"]
+    slot = _earliest_pcp_slot(state, pcp_id)
+    meds = targets["interacting_medications"]
+    # Strip the strength suffix (everything after the first space).
+    bare = [m.split(" ")[0] for m in meds]
+    assert bare != meds, "test fixture expects dosage-bearing medication names"
+    reason = f"Drug interaction review: {bare[0]} and {bare[1]}"
 
     created = create_appointment(
         CreateAppointmentRequest(

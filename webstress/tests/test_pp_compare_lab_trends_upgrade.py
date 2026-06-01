@@ -2,11 +2,19 @@
 
 The upgraded task (re-tiered easy -> hard) requires the agent to:
   1. RE-DERIVE the most-recent-pair HbA1c trend direction from lab history
-     (NOT stated in the instruction). The seed trend 6.9 -> 7.4 -> 8.1 is
-     WORSENING (most recent pair 7.4 -> 8.1 increases) so the worsening branch
-     (endocrinology) is the only satisfiable oneof branch.
-  2. Book with the endocrinologist (gated on an APPROVED referral) at the
-     earliest endocrinology slot, with reason exactly "HbA1c worsening review".
+     (NOT stated in the instruction). The seeded RESULTED HbA1c series sorted
+     by collected_at is 8.4 -> 7.9 -> 7.5 -> 7.7 -> 7.8 (the 7.7 is an extra
+     resulted point dated one day before the most-recent). Overall the series
+     FALLS (an eyeballer reads "improving"), but the strict last-two RESULTED
+     pair 7.7 -> 7.8 INCREASES, so the trend is WORSENING and only the
+     endocrinology branch is satisfiable. A NON-resulted ("collected") HbA1c
+     dated most-recently with a low value (6.4) is the visible tail of the
+     /labs/trend view; an agent that skips the status=='resulted' filter would
+     read 7.8 -> 6.4 as "improving" and flip to the wrong PCP branch.
+  2. Book with an endocrinologist (gated on an APPROVED referral) at the
+     GLOBAL earliest endocrinology slot across BOTH seeded endocrinologists,
+     with reason exactly "HbA1c worsening review". Booking the other
+     endocrinologist's (later) earliest slot fails the datetime predicate.
   3. Complete the two-step confirm workflow (endocrinology is in
      auto_confirm_specialties so the appointment lands pending and must be
      confirmed).
@@ -15,8 +23,7 @@ The upgraded task (re-tiered easy -> hard) requires the agent to:
 
 The CORRECT path is driven through the REAL backend endpoints via the ASGI
 app (TestClient): list labs/referrals/slots, create the endocrinology
-appointment, then confirm it. A near-miss (PCP/improving branch) is asserted
-to FAIL.
+appointment, then confirm it. Several near-misses are asserted to FAIL.
 """
 
 from __future__ import annotations
@@ -76,6 +83,23 @@ def _earliest_slot(client: TestClient, sid: str, provider_id: str) -> str:
     return min(s["datetime"] for s in slots)
 
 
+def _global_earliest_endo(client: TestClient, sid: str, endo_ids: list[str]) -> tuple[str, str]:
+    """Return (provider_id, datetime) of the GLOBAL earliest slot across every
+    seeded endocrinologist — this is what the canonical datetime expr computes."""
+    best: tuple[str, str] | None = None
+    for pid in endo_ids:
+        resp = client.get(
+            f"/api/env/{ENV}/appointments/available-slots",
+            params={"session_id": sid, "provider_id": pid},
+        )
+        assert resp.status_code == 200, resp.text
+        for s in resp.json()["items"]:
+            if best is None or s["datetime"] < best[1]:
+                best = (pid, s["datetime"])
+    assert best is not None, "no endocrinology slots found"
+    return best
+
+
 # ---------------------------------------------------------------------------
 # Correct solution — driven through the REAL backend endpoints.
 # ---------------------------------------------------------------------------
@@ -85,9 +109,10 @@ def test_correct_trajectory_passes_via_real_endpoints(client: TestClient):
     sid = session["session_id"]
     targets = session["resolved_targets"]
     endo_ids = targets["endo_provider_ids"]
-    endo_id = endo_ids[0]
+    assert len(endo_ids) >= 2, "task should seed multiple endocrinologists"
 
-    # Confirm the seeded trend is worsening (sanity: agent's derivation target).
+    # Confirm the seeded trend is worsening on the STRICT resulted last-two pair
+    # (the discriminator), and that the status-blind tail would mislead.
     labs = client.get(
         f"/api/env/{ENV}/labs/trend/{targets['trend_test_name']}",
         params={"session_id": sid},
@@ -95,12 +120,21 @@ def test_correct_trajectory_passes_via_real_endpoints(client: TestClient):
     resulted = [l for l in labs if l["status"] == "resulted"]
     resulted.sort(key=lambda l: l["collected_at"])
     assert float(resulted[-1]["value"]) > float(resulted[-2]["value"]), "seed must be worsening"
+    # Overall series falls (eyeballing reads "improving") -> the most-recent
+    # pair, not the overall direction, must decide.
+    assert float(resulted[-1]["value"]) < float(resulted[0]["value"]), "overall series should fall"
+    # Status-blind tail (no resulted filter) would read as improving -> trap.
+    all_sorted = sorted(labs, key=lambda l: l["collected_at"])
+    assert float(all_sorted[-1]["value"]) < float(all_sorted[-2]["value"]), (
+        "status-blind tail should look improving (the fair trap)"
+    )
 
     # An approved endocrinology referral must exist so the gate accepts the booking.
     refs = client.get(f"/api/env/{ENV}/referrals", params={"session_id": sid}).json()["items"]
     assert any(r["to_specialty"] == "endocrinology" and r["status"] == "approved" for r in refs)
 
-    earliest = _earliest_slot(client, sid, endo_id)
+    # GLOBAL earliest endo slot across BOTH endocrinologists.
+    endo_id, earliest = _global_earliest_endo(client, sid, endo_ids)
 
     # Create the endocrinology follow-up at the earliest slot.
     create_resp = client.post(
@@ -254,3 +288,104 @@ def test_correct_but_requested_extra_referral_fails(client: TestClient):
         trajectory=[],
     )
     assert result.get("success") is False, f"extra referral should fail: {result}"
+
+
+# ---------------------------------------------------------------------------
+# Near-miss D — derived the worsening branch correctly and confirmed, but
+# booked the WRONG endocrinologist (the one whose earliest slot is NOT the
+# global earliest across both endos). The datetime expr takes the global min
+# over every endo provider, so this fails the datetime predicate.
+# ---------------------------------------------------------------------------
+
+def test_wrong_endo_not_global_earliest_slot_fails(client: TestClient):
+    session = _create(client)
+    sid = session["session_id"]
+    targets = session["resolved_targets"]
+    endo_ids = targets["endo_provider_ids"]
+    assert len(endo_ids) >= 2, "need >=2 endos to exercise the global-min discriminator"
+
+    global_pid, global_dt = _global_earliest_endo(client, sid, endo_ids)
+    # Pick an endocrinologist whose earliest slot is strictly later than global.
+    wrong_pid = None
+    wrong_dt = None
+    for pid in endo_ids:
+        if pid == global_pid:
+            continue
+        e = _earliest_slot(client, sid, pid)
+        if e > global_dt:
+            wrong_pid, wrong_dt = pid, e
+            break
+    assert wrong_pid is not None, "expected a later-earliest endo to exist"
+
+    apt = client.post(
+        f"/api/env/{ENV}/appointments/create",
+        json={
+            "session_id": sid,
+            "provider_id": wrong_pid,
+            "slot_datetime": wrong_dt,
+            "type": "in-person",
+            "reason": "HbA1c worsening review",
+        },
+    ).json()
+    client.post(f"/api/env/{ENV}/appointments/{apt['id']}/confirm", json={"session_id": sid})
+
+    sm: SessionManager = app.state.session_manager
+    state = sm.get(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(state.resolved_targets),
+        trajectory=[],
+    )
+    assert result.get("success") is False, (
+        f"booking the non-global-earliest endo slot should fail: {result}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Near-miss E — an agent that ignored the status=='resulted' filter would read
+# the trend-view tail (most-recent point is a 'collected', non-resulted HbA1c
+# with a low value) as IMPROVING and book the PCP. The seed is truly worsening,
+# so the PCP/improving branch's provider expr is unsatisfiable -> FAIL.
+# (This is the status-blind grounding trap the variant amplifies.)
+# ---------------------------------------------------------------------------
+
+def test_status_blind_improving_pcp_fails(client: TestClient):
+    session = _create(client)
+    sid = session["session_id"]
+    targets = session["resolved_targets"]
+
+    # Demonstrate the trap is live: status-blind tail looks improving.
+    labs = client.get(
+        f"/api/env/{ENV}/labs/trend/{targets['trend_test_name']}",
+        params={"session_id": sid},
+    ).json()["items"]
+    all_sorted = sorted(labs, key=lambda l: l["collected_at"])
+    assert float(all_sorted[-1]["value"]) < float(all_sorted[-2]["value"])
+    assert all_sorted[-1]["status"] != "resulted", "tail trap must be non-resulted"
+
+    pcp_id = targets["pcp_id"]
+    earliest = _earliest_slot(client, sid, pcp_id)
+    create_resp = client.post(
+        f"/api/env/{ENV}/appointments/create",
+        json={
+            "session_id": sid,
+            "provider_id": pcp_id,
+            "slot_datetime": earliest,
+            "type": "in-person",
+            "reason": "HbA1c improving review",
+        },
+    )
+    assert create_resp.status_code == 200, create_resp.text
+
+    sm: SessionManager = app.state.session_manager
+    state = sm.get(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(state.resolved_targets),
+        trajectory=[],
+    )
+    assert result.get("success") is False, (
+        f"status-blind PCP/improving booking should fail: {result}"
+    )

@@ -1,13 +1,22 @@
-"""Solvability + difficulty proof for the upgraded pp_message_pcp task.
+"""Solvability + difficulty proof for the v2-upgraded pp_message_pcp task.
 
 The upgraded task (medium tier) requires the agent to:
   1. Schedule exactly one appointment with the ASSIGNED PCP (target.pcp_id),
-     at that PCP's own earliest available slot, with an exact reason.
+     at that PCP's OWN earliest available slot, with an exact reason. A SECOND
+     PCP (a sibling provider in the directory) advertises a strictly-EARLIER
+     slot (target.global_earliest_decoy_slot_dt on
+     target.global_earliest_decoy_provider_id) — booking the globally-earliest
+     PCP slot is the wrong answer; only the assigned PCP's own earliest slot
+     scores.
   2. Complete the two-step confirmation workflow (auto_confirm_specialties=[pcp]
      lands the new appointment in confirmation_state="pending"; the agent must
      then POST /appointments/{id}/confirm to reach "confirmed").
-  3. Touch nothing else — in particular not cancel/modify/confirm any of the
-     pre-existing seeded appointments (now a critical, comprehensive invariant).
+  3. Touch nothing else — in particular, one PRE-EXISTING PCP appointment
+     (target.pcp_apt_id) is itself seeded requires_confirmation=True /
+     confirmation_state="pending". The naive "find the pending PCP appointment
+     and confirm it" heuristic confirms the WRONG (pre-existing) row, which is
+     a critical, comprehensive appointments-invariant violation. The agent must
+     confirm ONLY its own newly-created appointment.
 
 The correct path is driven entirely through the REAL backend mutation
 endpoints via TestClient so the proof also confirms every gate is passable.
@@ -41,16 +50,39 @@ def _earliest_pcp_slot_iso(state, pcp_id: str) -> str:
     return min(s.datetime for s in pcp.available_slots).isoformat()
 
 
+def test_difficulty_preconditions_hold():
+    """The two v2 discriminators must actually exist for this seed."""
+    sm, sid, targets, state = _create_session()
+    pcp_id = targets["pcp_id"]
+
+    # Two PCP providers exist; the confirmation workflow is opted in.
+    assert state.auto_confirm_specialties == ["pcp"], state.auto_confirm_specialties
+    pcps = [p for p in state.providers if p.specialty == "pcp"]
+    assert len(pcps) >= 2
+
+    # Trap 1 (grounding): a sibling PCP advertises a strictly-EARLIER slot than
+    # the assigned PCP's own earliest slot.
+    assigned_earliest = _earliest_pcp_slot_iso(state, pcp_id)
+    decoy_dt = targets["global_earliest_decoy_slot_dt"]
+    decoy_pid = targets["global_earliest_decoy_provider_id"]
+    assert decoy_pid and decoy_pid != pcp_id, (decoy_pid, pcp_id)
+    assert decoy_dt < assigned_earliest, (decoy_dt, assigned_earliest)
+
+    # Trap 2 (backtracking/state-tracking): the pre-existing PCP appointment is
+    # itself awaiting confirmation — a confirm-the-wrong-one lure.
+    pre = next(a for a in state.appointments if a.id == targets["pcp_apt_id"])
+    assert pre.requires_confirmation is True
+    assert pre.confirmation_state == "pending"
+    assert pre.status == "scheduled"
+    assert pre.provider_id == pcp_id
+
+
 def test_correct_trajectory_through_real_endpoints_passes():
-    """Schedule + confirm with the assigned PCP via real endpoints -> pass."""
+    """Schedule the assigned PCP's OWN earliest slot + confirm only the new
+    appointment via real endpoints -> pass."""
     sm, sid, targets, state = _create_session()
     pcp_id = targets["pcp_id"]
     slot_iso = _earliest_pcp_slot_iso(state, pcp_id)
-
-    # Confirm the difficulty preconditions actually hold for this seed.
-    assert state.auto_confirm_specialties == ["pcp"], state.auto_confirm_specialties
-    assert len([p for p in state.providers if p.specialty == "pcp"]) >= 2
-    assert len(state.appointments) >= 3  # pre-existing rows the invariant guards
 
     client = TestClient(app)
 
@@ -71,7 +103,7 @@ def test_correct_trajectory_through_real_endpoints_passes():
     assert new_apt["confirmation_state"] == "pending", new_apt
     new_apt_id = new_apt["id"]
 
-    # Step 2: complete the confirmation workflow.
+    # Step 2: complete the confirmation workflow on the NEW appointment only.
     confirm_resp = client.post(
         f"/api/env/patient_portal/appointments/{new_apt_id}/confirm",
         json={"session_id": sid},
@@ -90,6 +122,108 @@ def test_correct_trajectory_through_real_endpoints_passes():
     assert result.get("score", 0.0) >= 0.99, result
     # canonical_diff is richer than a 2-check eval.
     assert len(result.get("checks", [])) + len(result.get("negative_checks", [])) > 2
+
+
+def test_booking_globally_earliest_decoy_pcp_slot_fails():
+    """Booking the sibling PCP's strictly-earlier slot (the globally-earliest
+    PCP slot) instead of the assigned PCP's own earliest slot must fail."""
+    sm, sid, targets, state = _create_session()
+    decoy_pid = targets["global_earliest_decoy_provider_id"]
+    decoy_dt = targets["global_earliest_decoy_slot_dt"]
+
+    client = TestClient(app)
+    create_resp = client.post(
+        "/api/env/patient_portal/appointments/create",
+        json={
+            "session_id": sid,
+            "provider_id": decoy_pid,
+            "slot_datetime": decoy_dt,
+            "type": "in-person",
+            "reason": "Medication side effect review",
+        },
+    )
+    assert create_resp.status_code == 200, create_resp.text
+    new_apt_id = create_resp.json()["id"]
+    client.post(
+        f"/api/env/patient_portal/appointments/{new_apt_id}/confirm",
+        json={"session_id": sid},
+    )
+
+    result = evaluate(
+        task=get_task("pp_message_pcp"),
+        server_state=sm.get_state(sid),
+        targets=targets,
+        trajectory=[],
+    )
+    assert result.get("success") is False, (
+        f"globally-earliest decoy PCP slot should fail: {result}"
+    )
+
+
+def test_confirming_preexisting_pending_pcp_appointment_fails():
+    """Correct create+confirm, but ALSO confirming the pre-existing pending PCP
+    appointment violates the critical comprehensive appointments invariant."""
+    sm, sid, targets, state = _create_session()
+    pcp_id = targets["pcp_id"]
+    slot_iso = _earliest_pcp_slot_iso(state, pcp_id)
+
+    client = TestClient(app)
+    create_resp = client.post(
+        "/api/env/patient_portal/appointments/create",
+        json={
+            "session_id": sid,
+            "provider_id": pcp_id,
+            "slot_datetime": slot_iso,
+            "type": "in-person",
+            "reason": "Medication side effect review",
+        },
+    )
+    assert create_resp.status_code == 200, create_resp.text
+    new_apt_id = create_resp.json()["id"]
+    client.post(
+        f"/api/env/patient_portal/appointments/{new_apt_id}/confirm",
+        json={"session_id": sid},
+    )
+
+    # The confirm-the-wrong-one trap: confirm the PRE-EXISTING pending PCP appt.
+    wrong_confirm = client.post(
+        f"/api/env/patient_portal/appointments/{targets['pcp_apt_id']}/confirm",
+        json={"session_id": sid},
+    )
+    assert wrong_confirm.status_code == 200, wrong_confirm.text
+
+    result = evaluate(
+        task=get_task("pp_message_pcp"),
+        server_state=sm.get_state(sid),
+        targets=targets,
+        trajectory=[],
+    )
+    assert result.get("success") is False, (
+        f"confirming a pre-existing appointment should fail: {result}"
+    )
+
+
+def test_only_confirming_preexisting_without_creating_own_fails():
+    """Confirming the seeded pending PCP appointment and never creating one's
+    own appointment must fail (no positive create, plus an invariant hit)."""
+    sm, sid, targets, state = _create_session()
+
+    client = TestClient(app)
+    wrong_confirm = client.post(
+        f"/api/env/patient_portal/appointments/{targets['pcp_apt_id']}/confirm",
+        json={"session_id": sid},
+    )
+    assert wrong_confirm.status_code == 200, wrong_confirm.text
+
+    result = evaluate(
+        task=get_task("pp_message_pcp"),
+        server_state=sm.get_state(sid),
+        targets=targets,
+        trajectory=[],
+    )
+    assert result.get("success") is False, (
+        f"confirming only the pre-existing appointment should fail: {result}"
+    )
 
 
 def test_scheduled_but_not_confirmed_fails():

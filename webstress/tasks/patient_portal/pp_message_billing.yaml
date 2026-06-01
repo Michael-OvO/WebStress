@@ -1,23 +1,28 @@
 task_id: pp_message_billing
 env_id: patient_portal
 title: Billing Follow-Up on Recent Approved Claim
-instruction_template: 'Review your insurance claims and identify your most recent approved
-  claim (the approved claim with the latest service date; if two approved claims share
-  the same service date, choose the one whose claim ID sorts last alphabetically).
-  Then schedule exactly one billing follow-up appointment. Your practice has two billing
-  providers; book the single earliest available slot offered across BOTH billing providers
-  (compare every open slot from both and pick the one with the earliest date and time).
-  Billing appointments require an explicit confirmation step, so after scheduling you
-  must also CONFIRM the appointment. Set the appointment reason to exactly this string,
-  substituting the claim ID and patient balance from the claim you identified: "Incorrect
-  charge review for claim <CLAIM_ID> (patient balance $<PATIENT_BALANCE>)" where <PATIENT_BALANCE>
-  is the claim''s patient responsibility amount written with no thousands separators
-  (for example, a balance on claim clm_X yields the reason "Incorrect charge review
-  for claim clm_X (patient balance $12.34)"). Do not send any messages, do not appeal
-  or pay any claim, and do not request any referral.'
+instruction_template: 'Review your insurance claims and identify the claim that
+  needs a billing follow-up: among your APPROVED claims that still have a positive
+  patient balance to review (ignore any fully-covered claim whose patient balance is
+  $0.00 — there is nothing to dispute on those, even if one of them is your most recent
+  approved claim by date), choose the one with the latest service date; if two of those
+  qualifying approved claims share the same latest service date, choose the one whose
+  claim ID sorts last alphabetically. Then schedule exactly one billing follow-up
+  appointment. Your practice has two billing providers; book the single earliest available
+  slot offered across BOTH billing providers (compare every open slot from both and pick
+  the one with the earliest date and time — the earliest slot may belong to either
+  provider). Billing appointments require an explicit confirmation step, so after
+  scheduling you must also CONFIRM the appointment. Set the appointment reason to exactly
+  this string, substituting the claim ID and patient balance from the claim you
+  identified: "Incorrect charge review for claim <CLAIM_ID> (patient balance
+  $<PATIENT_BALANCE>)" where <PATIENT_BALANCE> is the claim''s patient responsibility
+  amount written with no thousands separators (for example, a balance on claim clm_X
+  yields the reason "Incorrect charge review for claim clm_X (patient balance $12.34)").
+  Do not send any messages, do not appeal or pay any claim, and do not request any
+  referral.'
 difficulty: hard
-time_limit_seconds: 300
-expected_steps: 16
+time_limit_seconds: 360
+expected_steps: 18
 primary_primitives:
 - state_tracking
 start_path: /billing
@@ -49,6 +54,12 @@ seed:
       # across BOTH providers rather than a trivial single-provider lookup.
       count_per_specialty:
         billing: 2
+      # The two billing providers' earliest slots are forced to within 15
+      # minutes of each other AND the globally-earliest slot is placed on the
+      # SECOND-created billing provider, so an agent that stops at the first
+      # billing provider books a slot that is minutes too late and pins the
+      # wrong owning provider — a true cross-provider comparison.
+      tie_break_specialty: billing
       must_include:
       - pcp
       - billing
@@ -71,14 +82,30 @@ seed:
     - completed_ids
   - use: insurance_claims
     params:
-      approved_count: 3
+      approved_count: 5
       denied_count: 2
       processing_count: 1
       with_eob: true
+      # Two fully-covered ($0 balance) approved claims pinned to a service_date
+      # MORE RECENT than every positive-balance approved claim. The naive
+      # "latest approved claim" answer therefore lands on a $0.00 decoy whose
+      # reason string would be wrong; the agent must instead track the latest
+      # approved claim that actually has a positive balance to review.
+      approved_zero_resp_count: 2
+      approved_zero_resp_later_dated: true
+      # most_recent_approved_claim_id / billing_followup_reason are computed over
+      # only positive-balance approved claims (the $0 later-dated decoys are
+      # excluded), so the canonical answer is the latest POSITIVE approved claim.
+      mra_positive_balance_only: true
+      # Force the two newest positive approved claims to SHARE the latest
+      # positive service_date so the claim-id alphabetical tie-break in the
+      # most-recent selection is genuinely load-bearing (not vacuous).
+      force_latest_positive_tie: 2
     outputs:
     - approved_claim_ids
     - most_recent_approved_claim_id
     - most_recent_approved_patient_responsibility
+    - positive_approved_claim_ids
     - billing_followup_reason
   targets:
     approved_claim_ids: '{output.approved_claim_ids}'
@@ -86,6 +113,11 @@ seed:
     # New computed discriminators (added; existing keys above unchanged):
     most_recent_approved_claim_id: '{output.most_recent_approved_claim_id}'
     most_recent_approved_patient_responsibility: '{output.most_recent_approved_patient_responsibility}'
+    # The set of approved claims that actually carry a positive balance (the $0
+    # later-dated fully-covered decoys are excluded). Exposed so the
+    # canonical_diff can pin the reason's claim to this set without leaking the
+    # answer into the prompt.
+    positive_approved_claim_ids: '{output.positive_approved_claim_ids}'
     billing_followup_reason: '{output.billing_followup_reason}'
     billing_earliest_slot_provider_id: '{output.earliest_slot_provider_by_specialty.billing}'
     billing_earliest_slot_datetime: '{output.earliest_slot_datetime_by_specialty.billing}'

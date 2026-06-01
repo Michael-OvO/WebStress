@@ -1,13 +1,18 @@
 """Solvability proof + near-miss for the upgraded pp_respond_to_provider task.
 
-The medium->hard upgrade adds three genuine discriminators on top of the
-original "read the bp message + book the PCP follow-up" task:
+The medium->hard upgrade adds genuine grounding/verification discriminators on
+top of the original "read the bp message + book the PCP follow-up" task:
 
   1. Two distinct PCPs exist (prov_1 = assigned PCP / message sender, plus a
      same-specialty decoy). The agent must book with the message *sender*
      (target.pcp_id == prov_1), not "any PCP".
   2. The booked slot must be the assigned PCP's earliest IN-PERSON slot, and
-     the appointment must be in-person (telehealth fails).
+     the appointment must be in-person (telehealth fails). The v2 upgrade makes
+     this a DETERMINISTIC trap: provider_directory's
+     ``force_earlier_telehealth_specialties: [pcp]`` guarantees the assigned
+     PCP owns a telehealth slot strictly EARLIER than its earliest in-person
+     slot on EVERY seed, so "book the earliest slot" (ignoring modality) is a
+     concrete wrong answer on every run (previously it only bit ~1/3 of seeds).
   3. New PCP appointments land in confirmation_state="pending"
      (auto_confirm_specialties: [pcp]); the agent must also call
      POST /appointments/{id}/confirm so the appointment becomes "confirmed".
@@ -43,6 +48,13 @@ def _earliest_in_person_slot(state, provider_id: str) -> str:
     return min(slots).isoformat()
 
 
+def _earliest_any_slot(state, provider_id: str):
+    """The provider's globally-earliest slot regardless of modality (the trap)."""
+    provider = next(p for p in state.providers if p.id == provider_id)
+    slot = min(provider.available_slots, key=lambda s: s.datetime)
+    return slot.datetime.isoformat(), slot.type
+
+
 def _new_session():
     sm = SessionManager()
     sid, targets, _ = sm.create_session(
@@ -69,6 +81,39 @@ def test_seed_shape_has_two_pcps_and_confirmation_gate():
 
     # The confirmation workflow is armed for PCP appointments.
     assert "pcp" in (state.auto_confirm_specialties or [])
+
+    # The decoy PCP is exposed as a scalar target for the bounded-create
+    # invariant and the grounding intervention variant.
+    assert targets["decoy_pcp_id"] in pcp_ids
+    assert targets["decoy_pcp_id"] != targets["pcp_id"]
+
+
+def test_modality_trap_is_deterministic_across_seeds():
+    """The assigned PCP's earliest slot is ALWAYS telehealth (an active trap).
+
+    v2 adds ``force_earlier_telehealth_specialties: [pcp]`` so on every seed the
+    assigned PCP owns a telehealth slot strictly earlier than its earliest
+    in-person slot. This converts the in-person filter from an occasionally
+    vacuous predicate into a discriminator that bites on every run.
+    """
+    from webstress.backend.state import SessionManager
+
+    sm = SessionManager()
+    for seed in (1, 7, 42, 99, 123, 256):
+        sid, targets, _ = sm.create_session(
+            env_id="patient_portal", task_id=TASK_ID, seed=seed
+        )
+        state = sm.get_state(sid)
+        pcp_id = targets["pcp_id"]
+        earliest_any_dt, earliest_any_type = _earliest_any_slot(state, pcp_id)
+        earliest_inperson_dt = _earliest_in_person_slot(state, pcp_id)
+        assert earliest_any_type == "telehealth", (
+            f"seed {seed}: earliest slot should be the telehealth trap, "
+            f"got {earliest_any_type}"
+        )
+        assert earliest_any_dt < earliest_inperson_dt, (
+            f"seed {seed}: telehealth trap should precede earliest in-person"
+        )
 
 
 def test_correct_trajectory_evaluates_to_pass():
@@ -197,3 +242,48 @@ def test_wrong_pcp_fails():
         trajectory=[],
     )
     assert result.get("success") is False, f"wrong PCP should fail: {result}"
+
+
+def test_earliest_slot_ignoring_modality_fails():
+    """Booking the assigned PCP's earliest slot ignoring modality must fail.
+
+    The earliest slot is the deterministic telehealth trap, so an agent that
+    books "the next available slot" rather than the earliest IN-PERSON slot
+    lands on the wrong datetime AND the wrong type.
+    """
+    sm, sid, targets = _new_session()
+    state = sm.get_state(sid)
+    pcp_id = targets["pcp_id"]
+
+    trap_dt, trap_type = _earliest_any_slot(state, pcp_id)
+    assert trap_type == "telehealth", "v2 seed should plant a telehealth trap"
+    assert trap_dt != _earliest_in_person_slot(state, pcp_id)
+
+    mark_message_read(
+        targets["bp_msg_id"], SessionScopedRequest(session_id=sid), session_manager=sm
+    )
+    created = create_appointment(
+        CreateAppointmentRequest(
+            session_id=sid,
+            provider_id=pcp_id,
+            slot_datetime=trap_dt,
+            type=trap_type,
+            reason="Blood pressure medication adjustment follow-up",
+        ),
+        session_manager=sm,
+    )
+    if created.get("confirmation_state") == "pending":
+        confirm_appointment(
+            created["id"], SessionScopedRequest(session_id=sid), session_manager=sm
+        )
+
+    state = sm.get_state(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert result.get("success") is False, (
+        f"booking the earliest (telehealth) slot should fail: {result}"
+    )

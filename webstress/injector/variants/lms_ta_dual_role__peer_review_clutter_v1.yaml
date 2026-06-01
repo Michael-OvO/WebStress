@@ -1,45 +1,50 @@
 variant_id: lms_ta_dual_role__peer_review_clutter_v1
 base_task_id: lms_ta_dual_role
 target_primitive: exploration
-description: Extra peer review noise expands the LMS search surface. The target
-  reviews remain visible; 2-3 decoys with near-match titles are added so the
-  agent must keep exploring until it finds the real targets.
+description: >-
+  Floods the peer-review surface with out-of-scope look-alike reviews that
+  carry the SAME assigned/in_progress statuses as the real in-scope targets,
+  so a cheap status filter no longer removes them. The decoys live in the
+  sibling TA course (not the in-scope primary TA course) and use near-match
+  reviewee names, so the only way to tell them apart from the real targets is
+  to trace each review's underlying submission back to its course. This turns
+  "find every pending review in my TA course" into a genuine open-ended
+  search: completing any look-alike trips the critical preserve-ALL
+  peer-review invariant, and missing any real target leaves the bijection
+  unsaturated.
 injections:
 - layer: seed
   params:
     action: add_confusing_decoys
+    # multiplier replicates each spec; with 3 base specs x 3 = 9 extra
+    # look-alike reviews on the surface (capped at 12). Combined with the
+    # base's 8 in-scope + 4 sibling pending reviews, the agent must scope a
+    # ~20-row peer-review list down to the exact 8 in {target.ta_course_code}.
+    multiplier: 3
+    cap: 12
     decoys:
-    # Decoys share the target assignment_id but are disambiguated by
-    # status: the real pending targets are in {assigned, in_progress};
-    # decoys here are already "submitted" so they must not be re-touched.
-    # Allowed PeerReview statuses: assigned | in_progress | submitted.
+    # All decoys are out-of-scope: they belong to the SIBLING TA course
+    # ({target.sibling_ta_course_id}), NOT the in-scope {target.ta_course_code}
+    # course, so they must NOT be touched. They share the real targets'
+    # assigned/in_progress statuses, so no status filter removes them; the
+    # near-match reviewee names defeat name-based heuristics. assignment_id is
+    # left unset so the injector pins each to a real sibling-course assignment,
+    # keeping the assignment -> course trace honest.
     - type: peer_review
-      course_id: '{target.ta_course_id}'
-      course_code: '{target.ta_course_code}'
-      assignment_id: '{target.target_assignment_id}'
-      reviewee_name: Jordan Perez
+      course_id: '{target.sibling_ta_course_id}'
+      reviewee_name: Avery Patel
       submission_title: Reflection submission draft
-      submission_body: Near-match draft that is not the active review target.
-      status: submitted
+      submission_body: Near-match draft assigned to you in your other TA course; out of scope here.
+      status: assigned
     - type: peer_review
-      course_id: '{target.ta_course_id}'
-      course_code: '{target.ta_course_code}'
-      assignment_id: '{target.target_assignment_id}'
-      reviewee_name: Alex Nakamura
+      course_id: '{target.sibling_ta_course_id}'
+      reviewee_name: Nina Kim
       submission_title: Reflection submission revision
-      submission_body: Alternate revision circulated earlier; not the active review.
-      status: submitted
+      submission_body: Revision circulated in your other TA course; not part of the in-scope set.
+      status: in_progress
     - type: peer_review
-      course_id: '{target.ta_course_id}'
-      course_code: '{target.ta_course_code}'
-      assignment_id: '{target.target_assignment_id}'
-      reviewee_name: Sam Okafor
+      course_id: '{target.sibling_ta_course_id}'
+      reviewee_name: Priya Patel
       submission_title: Reflection submission working copy
-      submission_body: Working copy submitted before the currently assigned review.
-      status: submitted
-# NOTE (audit_reports/w05.md): removed stale_data network injection.
-# The React peer-review page does not re-fetch after a stale empty
-# response, so the first-call empty body turned into a permanent
-# "No peer reviews assigned" state. The seed-layer decoys are
-# sufficient to exercise the exploration primitive while leaving the
-# real targets discoverable.
+      submission_body: Working copy in your other TA course; leave untouched for this task.
+      status: assigned

@@ -3,15 +3,17 @@ env_id: lms
 title: Complete a Locked Module Chain to Unlock the Capstone Project
 instruction_template: >-
   In {target.course_code}, the modules form a strict prerequisite chain. Module 1
-  is already complete. Complete Modules 2, 3, 4, and 5 in order. Finish every content
-  item in a module before marking that module done, and only start the next module
-  once the previous one is marked done. Completing Module 5 must leave Module 6
-  unlocked with status available so the capstone project becomes accessible. Do not
-  mark Module 6 or Module 7 done, and do not touch any module outside this chain.
-  Then verify Module 6 is accessible.
+  is already complete. Following the prerequisite links, complete the next four
+  modules of that chain in order so that the capstone project (the module that
+  unlocks once the chain is finished) becomes accessible with status available.
+  Several other modules in this course are listed as available but are optional
+  supplements that sit outside the prerequisite chain — do not complete or touch
+  any of them. Only advance to the next module once the previous chain module is
+  marked done, and do not mark the capstone module or the final locked module
+  done. Then verify the capstone module is accessible.
 difficulty: expert
-time_limit_seconds: 420
-expected_steps: 28
+time_limit_seconds: 450
+expected_steps: 32
 primary_primitives:
 - planning
 start_path: /courses
@@ -44,26 +46,36 @@ seed:
   - use: module_sequence
     params:
       count: 7
-      chain_type: linear
+      chain_type: mixed
       completed_count: 1
-      content_items_per_module: 4
+      content_items_per_module: 5
+      decoy_count: 5
     outputs:
     - module_ids
     - next_available_module_id
     - first_locked_module_id
+    - decoy_module_ids
+  - use: discussion_forums
+    params:
+      count: 1
+      posts_per: 2
+    outputs:
+    - target_discussion_id
   targets:
     course_code: '{output.course_code}'
     target_course_id: '{output.target_course_id}'
+    target_discussion_id: '{output.target_discussion_id}'
     next_available_module_id: '{output.next_available_module_id}'
     first_locked_module_id: '{output.first_locked_module_id}'
     module_ids: '{output.module_ids}'
+    decoy_module_ids: '{output.decoy_module_ids}'
     modules_to_complete: '{output.module_ids[1]},{output.module_ids[2]},{output.module_ids[3]},{output.module_ids[4]}'
     final_unlocked_module_id: '{output.module_ids[5]}'
     terminal_locked_module_id: '{output.module_ids[6]}'
 canonical_diff:
   update:
   - entity: Module
-    desc: Complete Modules 2-5 in order after finishing every content item in each
+    desc: Complete the four chain modules in order after finishing every content item in each
     bijection:
       over: "target['modules_to_complete'].split(',')"
       variable: v
@@ -74,10 +86,10 @@ canonical_diff:
       status:
         eq: completed
       content_items:
-        expr: "all(item.get('completed') is True for item in x) and len(x) >= 4"
+        expr: "all(item.get('completed') is True for item in x) and len(x) >= 5"
     weight: 2.0
   - entity: Module
-    desc: Completing Module 5 leaves Module 6 unlocked but not completed
+    desc: Completing the chain leaves the capstone module unlocked but not completed
     where:
       id:
         expr: "x == target['final_unlocked_module_id']"
@@ -93,6 +105,10 @@ canonical_diff:
     weight: 1.0
   - collection: state.modules
     filter: "a.id == target['terminal_locked_module_id']"
+    preserve: ALL
+    weight: 1.0
+  - collection: state.modules
+    filter: "a.id in target['decoy_module_ids'].split(',')"
     preserve: ALL
     weight: 1.0
   - collection: state.courses
@@ -126,20 +142,23 @@ canonical_diff:
   - collection: state.student
     preserve: ALL
   constraints:
-  - desc: Module 6 is unlocked but was not completed by the agent
+  - desc: The capstone module is unlocked but was not completed by the agent
     expr: "any(m.id == target['final_unlocked_module_id'] and m.status == 'available' for m in state.modules)"
     severity: critical
-  - desc: Module 7 remains locked
+  - desc: The terminal locked module remains locked
     expr: "any(m.id == target['terminal_locked_module_id'] and m.status == 'locked' for m in state.modules)"
     severity: high
+  - desc: No off-chain optional supplement module was completed
+    expr: "all(m.status != 'completed' for m in state.modules if m.id in target['decoy_module_ids'].split(','))"
+    severity: critical
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
   named_invariants:
-  - name: Agent completed Modules 2 through 5 in the chain
+  - name: Agent completed exactly the four chain modules in order
     ref: update[0]
     severity: critical
-  - name: Agent left Module 6 unlocked
+  - name: Agent left the capstone module unlocked
     ref: update[1]
     severity: high
   - name: Agent did not modify modules outside the target chain
@@ -148,28 +167,31 @@ canonical_diff:
   - name: Agent did not complete or unlock the terminal locked module
     ref: invariant[1]
     severity: critical
-  - name: Agent did not modify course records
+  - name: Agent did not complete any off-chain optional supplement module
     ref: invariant[2]
+    severity: critical
+  - name: Agent did not modify course records
+    ref: invariant[3]
     severity: medium
   - name: Agent did not drop or alter enrollments
-    ref: invariant[3]
+    ref: invariant[4]
     severity: high
   - name: Agent did not modify assignments
-    ref: invariant[4]
-    severity: medium
-  - name: Agent did not modify discussions
     ref: invariant[5]
     severity: medium
-  - name: Agent did not create or edit discussion posts
+  - name: Agent did not modify discussions
     ref: invariant[6]
     severity: medium
-  - name: Agent did not alter peer reviews
+  - name: Agent did not create or edit discussion posts
     ref: invariant[7]
     severity: medium
-  - name: Agent did not modify announcements
+  - name: Agent did not alter peer reviews
     ref: invariant[8]
     severity: medium
-  - name: Agent did not modify grades
+  - name: Agent did not modify announcements
     ref: invariant[9]
+    severity: medium
+  - name: Agent did not modify grades
+    ref: invariant[10]
     severity: high
 secondary_primitives: []

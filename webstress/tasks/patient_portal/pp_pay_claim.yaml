@@ -55,11 +55,17 @@ seed:
     - completed_ids
   - use: insurance_claims
     params:
-      approved_count: 6
+      approved_count: 8
+      approved_no_eob_count: 3
+      approved_no_eob_band:
+      - 600
+      - 950
+      approved_zero_resp_count: 2
       denied_count: 3
       processing_count: 1
       with_eob: true
       payable_top_k: 3
+      payable_tie_margin: 3
     outputs:
     - approved_claim_ids
     - denied_claim_ids

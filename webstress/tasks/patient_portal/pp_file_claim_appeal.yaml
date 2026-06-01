@@ -1,17 +1,20 @@
 task_id: pp_file_claim_appeal
 env_id: patient_portal
 title: File Claim Appeals for the Two Most-Urgent Denied Claims
-instruction_template: Review every insurance claim on the account. Among the denied
-  claims that are still eligible for appeal (an EOB is available and the appeal deadline
-  has not yet passed), find the two whose appeal deadline is closest to now. Order
-  the eligible claims by appeal deadline from earliest to latest; if two claims share
-  the same appeal deadline, order those two by claim ID in ascending order. File an
-  appeal on exactly those two most-urgent eligible claims using the claim appeal action,
-  and on no others. Do not pay or appeal any other claim, do not modify or appeal
-  any approved or processing claim, and do not send any messages.
+instruction_template: Review every insurance claim on the account. A claim is eligible
+  for appeal ONLY when all three of these are true at once - its status is denied, an
+  EOB is available for it, and its appeal deadline has not yet passed. Some denied claims
+  are NOT eligible (no EOB has been issued, or the appeal deadline has already passed)
+  and must be left alone. Among the eligible claims, find the two whose appeal deadline
+  is closest to now. Order the eligible claims by appeal deadline from earliest to latest;
+  if two claims share the same appeal deadline, order those two by claim ID in ascending
+  order. File an appeal on exactly those two most-urgent eligible claims using the claim
+  appeal action, and on no others. Do not pay or appeal any other claim, do not modify
+  or appeal any approved or processing claim, do not appeal any denied claim that lacks
+  an EOB or whose deadline has passed, and do not send any messages.
 difficulty: expert
-time_limit_seconds: 420
-expected_steps: 30
+time_limit_seconds: 450
+expected_steps: 34
 primary_primitives:
 - state_tracking
 start_path: /billing
@@ -66,16 +69,23 @@ seed:
   - use: insurance_claims
     params:
       approved_count: 2
-      denied_count: 5
+      denied_count: 6
       processing_count: 1
       with_eob: true
       near_appeal_deadline: true
+      monotonic_appealable_deadlines: true
+      no_eob_denied_count: 2
+      denied_expired_count: 2
     outputs:
     - approved_claim_ids
     - denied_claim_ids
     - appealable_claim_id
     - top_2_urgent_appealable_claim_ids
     - appealable_claim_ids_by_deadline
+    - rank1_appeal_deadline
+    - rank2_appeal_deadline
+    - rank2_boundary_deadline
+    - rank1_tie_deadline
   targets:
     pcp_id: '{output.pcp_id}'
     approved_claim_ids: '{output.approved_claim_ids}'
@@ -83,6 +93,10 @@ seed:
     appealable_claim_id: '{output.appealable_claim_id}'
     top_2_urgent_appealable_claim_ids: '{output.top_2_urgent_appealable_claim_ids}'
     appealable_claim_ids_by_deadline: '{output.appealable_claim_ids_by_deadline}'
+    rank1_appeal_deadline: '{output.rank1_appeal_deadline}'
+    rank2_appeal_deadline: '{output.rank2_appeal_deadline}'
+    rank2_boundary_deadline: '{output.rank2_boundary_deadline}'
+    rank1_tie_deadline: '{output.rank1_tie_deadline}'
     approved_ref_ids: '{output.approved_ref_ids}'
     completed_ids: '{output.completed_ids}'
 canonical_diff:

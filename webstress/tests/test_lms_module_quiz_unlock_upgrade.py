@@ -1,20 +1,31 @@
-"""Solvability proof for the upgraded lms_module_quiz_unlock task.
+"""Solvability proof for the upgraded lms_module_quiz_unlock task (v2).
 
-The upgraded task escalates from a single-module-complete-plus-cascade task
-to an EXPERT ordered multi-module chain:
+The v2 base escalates the planning surface beyond raw step count:
 
-  * Modules 2, 3, 4, 5 must be completed IN ORDER (a saturating bijection over
-    the seeded ``modules_to_complete`` target list), and every one of the 4
-    content items in each module must be completed first.
-  * Completing Module 5 cascades Module 6 from locked -> available (the
-    capstone unlock), and Module 6 must NOT itself be completed.
-  * Module 7 (the terminal locked module) must remain locked, guarded by a
-    dedicated CRITICAL invariant + constraint, so a greedy agent that keeps
-    completing modules fails.
+  * The chain is now ``chain_type='mixed'`` — Modules 3 and 5 are gated by a
+    ``min_score`` unlock condition (``{prereq_id}:70``), not a plain
+    prerequisite. Since the gated modules carry no linked assignment, the gate
+    is satisfied by COMPLETING the prerequisite module (all content items done
+    + marked done), so the agent must reason that "complete the prior module"
+    is what clears the score gate, then re-derive the next completable module.
+  * Five OFF-CHAIN decoy modules (Modules 8-12) are seeded ``available`` with
+    completable content items and "Optional ..." titles. They are NOT part of
+    the prerequisite chain. Completing any one is a scored CRITICAL violation
+    (dedicated decoy invariant + decoy constraint), so a greedy "complete every
+    available module" agent fails. The agent must follow the prerequisite links
+    to identify the real chain.
+  * Each chain module now has 5 content items; the per-module ``content_items``
+    predicate requires ``len(x) >= 5`` so the "finish all items first" subgoal
+    stays load-bearing.
+  * Completing the four chain modules cascades the capstone module (Module 6)
+    from locked -> available, and Module 6 must NOT itself be completed. Module
+    7 (terminal, min_score-gated on Module 6 which is never completed) must
+    remain locked, guarded by a CRITICAL invariant + constraint.
 
 This drives the CORRECT solution through the REAL LMS backend endpoints via
 starlette TestClient (item-complete + module-complete), then evaluates with the
-unified evaluator. A near-miss (over-completing Module 6) is asserted to fail.
+unified evaluator. Three near-misses (over-completing the capstone, completing
+an off-chain decoy, partial chain) are asserted to fail.
 """
 
 from __future__ import annotations
@@ -73,26 +84,67 @@ def _complete_module_via_api(client: TestClient, sid: str, module_id: str) -> No
     assert resp.status_code == 200, resp.text
 
 
+def test_chain_is_mixed_with_min_score_gates_and_decoys(client: TestClient):
+    """The seeded state matches the v2 design: mixed gates + 5 off-chain decoys."""
+    sid, targets = _open_session()
+    try:
+        state = app.state.session_manager.get(sid)
+        chain_ids = targets["module_ids"].split(",")
+        decoy_ids = targets["decoy_module_ids"].split(",")
+
+        # 7 chain modules + 5 decoys.
+        assert len(chain_ids) == 7, chain_ids
+        assert len(decoy_ids) == 5, decoy_ids
+        assert len(state.modules) == 12, len(state.modules)
+
+        # Modules 3 and 5 (indices 2 and 4) are min_score gated — that is what
+        # makes "just complete the next available module" insufficient without
+        # reasoning that completing the prerequisite clears the score gate.
+        gate_module_3 = state.get_module(chain_ids[2])
+        gate_module_5 = state.get_module(chain_ids[4])
+        assert gate_module_3.unlock_condition == "min_score", gate_module_3.unlock_condition
+        assert gate_module_5.unlock_condition == "min_score", gate_module_5.unlock_condition
+
+        # Every decoy is independently available with completable items but is
+        # NOT in the prerequisite chain.
+        for did in decoy_ids:
+            decoy = state.get_module(did)
+            assert decoy is not None, did
+            assert decoy.status == "available", (did, decoy.status)
+            assert decoy.unlock_condition == "none", (did, decoy.unlock_condition)
+            assert did not in chain_ids
+
+        # Every chain module to complete carries >=5 content items.
+        for mid in targets["modules_to_complete"].split(","):
+            assert len(state.get_module(mid).content_items) >= 5
+    finally:
+        app.state.session_manager.destroy(sid)
+
+
 def test_correct_ordered_chain_completion_passes(client: TestClient):
-    """Completing Modules 2-5 in order via the real backend passes evaluation."""
+    """Completing the four chain modules in order via the real backend passes."""
     sid, targets = _open_session()
     try:
         to_complete = targets["modules_to_complete"].split(",")
         assert len(to_complete) == 4, to_complete
 
         # Drive the ordered chain through the REAL endpoints. Each module is
-        # only unlockable once its predecessor is completed (server gate), so
-        # the order matters — out-of-order calls would 422.
+        # only unlockable once its predecessor is completed (server gate,
+        # including the min_score gates on Modules 3 and 5), so the order
+        # matters — out-of-order calls would 422.
         for module_id in to_complete:
             _complete_module_via_api(client, sid, module_id)
 
         state = app.state.session_manager.get(sid)
 
-        # Sanity: the cascade left Module 6 available and Module 7 locked.
+        # Sanity: the cascade left the capstone available and the terminal
+        # module locked, and NO decoy was touched.
         final_unlocked = state.get_module(targets["final_unlocked_module_id"])
         terminal_locked = state.get_module(targets["terminal_locked_module_id"])
         assert final_unlocked.status == "available", final_unlocked.status
         assert terminal_locked.status == "locked", terminal_locked.status
+        for did in targets["decoy_module_ids"].split(","):
+            assert state.get_module(did).status == "available"
 
         result = evaluate(
             task=get_task(TASK_ID),
@@ -109,19 +161,18 @@ def test_correct_ordered_chain_completion_passes(client: TestClient):
 
 
 def test_over_completing_capstone_module_fails(client: TestClient):
-    """Completing Module 6 as well (greedy over-completion) fails evaluation.
+    """Completing the capstone module as well (greedy over-completion) fails.
 
-    Module 6 must stay merely AVAILABLE after the cascade. If the agent also
-    finishes Module 6's items and marks it done, update[1] (status==available)
-    no longer holds and the CRITICAL 'Module 6 unlocked but not completed'
+    The capstone module must stay merely AVAILABLE after the cascade. If the
+    agent also finishes its items and marks it done, update[1] (status==available)
+    no longer holds and the CRITICAL 'capstone unlocked but not completed'
     constraint flips — the task must reject this near-miss.
     """
     sid, targets = _open_session()
     try:
-        # Complete the four intended modules...
         for module_id in targets["modules_to_complete"].split(","):
             _complete_module_via_api(client, sid, module_id)
-        # ...then ALSO over-complete Module 6 (now available via cascade).
+        # ...then ALSO over-complete the capstone (now available via cascade).
         _complete_module_via_api(client, sid, targets["final_unlocked_module_id"])
 
         state = app.state.session_manager.get(sid)
@@ -138,8 +189,37 @@ def test_over_completing_capstone_module_fails(client: TestClient):
         app.state.session_manager.destroy(sid)
 
 
+def test_completing_offchain_decoy_module_fails(client: TestClient):
+    """Completing a look-alike 'available' decoy is a scored CRITICAL failure.
+
+    The whole point of the v2 selection-under-planning upgrade: a greedy agent
+    that completes every 'available' module (including the optional supplements)
+    must fail. Here we do the right chain AND wrongly complete one decoy.
+    """
+    sid, targets = _open_session()
+    try:
+        for module_id in targets["modules_to_complete"].split(","):
+            _complete_module_via_api(client, sid, module_id)
+
+        decoy_id = targets["decoy_module_ids"].split(",")[0]
+        _complete_module_via_api(client, sid, decoy_id)
+
+        state = app.state.session_manager.get(sid)
+        assert state.get_module(decoy_id).status == "completed"
+
+        result = evaluate(
+            task=get_task(TASK_ID),
+            server_state=state,
+            targets=dict(targets),
+            trajectory=[],
+        )
+        assert result.get("success") is False, f"expected failure, got {result}"
+    finally:
+        app.state.session_manager.destroy(sid)
+
+
 def test_partial_chain_completion_fails(client: TestClient):
-    """Completing only Modules 2 and 3 (missing 4 and 5) fails the bijection."""
+    """Completing only the first two chain modules (missing 4 and 5) fails."""
     sid, targets = _open_session()
     try:
         partial = targets["modules_to_complete"].split(",")[:2]

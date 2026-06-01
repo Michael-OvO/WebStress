@@ -3,16 +3,24 @@ env_id: patient_portal
 title: Resolve Every Double-Booked Appointment Slot
 instruction_template: >-
   Your upcoming appointments contain several time slots where more than one
-  appointment is booked at the exact same date and time. For every group of
-  appointments that share an identical date and time, keep only the single
-  appointment that was booked first (the earliest booked_at value in that
-  group) and cancel each of the other appointments in that same group. Apply
-  this to every conflicting group. Do not cancel any appointment whose date
-  and time is not shared by another appointment. Do not reschedule any
-  appointment and do not send any message.
+  appointment is booked at the exact same date and time. A conflict only
+  exists when two or more appointments that are CURRENTLY SCHEDULED share an
+  identical date and time — appointments that are already completed or
+  cancelled do not count, even if they sit on the same slot. For every group
+  of scheduled appointments that share an identical date and time, keep only
+  the single appointment that was booked first (the earliest booked_at value
+  in that group; if two share the same booked_at, keep the one whose
+  appointment id sorts first) and cancel each of the other scheduled
+  appointments in that same group. The earliest-booked appointment is the one
+  to keep regardless of its provider or visit type — do not assume the
+  primary-care or in-person appointment is the keeper. Apply this to every
+  conflicting group. Do not cancel any appointment whose date and time is not
+  shared by another SCHEDULED appointment, and do not cancel a scheduled
+  appointment merely because a completed or cancelled appointment shares its
+  slot. Do not reschedule any appointment and do not send any message.
 difficulty: hard
-time_limit_seconds: 300
-expected_steps: 18
+time_limit_seconds: 360
+expected_steps: 22
 primary_primitives:
 - backtracking
 start_path: /appointments
@@ -56,8 +64,11 @@ seed:
       cancelled_count: 2
       conflict_clusters:
       - 3
+      - 3
       - 2
-      - 2
+      keeper_trap_clusters:
+      - 1
+      pseudo_conflict_count: 2
     outputs:
     - upcoming_ids
     - conflict_apt_ids
@@ -65,6 +76,7 @@ seed:
     - cluster_all_apt_ids
     - cluster_cancel_apt_ids
     - cluster_keep_apt_ids
+    - pseudo_conflict_apt_ids
   targets:
     pcp_id: '{output.pcp_id}'
     upcoming_ids: '{output.upcoming_ids}'
@@ -73,6 +85,7 @@ seed:
     cluster_all_apt_ids: '{output.cluster_all_apt_ids}'
     cluster_cancel_apt_ids: '{output.cluster_cancel_apt_ids}'
     cluster_keep_apt_ids: '{output.cluster_keep_apt_ids}'
+    pseudo_conflict_apt_ids: '{output.pseudo_conflict_apt_ids}'
 
 canonical_diff:
   update:
@@ -144,7 +157,31 @@ canonical_diff:
           if a.id in target['cluster_all_apt_ids']
           and a.status == 'cancelled'
         ]) == len(target['cluster_cancel_apt_ids'])
-      severity: high
+      severity: critical
+    # Status-filter trap: appointments that share a slot with a COMPLETED
+    # decoy (a pseudo-conflict) are NOT real conflicts. Cancelling such a
+    # scheduled survivor is the tempting error from grouping by datetime
+    # without filtering to status=='scheduled'. These must stay scheduled.
+    - desc: "Scheduled appointments that only share a slot with a completed appointment were left scheduled"
+      expr: >-
+        all(
+          state.get_appointment(aid) is not None
+          and state.get_appointment(aid).status == 'scheduled'
+          for aid in target['pseudo_conflict_apt_ids']
+        )
+      severity: critical
+    # Global no-stray-cancel: the ONLY appointments newly cancelled are the
+    # precomputed later-booked duplicates. Any other cancellation (a keeper, a
+    # pseudo survivor, or an unrelated upcoming appointment) makes the total
+    # cancelled count exceed the baseline by more than the cancel set and fails.
+    - desc: "Exactly the later-booked duplicates were cancelled and nothing else"
+      expr: >-
+        (
+          len([a for a in state.appointments if a.status == 'cancelled'])
+          == len([a for a in initial.appointments if a.status == 'cancelled'])
+          + len(target['cluster_cancel_apt_ids'])
+        )
+      severity: critical
   named_invariants:
     - name: "Agent did not cancel the earliest-booked appointment of any group or any non-conflicting appointment"
       ref: invariant[0]

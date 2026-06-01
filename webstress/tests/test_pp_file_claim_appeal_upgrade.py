@@ -8,16 +8,32 @@ most-urgent — while leaving the OTHER appealable denied claims (the most
 tempting siblings, including one with a far larger patient responsibility)
 untouched, along with every approved/processing claim and all other records.
 
+The v2 upgrade makes the eligibility FILTER load-bearing and the deadline
+ranking ROBUST (the two weaknesses found in the empirical failure analysis):
+  * the seed now plants INELIGIBLE denied decoys (no EOB, and past-deadline)
+    so the agent must apply the full 3-clause filter (status==denied AND
+    eob_available AND appeal_deadline>=now), not just "appeal every denied
+    claim"; and
+  * the eligible claims get DETERMINISTIC, monotonically-spaced deadlines so
+    rank-1/rank-2 are each unambiguously earlier than rank-3 by a comfortable
+    margin (no more RNG-clustered 0-day-gap coin-flips), with exactly ONE
+    intentional same-deadline tie pair among the LATEST eligible claims to
+    exercise the claim-id tiebreaker deliberately (and away from the answer).
+
 This module proves:
   * the intended answer (`top_2_urgent_appealable_claim_ids`) is achievable by
     driving the REAL backend `/claims/{id}/appeal` endpoint past its gates
     (status==denied, eob_available, deadline>=now), and scores >= 0.99;
+  * the ineligible denied decoys are genuinely excluded AND backend-rejected;
+  * the deadline ranking is robust (rank-2 vs rank-3 gap is comfortable);
   * a near-miss (appealing by patient-responsibility rank instead of deadline,
     i.e. the pp_claim_audit heuristic) FAILS — confirming the new
     deadline-ranking discriminator genuinely bites.
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 from starlette.testclient import TestClient
 
@@ -28,6 +44,12 @@ from webstress.tasks._registry import get_task
 
 TASK_ID = "pp_file_claim_appeal"
 API = "/api/env/patient_portal"
+
+
+def _as_dt(value) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
 
 
 def _new_session() -> tuple[SessionManager, str, dict]:
@@ -64,14 +86,41 @@ def test_targets_are_well_formed_and_discriminating():
     assert set(top2).issubset(set(denied))
 
     claims = {c.id: c for c in state.claims}
-    # Every appealable claim is genuinely appealable through the backend gate.
+    # Every appealable claim is genuinely appealable (denied + EOB). The
+    # deadline gate is enforced/verified through the real backend in the
+    # dedicated rejection test (it owns the authoritative request-time clock).
     for cid in by_deadline:
         c = claims[cid]
         assert c.status == "denied" and c.eob_available
 
+    # v2: the eligibility FILTER is load-bearing — there are INELIGIBLE denied
+    # decoys (no EOB, or past-deadline) among the denied claims that must be
+    # EXCLUDED from the appealable set. An "appeal every denied claim" agent
+    # would over-act on these and fail. The builder's appealable set is the
+    # ground truth (it applies the same status+EOB+deadline gate the backend
+    # does); membership exclusion is the structural proof, and the backend
+    # 422-rejects each one in test_ineligible_denied_decoys_are_backend_rejected.
+    ineligible_denied = [cid for cid in denied if cid not in set(by_deadline)]
+    assert len(ineligible_denied) >= 2, (
+        f"expected ineligible denied decoys; denied={denied} appealable={by_deadline}"
+    )
+    for cid in ineligible_denied:
+        assert claims[cid].status == "denied"
+
     # The two urgent claims have the earliest deadlines among appealable claims.
-    deadlines = [(cid, claims[cid].appeal_deadline) for cid in by_deadline]
+    deadlines = [(cid, str(claims[cid].appeal_deadline)) for cid in by_deadline]
     assert deadlines[:2] == sorted(deadlines, key=lambda kv: (kv[1], kv[0]))[:2]
+
+    # v2: the rank-2 vs rank-3 boundary is ROBUST — at least a few days of gap,
+    # not a near-coin-flip on RNG-clustered dates. (Deterministic spacing puts
+    # rank-2 a full 14 days ahead of rank-3 in this seed.)
+    if len(by_deadline) >= 3:
+        ordered = sorted(by_deadline, key=lambda cid: (str(claims[cid].appeal_deadline), cid))
+        gap_days = (
+            _as_dt(claims[ordered[2]].appeal_deadline)
+            - _as_dt(claims[ordered[1]].appeal_deadline)
+        ).total_seconds() / 86400.0
+        assert gap_days >= 3.0, f"rank-2 vs rank-3 deadline gap too small: {gap_days}d"
 
     # Discriminator check: a responsibility-ranked top-2 (the pp_claim_audit
     # heuristic) selects a DIFFERENT set, so an agent cannot pass by sorting on
@@ -83,6 +132,24 @@ def test_targets_are_well_formed_and_discriminating():
     assert set(by_resp) != set(top2), (
         "task is not discriminating: deadline-rank and responsibility-rank coincide"
     )
+
+
+def test_ineligible_denied_decoys_are_backend_rejected():
+    """v2 filter proof: every denied claim that is NOT in the appealable set is
+    rejected by the real appeal endpoint (422) because it lacks an EOB or its
+    deadline has passed. An agent that appeals 'every denied claim' both 422s
+    and (if it forces the state) trips the critical frozen-sibling invariant."""
+    sm, sid, targets = _new_session()
+    state = sm.get_state(sid)
+    client = TestClient(app)
+
+    appealable = set(targets["appealable_claim_ids_by_deadline"])
+    ineligible_denied = [cid for cid in targets["denied_claim_ids"] if cid not in appealable]
+    assert len(ineligible_denied) >= 2, ineligible_denied
+
+    for cid in ineligible_denied:
+        resp = _appeal_via_backend(client, sid, cid)
+        assert resp.status_code == 422, f"{cid} should be ineligible: {resp.text}"
 
 
 def test_correct_trajectory_via_backend_passes():
@@ -177,3 +244,102 @@ def test_extra_appeal_trajectory_fails():
         trajectory=[],
     )
     assert result.get("success") is False, f"over-acting should fail: {result}"
+
+
+# ---------------------------------------------------------------------------
+# Paired intervention variant (state_tracking stressor: split_information +
+# contradictory_update). The variant plants boundary-case INELIGIBLE denied
+# lookalikes right at the load-bearing rank-2 deadline cutoff + conflicting
+# billing messages. It must (a) keep the task solvable (the true top-2 still
+# passes), (b) NOT change the canonical answer (every decoy is ineligible and
+# backend-rejected), and (c) demonstrably trap a deadline-only heuristic that
+# skips the eligibility re-check.
+# ---------------------------------------------------------------------------
+
+VARIANT_FILENAME = "pp_file_claim_appeal__claim_shadow_v1.yaml"
+
+
+def _new_variant_session() -> tuple[SessionManager, str, dict]:
+    from webstress.backend.routes.patient_portal import SessionCreateRequest, create_session
+
+    sm: SessionManager = app.state.session_manager
+    payload = create_session(
+        SessionCreateRequest(task_id=TASK_ID, variant_filename=VARIANT_FILENAME, seed=42),
+        session_manager=sm,
+    )
+    sid = payload["session_id"]
+    targets = sm.get_targets(sid)
+    return sm, sid, dict(targets)
+
+
+def test_variant_renders_with_no_unresolved_targets():
+    """Every {target.X} placeholder in the variant resolves against base seed
+    targets — there must be no literal '{target.' left in the injected state."""
+    import json
+
+    sm, sid, _ = _new_variant_session()
+    state = sm.get(sid)
+    blob = json.dumps(state.degradation)
+    assert "{target." not in blob, f"unresolved target placeholder: {blob}"
+    assert state.degradation["base_task_id"] == TASK_ID
+    assert state.degradation["target_primitive"] == "state_tracking"
+
+
+def test_variant_correct_trajectory_still_passes():
+    """Solvability under the intervention: appealing the true top-2 still scores
+    1.0 even with the boundary decoys + conflicting messages injected."""
+    sm, sid, targets = _new_variant_session()
+    client = TestClient(app)
+
+    for clm_id in targets["top_2_urgent_appealable_claim_ids"]:
+        resp = _appeal_via_backend(client, sid, clm_id)
+        assert resp.status_code == 200, resp.text
+
+    state = sm.get(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert result.get("success") is True, f"variant should stay solvable: {result}"
+    assert result.get("score", 0.0) >= 0.99, f"result: {result}"
+
+
+def test_variant_decoys_are_ineligible_and_do_not_change_answer():
+    """Every injected DENIED decoy is backend-ineligible (422), so the canonical
+    answer set is unchanged — the decoys raise tracking load without creating a
+    hidden alternative solution."""
+    sm, sid, targets = _new_variant_session()
+    state = sm.get(sid)
+    client = TestClient(app)
+
+    base_denied = set(targets["denied_claim_ids"])
+    decoy_denied = [c for c in state.claims if c.status == "denied" and c.id not in base_denied]
+    assert len(decoy_denied) >= 2, decoy_denied
+    for c in decoy_denied:
+        resp = _appeal_via_backend(client, sid, c.id)
+        assert resp.status_code == 422, f"decoy {c.id} must be ineligible: {resp.text}"
+
+
+def test_variant_deadline_only_heuristic_is_trapped():
+    """An agent that ranks ALL denied claims by deadline WITHOUT re-applying the
+    EOB/deadline eligibility filter (the exact state_tracking failure mode the
+    variant stresses) selects a set that DIFFERS from the correct top-2 — so the
+    intervention genuinely competes on the load-bearing predicate."""
+    sm, sid, targets = _new_variant_session()
+    state = sm.get(sid)
+
+    denied_all = [c for c in state.claims if c.status == "denied"]
+    naive_top2 = sorted(denied_all, key=lambda c: (str(c.appeal_deadline), c.id))[:2]
+    correct = set(targets["top_2_urgent_appealable_claim_ids"])
+    assert {c.id for c in naive_top2} != correct, (
+        "variant does not trap the deadline-only heuristic; decoys not biting"
+    )
+    # And actually appealing the naive picks fails (they 422 or trip invariants).
+    client = TestClient(app)
+    appealable = set(targets["appealable_claim_ids_by_deadline"])
+    for c in naive_top2:
+        if c.id not in appealable:
+            resp = _appeal_via_backend(client, sid, c.id)
+            assert resp.status_code == 422, (c.id, resp.text)

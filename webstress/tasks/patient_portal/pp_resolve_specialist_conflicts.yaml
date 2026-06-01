@@ -60,6 +60,15 @@ seed:
       completed_count: 2
       conflict_pair: true
       conflict_count: 3
+      # GUARANTEE the type-matched-slot trap fires in EVERY seed: inject a
+      # strictly-earlier telehealth decoy slot one hour before the later-booked
+      # provider's earliest in-person slot, so the bare-earliest slot is ALWAYS
+      # the wrong visit type and the agent MUST filter slots by type.
+      conflict_guarantee_type_trap: true
+      # Book a 4th non-cluster upcoming appointment with the SAME provider as
+      # the later-booked conflict (distinct, non-overlapping datetime) — a
+      # provider-grounding decoy frozen by the critical sibling invariant.
+      conflict_provider_grounding_decoy: true
     outputs:
     - upcoming_ids
     - conflict_apt_ids
@@ -67,6 +76,8 @@ seed:
     - later_booked_conflict_provider_id
     - later_booked_conflict_type
     - later_booked_conflict_type_matched_earliest_slot
+    - later_booked_conflict_earliest_slot
+    - conflict_provider_decoy_apt_id
   - use: referral_chain
     params:
       approved_count: 5
@@ -91,9 +102,20 @@ seed:
     # The earliest available slot offered by the later-booked appointment's
     # provider whose slot type MATCHES the appointment's current visit type.
     # This is the canonical destination and is deliberately distinct from the
-    # provider's globally-earliest slot in most seeds (that slot is usually the
-    # other visit type — a trap).
+    # provider's globally-earliest slot in EVERY seed (the bare-earliest slot
+    # is a strictly-earlier telehealth decoy of the wrong type — a guaranteed
+    # trap injected by conflict_guarantee_type_trap).
     type_matched_slot: '{output.later_booked_conflict_type_matched_earliest_slot}'
+    # The provider's globally-earliest slot (the GUARANTEED wrong-type
+    # telehealth decoy). Exposed so the paired intervention variant can stage a
+    # misleading "already moved to this slot" snapshot the agent must reject.
+    bare_earliest_slot: '{output.later_booked_conflict_earliest_slot}'
+    # A 4th non-cluster upcoming appointment that shares the later-booked
+    # conflict's provider at a distinct datetime — a provider-grounding decoy.
+    # Frozen by the critical sibling invariant (it is in the initial set and is
+    # not later_booked_apt_id, so the filter already covers it); exposed for
+    # the solvability proof's wrong-target near-miss.
+    provider_decoy_apt_id: '{output.conflict_provider_decoy_apt_id}'
 
 canonical_diff:
   # Two UI-natural paths resolve the conflict: (A) in-place reschedule via

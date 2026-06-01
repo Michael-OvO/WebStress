@@ -3,10 +3,11 @@
 Confirms the (now harder) "redo the returned peer review" task:
   * is achievable past the real backend gate (POST /peer-reviews/{id}/submit),
   * passes the canonical_diff evaluator when the agent submits the RETURNED
-    review with all three rubric criteria scored, the previously-recorded
-    criteria changed, and a >=80-char comment that names the reviewee, and
-  * fails on representative near-miss trajectories (wrong review, unchanged
-    previous scores, too-short comment, comment missing the reviewee name).
+    review with all three rubric criteria scored to the EXACT re-derived values
+    (previous score + 2 capped at 5; unscored criterion -> 3) and a >=80-char
+    comment that addresses the reviewee by first name, and
+  * fails on representative near-miss trajectories (wrong review, plausible but
+    NON-exact scores, too-short comment, comment missing the reviewee first name).
 """
 
 from __future__ import annotations
@@ -34,24 +35,24 @@ def _targets_and_state(session_id: str):
     return targets, state
 
 
-def _good_comment(reviewee_name: str) -> str:
+def _good_comment(reviewee_first: str) -> str:
     base = (
-        f"Hi {reviewee_name}, your submission states its thesis clearly, but the "
+        f"Hi {reviewee_first}, your submission states its thesis clearly, but the "
         f"middle section needs deeper analysis and at least one original example "
         f"to support the central claim before resubmission."
     )
     assert len(base.strip()) >= 80
-    assert reviewee_name.lower() in base.lower()
+    assert reviewee_first.lower() in base.lower()
     return base
 
 
-def _changed_scores(targets: dict) -> dict:
-    """Scores that differ from the previously-recorded clarity/depth values."""
-    prev_clarity = int(targets["prev_clarity"]) if targets.get("prev_clarity") else 0
-    prev_depth = int(targets["prev_depth"]) if targets.get("prev_depth") else 0
-    clarity = 5 if prev_clarity != 5 else 4
-    depth = 5 if prev_depth != 5 else 4
-    return {"clarity": clarity, "depth": depth, "originality": 4}
+def _correct_scores(targets: dict) -> dict:
+    """The EXACT re-derived scores: prev+2 (cap 5) per scored criterion, 3 if unscored."""
+    return {
+        "clarity": int(targets["req_clarity"]),
+        "depth": int(targets["req_depth"]),
+        "originality": int(targets["req_originality"]),
+    }
 
 
 def test_correct_trajectory_passes():
@@ -60,8 +61,8 @@ def test_correct_trajectory_passes():
     targets, _ = _targets_and_state(session_id)
 
     review_id = targets["target_review_id"]
-    scores = _changed_scores(targets)
-    comment = _good_comment(targets["reviewee_name"])
+    scores = _correct_scores(targets)
+    comment = _good_comment(targets["reviewee_first"])
 
     resp = client.post(
         f"/api/env/lms/peer-reviews/{review_id}/submit",
@@ -96,10 +97,38 @@ def test_wrong_review_fails():
     )
     assert other is not None, "expected another non-submitted review to exist"
 
-    comment = _good_comment(targets["reviewee_name"])
+    comment = _good_comment(targets["reviewee_first"])
     resp = client.post(
         f"/api/env/lms/peer-reviews/{other.id}/submit",
-        json={"session_id": session_id, "rubric_scores": {"clarity": 5, "depth": 5, "originality": 4}, "comments": comment},
+        json={"session_id": session_id, "rubric_scores": _correct_scores(targets), "comments": comment},
+    )
+    assert resp.status_code == 200, resp.text
+
+    targets, state = _targets_and_state(session_id)
+    result = evaluate(task=get_task(TASK_ID), server_state=state, targets=dict(targets), trajectory=[])
+    assert result.get("success") is False, f"expected failure, got {result}"
+
+
+def test_non_exact_scores_fail():
+    """Submitting the returned review with plausible-but-NOT-exact re-derived scores fails.
+
+    A near-miss agent that improves every criterion (max-everything, or +1 instead
+    of the published +2) lands wrong integers and must fail the exact predicate.
+    """
+    client = TestClient(app)
+    session_id = _create_session(client)
+    targets, _ = _targets_and_state(session_id)
+
+    review_id = targets["target_review_id"]
+    correct = _correct_scores(targets)
+    # Plausible "improve everything to the top" answer that does NOT match the rule.
+    near_miss = {"clarity": 5, "depth": 5, "originality": 5}
+    assert near_miss != correct, "near-miss must differ from the exact answer"
+    comment = _good_comment(targets["reviewee_first"])
+
+    resp = client.post(
+        f"/api/env/lms/peer-reviews/{review_id}/submit",
+        json={"session_id": session_id, "rubric_scores": near_miss, "comments": comment},
     )
     assert resp.status_code == 200, resp.text
 
@@ -118,8 +147,8 @@ def test_unchanged_previous_scores_fails():
     # Reuse the exact previously-recorded clarity & depth -> must NOT pass.
     prev_clarity = int(targets["prev_clarity"])
     prev_depth = int(targets["prev_depth"])
-    scores = {"clarity": prev_clarity, "depth": prev_depth, "originality": 4}
-    comment = _good_comment(targets["reviewee_name"])
+    scores = {"clarity": prev_clarity, "depth": prev_depth, "originality": 3}
+    comment = _good_comment(targets["reviewee_first"])
 
     resp = client.post(
         f"/api/env/lms/peer-reviews/{review_id}/submit",
@@ -139,8 +168,8 @@ def test_short_comment_fails():
     targets, _ = _targets_and_state(session_id)
 
     review_id = targets["target_review_id"]
-    scores = _changed_scores(targets)
-    short = f"{targets['reviewee_name']}: good work overall."  # < 80 chars
+    scores = _correct_scores(targets)
+    short = f"{targets['reviewee_first']}: good work overall."  # < 80 chars
     assert len(short.strip()) < 80
 
     resp = client.post(
@@ -155,19 +184,19 @@ def test_short_comment_fails():
 
 
 def test_comment_missing_reviewee_name_fails():
-    """A long comment that never names the reviewee fails the comment predicate."""
+    """A long comment that never names the reviewee (first name) fails the comment predicate."""
     client = TestClient(app)
     session_id = _create_session(client)
     targets, _ = _targets_and_state(session_id)
 
     review_id = targets["target_review_id"]
-    scores = _changed_scores(targets)
+    scores = _correct_scores(targets)
     comment = (
         "The submission states its thesis clearly, but the middle section needs "
         "deeper analysis and at least one original example to support the central claim."
     )
     assert len(comment.strip()) >= 80
-    assert targets["reviewee_name"].lower() not in comment.lower()
+    assert targets["reviewee_first"].lower() not in comment.lower()
 
     resp = client.post(
         f"/api/env/lms/peer-reviews/{review_id}/submit",

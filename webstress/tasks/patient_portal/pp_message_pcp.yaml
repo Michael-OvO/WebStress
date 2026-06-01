@@ -3,13 +3,16 @@ env_id: patient_portal
 title: Schedule and Confirm PCP Medication Review
 instruction_template: Review your medication list, then schedule exactly one follow-up appointment with your assigned primary
   care physician (the PCP your patient profile is registered to, provider id {target.pcp_id}) at the earliest available slot
-  on that physician's own calendar. Use the appointment reason exactly "Medication side effect review". This clinic requires
-  a two-step booking workflow, so after scheduling you must also complete the confirmation step on that appointment. Do not
-  send any messages. Do not book with any other physician, and do not cancel, reschedule, modify, or confirm any appointment
-  that already exists on your calendar.
+  on that physician's own calendar. Other primary-care physicians appear in the directory and one of them may advertise an
+  even earlier slot, but you must book the earliest slot on YOUR assigned PCP's calendar specifically, not the globally
+  earliest PCP slot. Use the appointment reason exactly "Medication side effect review". This clinic requires a two-step
+  booking workflow, so after scheduling you must also complete the confirmation step on the appointment you just created.
+  Do not send any messages. Do not book with any other physician, and do not cancel, reschedule, modify, or confirm any
+  appointment that already exists on your calendar -- note that one of your existing PCP appointments is itself still awaiting
+  confirmation, but it is NOT yours to confirm; confirm only the brand-new appointment you create in this task.
 difficulty: medium
-time_limit_seconds: 180
-expected_steps: 9
+time_limit_seconds: 200
+expected_steps: 11
 primary_primitives:
 - backtracking
 secondary_primitives:
@@ -42,8 +45,11 @@ seed:
         pcp: 2
       must_include:
       - pcp
+      earlier_sibling_decoy_specialty: pcp
     outputs:
     - provider_ids
+    - global_earliest_decoy_slot_dt
+    - global_earliest_decoy_provider_id
   - use: pharmacy_list
     params:
       count: 3
@@ -61,6 +67,8 @@ seed:
       completed_count: 2
       cancelled_count: 1
       include_specialist: true
+      requires_confirmation_specialties:
+      - pcp
     outputs:
     - upcoming_ids
     - pcp_apt_id
@@ -71,6 +79,8 @@ seed:
     active_rx_ids: '{output.active_rx_ids}'
     pcp_apt_id: '{output.pcp_apt_id}'
     existing_upcoming_apt_ids: '{output.upcoming_ids}'
+    global_earliest_decoy_slot_dt: '{output.global_earliest_decoy_slot_dt}'
+    global_earliest_decoy_provider_id: '{output.global_earliest_decoy_provider_id}'
 canonical_diff:
   create:
   - entity: Appointment

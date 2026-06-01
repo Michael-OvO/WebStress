@@ -1,17 +1,21 @@
 task_id: pp_rx_cost_optimization
 env_id: patient_portal
 title: Prescription Cost Optimization
-instruction_template: Your plan offers several mail-order pharmacies. Identify the
-  single mail-order pharmacy with the lowest 90-day supply cost, then transfer every
-  active prescription that is currently filled at a retail pharmacy and still has
-  at least one refill remaining to that mail-order pharmacy. Do not transfer any
-  active prescription that has zero refills remaining or that is already at a
-  mail-order pharmacy. Do not change your default pharmacy, do not send any
-  messages, do not request a renewal, and do not modify any expired or other
-  prescription.
+instruction_template: Your plan offers several mail-order pharmacies, and their
+  90-day supply costs are close together. Compare every mail-order pharmacy and
+  identify the single one with the lowest 90-day supply cost (if two are tied, the
+  cheapest is still uniquely determined). Then transfer every active prescription
+  that is currently filled at a retail (non-mail-order) pharmacy AND still has at
+  least one refill remaining to that lowest-cost mail-order pharmacy. Do not
+  transfer any active prescription that has zero refills remaining, even if it is
+  currently at a retail pharmacy, and do not transfer any prescription that is
+  already at a mail-order pharmacy. An expired prescription that shares the name of
+  one of your active medications is not eligible and must be left untouched. Do not
+  change your default pharmacy, do not send any messages, do not request a renewal,
+  and do not modify any expired or other prescription.
 difficulty: hard
 time_limit_seconds: 360
-expected_steps: 20
+expected_steps: 22
 primary_primitives:
 - grounding
 start_path: /medications
@@ -43,6 +47,10 @@ seed:
       count: 3
       include_mail_order: true
       mail_order_count: 3
+      mail_order_costs_override:
+      - 22
+      - 21
+      - 35
     outputs:
     - pharmacy_ids
     - default_pharmacy_id
@@ -52,9 +60,13 @@ seed:
     - cheapest_mail_order_pharmacy_id
   - use: prescription_cabinet
     params:
-      active_count: 5
+      active_count: 6
       expired_count: 2
-      zero_refill_count: 1
+      zero_refill_count: 2
+      retail_refillable_pin_count: 4
+      mail_order_active_count: 1
+      retail_zero_refill_count: 2
+      expired_target_decoy: true
       target_medication_name: Atorvastatin
       target_exclude_mail_order: true
     outputs:

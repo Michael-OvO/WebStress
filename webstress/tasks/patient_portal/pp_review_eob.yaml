@@ -52,11 +52,13 @@ seed:
     - completed_ids
   - use: insurance_claims
     params:
-      approved_count: 3
-      approved_no_eob_count: 2
-      approved_zero_resp_count: 2
+      approved_count: 4
+      approved_no_eob_count: 3
+      approved_zero_resp_count: 3
       denied_count: 3
-      processing_count: 1
+      denied_no_eob_count: 2
+      denied_past_deadline_count: 2
+      processing_count: 2
       with_eob: true
     outputs:
     - approved_claim_ids

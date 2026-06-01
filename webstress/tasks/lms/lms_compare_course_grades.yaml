@@ -9,8 +9,8 @@ instruction_template: You are enrolled in five courses. Compare your displayed w
   leave both enrollments unchanged. Do not drop, change, or add any other enrollment,
   and do not send any messages.
 difficulty: hard
-time_limit_seconds: 300
-expected_steps: 16
+time_limit_seconds: 360
+expected_steps: 20
 primary_primitives:
 - verification
 start_path: /courses
@@ -28,6 +28,15 @@ seed:
       must_include:
       - CS101
       - MATH201
+      # CS101 -> template 3 (no drop-lowest anywhere); MATH201 -> template 1
+      # (homework drop_lowest=2, quizzes drop_lowest=1). Distinct per-course
+      # drop policies force the agent to apply each course's own rule rather
+      # than a single shared recompute. Remaining decoy courses keep their
+      # randomized templates.
+      grading_template_indices:
+      - 3
+      - 1
+      vary_late_policies: true
     outputs:
     - course_ids
     - course_codes
@@ -37,9 +46,9 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 10
+      per_course_count: 12
       graded_fraction: 0.6
-      late_count: 1
+      late_count: 3
     outputs:
     - assignment_ids
   - use: grade_book
@@ -47,6 +56,11 @@ seed:
       compare_pair_codes:
       - CS101
       - MATH201
+      # Deterministically calibrate the named-pair (and a global-lowest decoy)
+      # to a knife-edge: penalty-adjusted (displayed) gap = 3.41 > 3.00 (DROP),
+      # naive raw-percentage gap = 2.60 <= 3.00 (no-op). See the calibration
+      # block in _seed_builders_lms.py grade_book.
+      calibrate_named_pair: true
     outputs:
     - grade_ids
     - current_weighted_scores
@@ -55,6 +69,7 @@ seed:
     - named_pair_lower_course_id
     - named_pair_lower_enrollment_id
     - named_pair_higher_course_id
+    - named_pair_higher_enrollment_id
     - named_pair_gap
     - named_pair_gap_above_3
   targets:
@@ -65,6 +80,7 @@ seed:
     named_pair_lower_course_id: '{output.named_pair_lower_course_id}'
     named_pair_lower_enrollment_id: '{output.named_pair_lower_enrollment_id}'
     named_pair_higher_course_id: '{output.named_pair_higher_course_id}'
+    named_pair_higher_enrollment_id: '{output.named_pair_higher_enrollment_id}'
     named_pair_gap: '{output.named_pair_gap}'
     named_pair_gap_above_3: '{output.named_pair_gap_above_3}'
 canonical_diff:
@@ -106,12 +122,22 @@ canonical_diff:
     - desc: The named-pair weighted-grade gap exceeds the 3-point tolerance
       expr: "Decimal(target['named_pair_gap']) > Decimal('3')"
       severity: critical
+    - desc: The DISPLAYED (penalty-adjusted) named-pair gap, recomputed live from
+        state via the same engine the Grades page uses, exceeds 3.00 points -- a
+        naive raw-percentage recompute that ignores the late-penalty column would
+        wrongly read it as within tolerance
+      expr: "abs(state.weighted_score_for_course(target['named_pair_higher_course_id']) - state.weighted_score_for_course(target['named_pair_lower_course_id'])) > Decimal('3')"
+      severity: critical
+    - desc: The dropped enrollment is the lower-graded of the named pair by the
+        DISPLAYED weighted score (engine value), not the higher one
+      expr: "state.weighted_score_for_course(target['named_pair_lower_course_id']) < state.weighted_score_for_course(target['named_pair_higher_course_id'])"
+      severity: critical
     - desc: Agent did not send messages
       expr: "len(state.sent_messages) == 0"
       severity: high
     - desc: The dropped enrollment is the scoped named-pair lower, not the global lowest decoy
-      expr: "target['named_pair_lower_enrollment_id'] != '' and (target['lower_grade_enrollment_id'] == target['named_pair_lower_enrollment_id'] or len([e for e in state.enrollments if e.status == 'dropped' and e.id != target['named_pair_lower_enrollment_id']]) == 0)"
-      severity: high
+      expr: "target['named_pair_lower_enrollment_id'] != '' and target['lower_grade_enrollment_id'] != target['named_pair_lower_enrollment_id'] and len([e for e in state.enrollments if e.status == 'dropped' and e.id != target['named_pair_lower_enrollment_id']]) == 0"
+      severity: critical
     named_invariants:
       - name: Agent dropped the lower-grade course of the named pair
         ref: update[0]

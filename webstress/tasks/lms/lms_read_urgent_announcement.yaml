@@ -2,15 +2,19 @@ task_id: lms_read_urgent_announcement
 env_id: lms
 title: Read Urgent Announcement
 instruction_template: >-
-  Your announcements feed has several urgent notices still marked unread. Open
-  the feed, and mark as read the single urgent unread announcement that was
-  posted most recently (the latest posted_at among announcements whose priority
-  is urgent and that are still unread). Mark exactly that one announcement read.
-  Do not mark any other announcement read, do not use mark-all-read, and do not
-  send any messages.
+  Your announcements feed is busy: there are several urgent notices and several
+  recent notices, some already read. Open the feed and mark as read the single
+  announcement that satisfies ALL THREE conditions: its priority is urgent, it is
+  still unread, and it has the latest posted_at among the announcements that meet
+  both of those conditions. Be careful: the most recently posted urgent
+  announcement overall has already been read (it is NOT your target), and the
+  most recently posted unread announcement overall is only normal priority (also
+  NOT your target). Mark exactly that one announcement read. Do not mark any
+  other announcement read, do not use mark-all-read, and do not send any
+  messages.
 difficulty: medium
 time_limit_seconds: 180
-expected_steps: 9
+expected_steps: 10
 primary_primitives:
   - grounding
 start_path: /courses
@@ -33,21 +37,26 @@ seed:
         - enrollment_ids
     - use: announcements_feed
       params:
-        count: 12
-        unread_count: 7
-        urgent_count: 4
+        count: 15
+        unread_count: 9
+        urgent_count: 6
         distinct_urgent_recency: true
+        tight_recency: true
+        urgent_read_decoy_count: 2
+        normal_late_decoy_count: 1
       outputs:
         - announcement_ids
         - unread_announcement_ids
         - urgent_announcement_id
         - urgent_unread_announcement_ids
         - target_urgent_announcement_id
+        - latest_announcement_id
   targets:
     urgent_announcement_id: '{output.urgent_announcement_id}'
     unread_announcement_ids: '{output.unread_announcement_ids}'
     urgent_unread_announcement_ids: '{output.urgent_unread_announcement_ids}'
     target_urgent_announcement_id: '{output.target_urgent_announcement_id}'
+    latest_announcement_id: '{output.latest_announcement_id}'
 
 canonical_diff:
   update:
@@ -94,6 +103,12 @@ canonical_diff:
       and not a.is_read) == len(target['urgent_unread_announcement_ids'].split(','))
       - 1
     severity: critical
+  - desc: The newest already-read urgent decoy stayed read (agent did not target it)
+    expr: >-
+      all(a.is_read for a in state.announcements if a.priority == 'urgent'
+      and a.id not in target['urgent_unread_announcement_ids'].split(','))
+    severity: critical
+
   named_invariants:
     - name: Agent did not modify non-target announcements
       ref: invariant[0]

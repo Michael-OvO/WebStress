@@ -1,15 +1,18 @@
 """Solvability proof for the hardened pp_cancel_appointment task.
 
-The task was re-tiered from easy -> medium. The patient has two duplicate
-appointments with the SAME PCP at the SAME datetime; the only thing that
-distinguishes them is ``booked_at``. The agent must cancel the EARLIER-booked
-duplicate (minimum booked_at) with a cancellation reason that contains the
-word "duplicate", while keeping the later-booked appointment and every other
-collection untouched.
+The task was re-tiered easy -> medium. The patient accidentally booked the same
+visit with the SAME PCP at the SAME datetime THREE times (a same-provider,
+same-datetime duplicate CLUSTER). The instruction no longer names the
+discriminating field: the agent must infer that the ORIGINAL booking is the
+earliest-booked member of the cluster (minimum ``booked_at``) and cancel EVERY
+other member (the accidental re-books) with a cancellation reason that contains
+the word "duplicate", while keeping the original and every other collection
+untouched.
 
 The correct trajectory is driven through the REAL backend cancel endpoint
 (POST /appointments/{id}/cancel) via a Starlette TestClient so the proof also
-confirms the action is reachable past the endpoint's gates (scheduled-only).
+confirms the action is reachable past the endpoint's gates (scheduled-only) and
+that the cancel BIJECTION over the re-book set saturates.
 """
 
 from __future__ import annotations
@@ -50,42 +53,61 @@ def _cancel(client: TestClient, sid: str, apt_id: str, reason: str):
     )
 
 
-def _earlier_booked_id(targets: dict, state) -> str:
-    """Re-derive the earlier-booked duplicate the way the evaluator expr does."""
+def _as_list(value) -> list[str]:
+    if isinstance(value, str):
+        return [v for v in value.split(",") if v]
+    return list(value)
+
+
+def _cluster_ids(targets: dict) -> list[str]:
+    return _as_list(targets["conflict_apt_ids"])
+
+
+def _cancel_ids(targets: dict) -> list[str]:
+    return _as_list(targets["conflict_cancel_apt_ids"])
+
+
+def _keep_id(targets: dict) -> str:
+    return targets["conflict_keep_apt_id"]
+
+
+def _earliest_booked_id(targets: dict, state) -> str:
+    """Re-derive the ORIGINAL (earliest-booked) the way a correct agent would."""
     by_id = {a.id: a for a in state.appointments}
-    return min(
-        targets["conflict_apt_ids"],
-        key=lambda aid: (by_id[aid].booked_at, aid),
-    )
+    return min(_cluster_ids(targets), key=lambda aid: (by_id[aid].booked_at, aid))
 
 
-def test_seed_shape_is_a_same_provider_duplicate_pair():
-    """The two conflict appointments share provider + datetime and differ only by booked_at."""
+def test_seed_shape_is_a_same_provider_duplicate_cluster():
+    """Three conflict appointments share provider + datetime; booked_at orders them."""
     sid, targets = _new_session()
     state = _state(sid)
-    ids = targets["conflict_apt_ids"]
-    assert len(ids) == 2
+    ids = _cluster_ids(targets)
+    assert len(ids) == 3
     appts = {a.id: a for a in state.appointments if a.id in ids}
-    a0, a1 = appts[ids[0]], appts[ids[1]]
     # Same provider (the PCP) and same datetime -> only booked_at disambiguates.
-    assert a0.provider_id == a1.provider_id == state.patient.pcp_id
-    assert a0.datetime == a1.datetime
-    assert a0.booked_at != a1.booked_at
-    # The pre-computed target must equal the min-booked-at appointment.
-    assert targets["earlier_booked_apt_id"] == _earlier_booked_id(targets, state)
-    assert targets["earlier_booked_apt_id"] != targets["later_booked_apt_id"]
+    provider_ids = {appts[i].provider_id for i in ids}
+    datetimes = {appts[i].datetime for i in ids}
+    assert provider_ids == {state.patient.pcp_id}
+    assert len(datetimes) == 1
+    booked = {appts[i].booked_at for i in ids}
+    assert len(booked) == 3  # all distinct -> total order
+    # The KEEP target must be the earliest-booked; the CANCEL set is the rest.
+    assert _keep_id(targets) == _earliest_booked_id(targets, state)
+    assert set(_cancel_ids(targets)) == set(ids) - {_keep_id(targets)}
+    assert _keep_id(targets) not in _cancel_ids(targets)
 
 
 def test_correct_trajectory_passes_via_real_endpoint():
-    """Cancelling the earlier-booked duplicate with a 'duplicate' reason passes."""
+    """Cancelling EVERY re-book with a 'duplicate' reason (keeping the original) passes."""
     client = _client()
     sid, targets = _new_session()
     state = _state(sid)
-    target_id = _earlier_booked_id(targets, state)
-    assert target_id == targets["target_apt_id"]
+    keep = _earliest_booked_id(targets, state)
+    assert keep == _keep_id(targets)
 
-    resp = _cancel(client, sid, target_id, "Duplicate booking created in error")
-    assert resp.status_code == 200, resp.text
+    for apt_id in _cancel_ids(targets):
+        resp = _cancel(client, sid, apt_id, "Duplicate booking created in error")
+        assert resp.status_code == 200, resp.text
 
     state = _state(sid)
     result = evaluate(
@@ -96,20 +118,42 @@ def test_correct_trajectory_passes_via_real_endpoint():
     )
     assert result.get("success") is True, f"result: {result}"
     assert result.get("score", 0.0) >= 0.99, f"result: {result}"
-    # Confirm the kept duplicate is still scheduled.
-    kept = next(a for a in state.appointments if a.id == targets["later_booked_apt_id"])
+    # Confirm the kept original is still scheduled.
+    kept = next(a for a in state.appointments if a.id == keep)
     assert kept.status == "scheduled"
 
 
-def test_wrong_duplicate_cancelled_fails():
-    """Cancelling the LATER-booked duplicate (the one that must be kept) fails."""
+def test_cancelling_only_one_rebook_fails():
+    """Cancelling just ONE of the two re-books (bijection not saturated) fails."""
+    client = _client()
+    sid, targets = _new_session()
+
+    one = _cancel_ids(targets)[0]
+    resp = _cancel(client, sid, one, "Duplicate booking created in error")
+    assert resp.status_code == 200, resp.text
+
+    state = _state(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert result.get("success") is False, f"result: {result}"
+
+
+def test_cancelling_the_original_fails():
+    """Cancelling the earliest-booked ORIGINAL (which must be kept) fails."""
     client = _client()
     sid, targets = _new_session()
     state = _state(sid)
-    wrong_id = targets["later_booked_apt_id"]
-    assert wrong_id != _earlier_booked_id(targets, state)
+    keep = _earliest_booked_id(targets, state)
 
-    resp = _cancel(client, sid, wrong_id, "Duplicate booking created in error")
+    # Agent who took global-min wrong / cancelled the original instead of a re-book.
+    resp = _cancel(client, sid, keep, "Duplicate booking created in error")
+    assert resp.status_code == 200, resp.text
+    # Also cancel one real re-book, leaving the other re-book live -> still wrong set.
+    resp = _cancel(client, sid, _cancel_ids(targets)[0], "Duplicate booking created in error")
     assert resp.status_code == 200, resp.text
 
     state = _state(sid)
@@ -123,14 +167,13 @@ def test_wrong_duplicate_cancelled_fails():
 
 
 def test_missing_duplicate_reason_fails():
-    """Cancelling the right appointment but without 'duplicate' in the reason fails."""
+    """Cancelling the right re-books but without 'duplicate' in the reason fails."""
     client = _client()
     sid, targets = _new_session()
-    state = _state(sid)
-    target_id = _earlier_booked_id(targets, state)
 
-    resp = _cancel(client, sid, target_id, "Patient requested cancellation")
-    assert resp.status_code == 200, resp.text
+    for apt_id in _cancel_ids(targets):
+        resp = _cancel(client, sid, apt_id, "Patient requested cancellation")
+        assert resp.status_code == 200, resp.text
 
     state = _state(sid)
     result = evaluate(
@@ -142,16 +185,13 @@ def test_missing_duplicate_reason_fails():
     assert result.get("success") is False, f"result: {result}"
 
 
-def test_extra_side_effect_cancelling_both_fails():
-    """Cancelling BOTH duplicates (extra collateral on the kept one) fails."""
+def test_extra_side_effect_cancelling_whole_cluster_fails():
+    """Cancelling ALL cluster members (incl. the original) trips the keep invariant."""
     client = _client()
     sid, targets = _new_session()
-    state = _state(sid)
-    target_id = _earlier_booked_id(targets, state)
 
-    assert _cancel(client, sid, target_id, "Duplicate booking").status_code == 200
-    # Stray side-effect: also cancel the appointment we were told to keep.
-    assert _cancel(client, sid, targets["later_booked_apt_id"], "oops").status_code == 200
+    for apt_id in _cluster_ids(targets):
+        assert _cancel(client, sid, apt_id, "Duplicate booking").status_code == 200
 
     state = _state(sid)
     result = evaluate(

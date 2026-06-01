@@ -2,14 +2,19 @@ task_id: lms_exam_conflict
 env_id: lms
 title: Resolve Exam Scheduling Conflict by Dropping Lower-Grade Course
 instruction_template: Open the calendar and review every upcoming final-exam event.
-  Group the exams by calendar date and find the single date that has the greatest
-  number of final exams scheduled on it. Among only the courses whose final exam
-  falls on that most-conflicted date, compute each course's current overall weighted
-  grade from the gradebook and drop the one course holding the lowest weighted grade.
-  Do not drop, add, or change any other enrollment, and do not contact anyone.
+  Several different dates have multiple final exams scheduled, so group the final
+  exams by calendar date and identify the single date that carries strictly more
+  final exams than any other date. Among only the courses whose final exam falls on
+  that single most-conflicted date, compute each course's current overall weighted
+  grade from the gradebook (apply each course's own category weights and drop-lowest
+  rules exactly; the two lowest grades in this group are within about a point of each
+  other, so an approximate read will not separate them) and drop the one course
+  holding the lowest weighted grade. Do not drop, add, or change any other enrollment,
+  including the courses whose exams fall on the other busy dates, and do not contact
+  anyone.
 difficulty: expert
-time_limit_seconds: 420
-expected_steps: 26
+time_limit_seconds: 450
+expected_steps: 32
 primary_primitives:
 - exploration
 start_path: /calendar
@@ -22,7 +27,7 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 6
+      count: 9
       must_include:
       - CS101
       - MATH201
@@ -37,7 +42,7 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 6
+      per_course_count: 9
       graded_fraction: 0.67
     outputs:
     - assignment_ids
@@ -53,6 +58,8 @@ seed:
       structured_exam_conflict: true
       primary_conflict_size: 3
       decoy_conflict_size: 2
+      decoy_cluster_count: 2
+      tight_min_gap: true
     outputs:
     - event_ids
     - conflicting_course_ids
@@ -61,7 +68,13 @@ seed:
     - lower_grade_conflict_enrollment_id
     - primary_conflict_course_ids
     - decoy_conflict_course_ids
+    - second_decoy_conflict_course_ids
+    - decoy_conflict_course_id
+    - second_decoy_conflict_course_id
     - primary_conflict_day
+    - decoy_conflict_day
+    - second_decoy_conflict_day
+    - primary_conflict_min_gap
     - second_lowest_primary_conflict_course_id
   - use: announcements_feed
     params:
@@ -76,7 +89,13 @@ seed:
     lower_grade_conflict_enrollment_id: '{output.lower_grade_conflict_enrollment_id}'
     primary_conflict_course_ids: '{output.primary_conflict_course_ids}'
     decoy_conflict_course_ids: '{output.decoy_conflict_course_ids}'
+    second_decoy_conflict_course_ids: '{output.second_decoy_conflict_course_ids}'
+    decoy_conflict_course_id: '{output.decoy_conflict_course_id}'
+    second_decoy_conflict_course_id: '{output.second_decoy_conflict_course_id}'
     primary_conflict_day: '{output.primary_conflict_day}'
+    decoy_conflict_day: '{output.decoy_conflict_day}'
+    second_decoy_conflict_day: '{output.second_decoy_conflict_day}'
+    primary_conflict_min_gap: '{output.primary_conflict_min_gap}'
     second_lowest_primary_conflict_course_id: '{output.second_lowest_primary_conflict_course_id}'
 canonical_diff:
   update:
@@ -99,6 +118,9 @@ canonical_diff:
     preserve: ALL
   - collection: state.enrollments
     filter: "a.course_id in target['decoy_conflict_course_ids'].split(',')"
+    preserve: ALL
+  - collection: state.enrollments
+    filter: "a.course_id in target['second_decoy_conflict_course_ids'].split(',')"
     preserve: ALL
   - collection: state.courses
     preserve: ALL
@@ -146,34 +168,37 @@ canonical_diff:
   - name: Agent did not drop a decoy-cluster course
     ref: invariant[2]
     severity: critical
-  - name: Agent did not modify course records
+  - name: Agent did not drop a second-decoy-cluster course
     ref: invariant[3]
-    severity: medium
-  - name: Agent did not modify assignments
+    severity: critical
+  - name: Agent did not modify course records
     ref: invariant[4]
     severity: medium
-  - name: Agent did not modify modules
+  - name: Agent did not modify assignments
     ref: invariant[5]
     severity: medium
-  - name: Agent did not modify discussions
+  - name: Agent did not modify modules
     ref: invariant[6]
     severity: medium
-  - name: Agent did not create or edit discussion posts
+  - name: Agent did not modify discussions
     ref: invariant[7]
     severity: medium
-  - name: Agent did not alter peer reviews
+  - name: Agent did not create or edit discussion posts
     ref: invariant[8]
     severity: medium
-  - name: Agent did not modify announcements
+  - name: Agent did not alter peer reviews
     ref: invariant[9]
     severity: medium
-  - name: Agent did not modify grades
+  - name: Agent did not modify announcements
     ref: invariant[10]
+    severity: medium
+  - name: Agent did not modify grades
+    ref: invariant[11]
     severity: high
   - name: Agent did not modify calendar events
-    ref: invariant[11]
+    ref: invariant[12]
     severity: low
   - name: Agent did not send messages
-    ref: invariant[12]
+    ref: invariant[13]
     severity: medium
 secondary_primitives: []

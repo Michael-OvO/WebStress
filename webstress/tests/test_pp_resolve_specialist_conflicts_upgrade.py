@@ -1,21 +1,31 @@
 """Solvability proof for the HARDENED pp_resolve_specialist_conflicts task.
 
-Upgrade levers exercised here:
+Upgrade levers exercised here (v2):
   * THREE overlapping conflict appointments — the most-recently-booked must be
     re-derived from booked_at across >2 candidates (target['later_booked_apt_id']).
-  * Destination is the earliest SAME-VISIT-TYPE slot (target['type_matched_slot']),
-    which in most seeds is NOT the provider's globally-earliest slot (a trap).
+  * Destination is the earliest SAME-VISIT-TYPE slot (target['type_matched_slot']).
+    In v2 this is GUARANTEED to differ from the provider's bare-earliest slot in
+    EVERY seed: the builder injects a strictly-earlier telehealth decoy one hour
+    before the earliest in-person slot (conflict_guarantee_type_trap), so the
+    bare-earliest slot is ALWAYS the wrong visit type and the agent MUST filter
+    slots by visit type before taking min().
   * datetime freshness gate (>= session_start).
   * Branch B's replacement must be CONFIRMED (auto_confirm specialty) — a single
     create call is insufficient; the agent must also call /confirm.
-  * The one mutated collection is filtered so both earlier-booked conflicts and
-    every other upcoming appointment are frozen; sibling invariant escalated to
-    severity:critical.
+  * A provider-grounding decoy (4th upcoming appointment sharing the later-booked
+    conflict's provider at a distinct datetime, conflict_provider_grounding_decoy)
+    is frozen by the critical sibling invariant — an agent that grounds on
+    "the appointment with provider X" touches the wrong row.
+  * The one mutated collection is filtered so both earlier-booked conflicts, the
+    provider-grounding decoy, and every other upcoming appointment are frozen;
+    sibling invariant escalated to severity:critical.
 
 Both `oneof` branches are driven through the REAL backend REST endpoints via
 TestClient (reschedule for Branch A; cancel + create + confirm for Branch B),
-confirming achievability past the slot/referral/confirmation gates. A WRONG
-near-miss (used the bare-earliest wrong-type slot) is asserted to FAIL.
+confirming achievability past the slot/referral/confirmation gates. WRONG
+near-misses (bare-earliest wrong-type slot; unconfirmed rebook; moved the
+earliest-booked conflict; moved the provider-grounding decoy) are asserted to
+FAIL.
 """
 
 from __future__ import annotations
@@ -59,6 +69,37 @@ def test_seed_targets_are_well_formed():
     prov = next(p for p in state.providers if p.id == la.provider_id)
     same_type = sorted(s.datetime.isoformat() for s in prov.available_slots if s.type == la.type)
     assert targets["type_matched_slot"] == same_type[0]
+    # v2: the provider-grounding decoy is a distinct upcoming appt with the
+    # SAME provider as the later-booked conflict but is NOT a cluster member.
+    decoy_id = targets["provider_decoy_apt_id"]
+    assert decoy_id is not None
+    assert decoy_id not in cluster
+    assert decoy_id != targets["later_booked_apt_id"]
+    assert apts[decoy_id].provider_id == la.provider_id
+    assert apts[decoy_id].status == "scheduled"
+
+
+def test_type_matched_trap_is_guaranteed_every_seed():
+    """v2 guarantee: the bare-earliest slot is ALWAYS a wrong-type telehealth
+    decoy strictly distinct from the type-matched destination, so the trap can
+    never collapse to a no-op (the v1 'didn't bite' root cause)."""
+    sm = app.state.session_manager
+    for seed in (1, 7, 13, 23, 42, 55, 71):
+        sid, targets, _ = sm.create_session(env_id=ENV, task_id=TASK, seed=seed)
+        targets = dict(targets)
+        state = sm.get_state(sid)
+        apts = {a.id: a for a in state.appointments}
+        la = apts[targets["later_booked_apt_id"]]
+        prov = next(p for p in state.providers if p.id == la.provider_id)
+        bare = min(s.datetime.isoformat() for s in prov.available_slots)
+        bare_slot = next(s for s in prov.available_slots if s.datetime.isoformat() == bare)
+        assert bare != targets["type_matched_slot"], (
+            f"seed={seed}: trap collapsed (bare-earliest == type-matched)"
+        )
+        assert bare_slot.type != la.type, (
+            f"seed={seed}: bare-earliest slot type {bare_slot.type} is not the trap type"
+        )
+        assert bare == targets["bare_earliest_slot"]
 
 
 def test_branch_a_reschedule_in_place_passes():
@@ -203,3 +244,27 @@ def test_wrong_appointment_moved_fails():
     state = sm.get_state(sid)
     result = evaluate(task=get_task(TASK), server_state=state, targets=dict(targets), trajectory=[])
     assert result.get("success") is False, f"moving the wrong conflict should fail: {result}"
+
+
+def test_wrong_provider_grounding_decoy_moved_fails():
+    """Near-miss (v2): an agent that grounds on 'the appointment with provider X'
+    moves the 4th non-cluster appointment that merely shares the later-booked
+    conflict's provider -> fail (and it trips the critical sibling invariant)."""
+    client = TestClient(app)
+    sm, sid, targets = _create_session(client)
+    state = sm.get_state(sid)
+    decoy_id = targets["provider_decoy_apt_id"]
+    decoy = next(a for a in state.appointments if a.id == decoy_id)
+    assert decoy_id != targets["later_booked_apt_id"]
+    prov = next(p for p in state.providers if p.id == decoy.provider_id)
+    # Move it to the type-matched destination (the otherwise-correct slot) so
+    # the only error is operating on the WRONG appointment row.
+    resp = client.post(
+        f"{BASE}/appointments/{decoy_id}/reschedule",
+        json={"session_id": sid, "new_slot_datetime": targets["type_matched_slot"]},
+    )
+    assert resp.status_code == 200, resp.text
+
+    state = sm.get_state(sid)
+    result = evaluate(task=get_task(TASK), server_state=state, targets=dict(targets), trajectory=[])
+    assert result.get("success") is False, f"moving the provider decoy should fail: {result}"

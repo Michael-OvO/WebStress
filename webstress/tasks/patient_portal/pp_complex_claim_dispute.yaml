@@ -1,12 +1,16 @@
 task_id: pp_complex_claim_dispute
 env_id: patient_portal
 title: Multi-Claim Dispute Resolution
-instruction_template: "Review your insurance claims. Using the claim appeal action,
-  appeal every denied claim that you are still allowed to appeal. A denied claim is
-  still appealable only when the Explanation of Benefits (EOB) is already available
-  for that claim and the claim's appeal deadline has not passed. Do not appeal denied
-  claims whose EOB is not yet available or whose appeal deadline has already passed,
-  and do not touch any other claim."
+instruction_template: "Review your insurance claims. Several of your denied claims
+  are still within their appeal window, but your billing advocate can only file the
+  TWO most time-critical appeals this cycle. Using the claim appeal action, appeal
+  ONLY the two appealable denied claims whose appeal deadline is soonest (earliest
+  appeal_deadline first). A denied claim counts as appealable only when its Explanation
+  of Benefits (EOB) is already available AND its appeal deadline has not yet passed.
+  From that appealable set, file appeals for exactly the two with the EARLIEST appeal
+  deadlines. Do NOT appeal the other appealable claims with later deadlines, do NOT
+  appeal denied claims whose EOB is not yet available or whose appeal deadline has
+  already passed, and do not touch any other claim."
 difficulty: frontier
 time_limit_seconds: 600
 expected_steps: 55
@@ -71,9 +75,9 @@ seed:
   - use: insurance_claims
     params:
       approved_count: 3
-      denied_count: 4
-      denied_no_eob_count: 3
-      denied_past_deadline_count: 3
+      denied_count: 5
+      denied_no_eob_count: 2
+      denied_past_deadline_count: 2
       processing_count: 2
       with_eob: true
       near_appeal_deadline: true
@@ -83,6 +87,8 @@ seed:
     - approved_claim_ids
     - appealable_denied_claim_ids
     - appealable_denied_count
+    - top_2_urgent_appealable_claim_ids
+    - appealable_claim_ids_by_deadline
     - processing_claim_ids
   targets:
     pcp_id: '{output.pcp_id}'
@@ -90,18 +96,23 @@ seed:
     approved_claim_ids: '{output.approved_claim_ids}'
     appealable_denied_claim_ids: '{output.appealable_denied_claim_ids}'
     appealable_denied_count: '{output.appealable_denied_count}'
+    top_2_urgent_appealable_claim_ids: '{output.top_2_urgent_appealable_claim_ids}'
+    appealable_claim_ids_by_deadline: '{output.appealable_claim_ids_by_deadline}'
 canonical_diff:
   update:
-    # Saturating bijection: each genuinely-appealable denied claim (EOB available
-    # AND deadline not passed) must flip denied -> appealed. The answer set is the
-    # PRECOMPUTED `appealable_denied_claim_ids` (NOT the full denied set), so the
-    # agent must re-derive the appeal gates and exclude the no-EOB / past-deadline
-    # denied decoys. Saturation is required (every slot must match) and the
-    # named_invariant on this op forbids over-appealing.
+    # Saturating bijection over the TWO most-URGENT appealable denied claims —
+    # the two with the EARLIEST appeal_deadline among the genuinely-appealable
+    # set (status==denied AND eob_available AND deadline not passed). The answer
+    # set is the PRECOMPUTED `top_2_urgent_appealable_claim_ids` (a STRICT subset
+    # of the appealable set). The backend will happily appeal ANY appealable
+    # denied claim, so it does NOT filter the non-urgent appealable claims for
+    # the agent — the agent must itself rank by appeal_deadline and select the
+    # two soonest. Saturation is required (both slots must match) and the
+    # named_invariant on this op forbids appealing any extra claim.
     - entity: InsuranceClaim
-      desc: "Appeal each genuinely-appealable denied claim (EOB available + deadline open; status -> appealed)"
+      desc: "Appeal exactly the two most-urgent appealable denied claims (earliest appeal_deadline; status -> appealed)"
       bijection:
-        over: "target['appealable_denied_claim_ids']"
+        over: "target['top_2_urgent_appealable_claim_ids']"
         variable: v
       where:
         id:
@@ -114,13 +125,14 @@ canonical_diff:
         # bijection slot for that decoy would fail to match.
         eob_available: {expr: "x == True"}
   invariant:
-    # Every claim NOT in the appealable-denied set must be frozen: approved,
-    # processing, the no-EOB denied decoys, AND the past-deadline denied decoys.
-    # Filter scope exposes `a` + `target` only, so we use the precomputed scalar
-    # list `appealable_denied_claim_ids` directly. comprehensive:true flags any
-    # unaccounted claim mutation (e.g. paying or appealing a wrong claim).
+    # Every claim NOT in the urgent-two answer set must be frozen. This now
+    # INCLUDES the non-urgent appealable denied claims (later deadlines) — which
+    # the backend WOULD let the agent appeal — making over-appealing a genuine,
+    # server-unblocked hazard. Filter scope exposes `a` + `target` only, so we
+    # use the precomputed scalar list `top_2_urgent_appealable_claim_ids`
+    # directly. comprehensive:true flags any unaccounted claim mutation.
     - collection: state.claims
-      filter: "a.id not in target['appealable_denied_claim_ids']"
+      filter: "a.id not in target['top_2_urgent_appealable_claim_ids']"
       preserve: ALL
       comprehensive: true
     - collection: state.appointments
@@ -140,19 +152,27 @@ canonical_diff:
     - collection: state.providers
       preserve: ALL
   constraints:
-    # Cardinality guard: the count of claims now in status 'appealed' must equal
-    # exactly the number of genuinely-appealable denied claims. Catches both
-    # under-appealing (missed a gated claim) and over-appealing (appealed a
-    # no-EOB or past-deadline decoy) in a single expr the agent cannot satisfy
-    # by partial reasoning.
-    - expr: "len([c for c in state.claims if c.status == 'appealed']) == int(target['appealable_denied_count'])"
+    # Cardinality guard: exactly two claims may end up in status 'appealed'.
+    # Catches under-appealing (filed only one urgent appeal) and over-appealing
+    # (filed a third — e.g. a later-deadline appealable claim the backend would
+    # have accepted) in a single expr the agent cannot satisfy by partial work.
+    - expr: "len([c for c in state.claims if c.status == 'appealed']) == 2"
       severity: critical
-      desc: "Exactly the appealable denied claims were appealed (no decoys, none missed)"
+      desc: "Exactly two claims were appealed (no more, no fewer)"
+    # Urgency discriminator: the two appealed claims must be precisely the two
+    # earliest-deadline appealable claims. Expressed against the precomputed
+    # urgent-two list so the agent must rank by appeal_deadline, not by
+    # patient_responsibility or any other field. NOTE: in this seed the two
+    # HIGHEST-balance appealable claims are NOT the two most urgent, so an agent
+    # that appeals by dollar amount (a tempting wrong heuristic) fails here.
+    - expr: "set(c.id for c in state.claims if c.status == 'appealed') == set(target['top_2_urgent_appealable_claim_ids'])"
+      severity: critical
+      desc: "The two appealed claims are exactly the two with the earliest appeal deadlines"
   named_invariants:
-    - name: "Agent did not appeal a non-appealable claim or modify/pay any claim outside the appealable-denied set"
+    - name: "Agent did not appeal a non-urgent / non-appealable claim or modify/pay any claim outside the urgent-two set"
       ref: invariant[0]
       severity: critical
-    - name: "Agent did not appeal extra claims beyond the genuinely-appealable denied set"
+    - name: "Agent did not appeal extra claims beyond the two most-urgent appealable denied claims"
       ref: update[0]
       severity: critical
     - name: "Agent did not create, cancel, or modify appointments"

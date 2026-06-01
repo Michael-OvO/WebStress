@@ -4,16 +4,19 @@ title: Complete Peer Review Cycle
 instruction_template: 'Complete the full peer review cycle for student Riley Chen.
   Submit every pending peer review so its status becomes submitted, and for each one
   provide all three rubric scores (clarity, depth, originality) on a 1 to 5 scale plus
-  a written comment. Each comment must be at least 40 characters, must address the
-  reviewee by their first name, and must name at least one rubric criterion (clarity,
-  depth, or originality). Some of these reviews were previously returned for revision:
-  for any review that already carries previous rubric scores, every criterion that
-  was scored before must now receive a strictly higher score than the previous value.
-  Do not submit, edit, or re-open any peer review that is already submitted, and do
-  not send any messages.'
+  a written comment. Each comment must be at least 60 characters, must address the
+  reviewee by their first name, and must explicitly name the rubric criterion that
+  received that review''s LOWEST corrected score. Some of these reviews were previously
+  returned for revision and already carry previous rubric scores. For any such review
+  you must recompute every score with this exact rule: for each criterion that already
+  has a previous score, the corrected score is exactly the previous score plus two,
+  capped at 5; for any criterion that has no previous score, the corrected score is
+  exactly 3. Reviews that were never scored before take any valid 1 to 5 score on each
+  criterion. Do not submit, edit, or re-open any peer review that is already submitted,
+  and do not send any messages.'
 difficulty: hard
-time_limit_seconds: 360
-expected_steps: 24
+time_limit_seconds: 420
+expected_steps: 30
 primary_primitives:
 - planning
 start_path: /peer-reviews
@@ -46,58 +49,67 @@ seed:
     - assignment_ids
   - use: peer_review_assignments
     params:
-      count: 6
+      count: 8
       returned_review_count: 2
+      returned_prev_profiles:
+      - clarity: 2
+        depth: 1
+      - clarity: 4
+        depth: 4
       statuses:
       - assigned
       - in_progress
+      - assigned
       - submitted
       - assigned
-      - in_progress
+      - submitted
+      - submitted
       - submitted
     outputs:
     - review_ids
     - pending_review_ids
     - completed_review_ids
     - returned_review_ids
+    - pending_review_req_scores
+    - pending_review_low_crit
+    - pending_review_name_tokens
   targets:
     course_code: '{output.course_code}'
     pending_review_ids: '{output.pending_review_ids}'
     completed_review_ids: '{output.completed_review_ids}'
     returned_review_ids: '{output.returned_review_ids}'
+    pending_review_req_scores: '{output.pending_review_req_scores}'
+    pending_review_low_crit: '{output.pending_review_low_crit}'
+    pending_review_name_tokens: '{output.pending_review_name_tokens}'
 canonical_diff:
   update:
   - entity: PeerReview
-    desc: Submit every pending peer review with all rubric scores and an addressed, revision-aware comment
+    desc: Redo every returned-for-revision review with the EXACT rule-derived corrected scores and an addressed comment naming its lowest-scored criterion
     bijection:
-      over: "target['pending_review_ids'].split(',') if target['pending_review_ids'] else []"
+      over: "[rid.strip() for rid in target['returned_review_ids'].split(',') if rid.strip()]"
       variable: v
     where:
       id:
         expr: "x == v.strip()"
     changes:
       rubric_scores:
-        expr: >-
-          len(x) == 3
-          and set(str(k) for k in x.keys()) == {'clarity', 'depth', 'originality'}
-          and all(1 <= int(s) <= 5 for s in x.values())
-          and all(
-            int(x[str(c)]) > int(p)
-            for r in initial.peer_reviews if r.id == v.strip()
-            for c, p in dict(r.previous_rubric_scores).items()
-          )
+        expr: 'len(x) == 3 and set(str(k) for k in x.keys()) == {''clarity'', ''depth'', ''originality''} and [int(x[''clarity'']), int(x[''depth'']), int(x[''originality''])] == [int(s) for s in next(e.split(''='')[1] for e in target[''pending_review_req_scores''].split(''|'') if e.split(''='')[0] == v.strip()).split(''~'')]'
       comments:
-        expr: >-
-          len(x.strip()) >= 40
-          and any(
-            w.lower() in x.lower()
-            for w in ['clarity', 'depth', 'originality']
-          )
-          and any(
-            str(r.reviewee_name).split()[0].lower() in x.lower()
-            for r in initial.peer_reviews
-            if r.id == v.strip() and str(r.reviewee_name).split()
-          )
+        expr: 'len(x.strip()) >= 60 and next(e.split('':'', 1)[1] for e in target[''pending_review_low_crit''].split(''|'') if e.split('':'', 1)[0] == v.strip()).lower() in x.lower() and next(e.split('':'', 1)[1] for e in target[''pending_review_name_tokens''].split(''|'') if e.split('':'', 1)[0] == v.strip()).lower() in x.lower()'
+      status: {eq: submitted}
+  - entity: PeerReview
+    desc: Submit every fresh (never-returned) pending review with three valid scores and an addressed comment naming its lowest-scored criterion
+    bijection:
+      over: '[rid.strip() for rid in target[''pending_review_ids''].split('','') if rid.strip() and rid.strip() not in [r.strip() for r in target[''returned_review_ids''].split('','') if r.strip()]]'
+      variable: v
+    where:
+      id:
+        expr: "x == v.strip()"
+    changes:
+      rubric_scores:
+        expr: 'len(x) == 3 and set(str(k) for k in x.keys()) == {''clarity'', ''depth'', ''originality''} and all(1 <= int(s) <= 5 for s in x.values())'
+      comments:
+        expr: 'len(x.strip()) >= 60 and next(e.split('':'', 1)[1] for e in target[''pending_review_low_crit''].split(''|'') if e.split('':'', 1)[0] == v.strip()).lower() in x.lower() and next(e.split('':'', 1)[1] for e in target[''pending_review_name_tokens''].split(''|'') if e.split('':'', 1)[0] == v.strip()).lower() in x.lower()'
       status: {eq: submitted}
   invariant:
   - collection: state.peer_reviews
@@ -144,8 +156,11 @@ canonical_diff:
       )
     severity: high
   named_invariants:
-  - name: Agent submitted all pending peer reviews with addressed, revision-aware feedback
+  - name: Agent redid all returned reviews with the exact rule-derived corrected scores
     ref: update[0]
+    severity: critical
+  - name: Agent submitted all fresh pending reviews with addressed feedback
+    ref: update[1]
     severity: critical
   - name: Agent did not modify or re-open other peer reviews
     ref: invariant[0]

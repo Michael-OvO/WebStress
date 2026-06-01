@@ -2,17 +2,23 @@ task_id: pp_provider_transition
 env_id: patient_portal
 title: Provider Transition
 instruction_template: 'Establish endocrinology follow-up without using messages. The
-  approved endocrinology referral names a specific endocrinologist as its destination
-  provider. 1) Read the approved endocrinology referral and identify the destination
-  endocrinologist it names (its to_provider_id), 2) Confirm that endocrinologist is
-  accepting new patients, 3) Schedule one appointment with that exact endocrinologist
-  in their single earliest available slot, linking the appointment to the approved
-  endocrinology referral, 4) Use the appointment reason exactly "Endocrinology transfer
-  of care", 5) Because endocrinology visits require confirmation, complete the booking
-  by confirming the new appointment so its confirmation_state becomes "confirmed".
-  Do not cancel, reschedule, or modify any existing appointments; do not book with
-  any other endocrinologist; do not modify any prescriptions, referrals, claims, labs,
-  or immunizations; and do not send any messages.'
+  directory lists several endocrinologists and there is more than one approved
+  endocrinology referral on file; exactly ONE of those approved referrals is the
+  transfer-of-care referral and it names a specific endocrinologist as its destination
+  provider. 1) Read the approved endocrinology referrals and identify the one whose
+  destination endocrinologist (its to_provider_id) is accepting new patients — that
+  is your target provider, 2) Note that another endocrinologist may advertise an
+  earlier open slot but is NOT accepting new patients (closed panel) and must be
+  rejected; the globally-earliest endocrinology slot is a decoy, 3) Schedule one
+  appointment with your target endocrinologist in THAT provider''s single earliest
+  available slot, linking the appointment to the matching approved endocrinology
+  referral (the one that names your target provider), 4) Use the appointment reason
+  exactly "Endocrinology transfer of care", 5) Because endocrinology visits require
+  confirmation, complete the booking by confirming the new appointment so its
+  confirmation_state becomes "confirmed". Do not cancel, reschedule, or modify any
+  existing appointments; do not book with any other endocrinologist; do not modify
+  any prescriptions, referrals, claims, labs, or immunizations; and do not send any
+  messages.'
 difficulty: frontier
 time_limit_seconds: 560
 expected_steps: 34
@@ -46,6 +52,15 @@ seed:
         endocrinology: 3
         cardiology: 2
         dermatology: 2
+      # The FIRST endocrinologist created is closed-panel (accepting_new=False)
+      # and — because min_slot_specialty triggers the strictly-earlier decoy
+      # slot injection — holds the GLOBALLY-earliest endocrinology slot. The
+      # agent must reject the globally-earliest slot (closed panel) and the
+      # referral pins to an ACCEPTING endo, so the earliest VALID slot has to
+      # be re-derived for the specific named-and-accepting provider.
+      non_accepting_provider_specs:
+        endocrinology: 1
+      min_slot_specialty: endocrinology
       must_include:
       - pcp
       - endocrinology
@@ -63,6 +78,16 @@ seed:
       pending_count: 1
       must_have_specialties:
       - endocrinology
+      # The eligible approved endo referral names the FIRST ACCEPTING
+      # endocrinologist (skips the closed-panel decoy). A SECOND approved endo
+      # referral names a DIFFERENT accepting endocrinologist, so the agent must
+      # link the referral whose to_provider_id is the booked provider — picking
+      # the wrong approved referral books/links the wrong endo and fails.
+      pin_must_have_accepting_only: true
+      extra_specialty_referrals:
+      - specialty: endocrinology
+        status: approved
+        accepting_distinct: true
     outputs:
     - approved_ref_ids
     - pending_ref_ids

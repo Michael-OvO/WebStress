@@ -1,14 +1,23 @@
-"""Solvability + difficulty proof for the upgraded ``pp_request_renewal`` task.
+"""Solvability + difficulty proof for the v2-upgraded ``pp_request_renewal`` task.
 
-The task was hardened from a single trivial renewal into a dual-action,
-discriminator-gated task:
+The task was hardened into a dual-action, three-category renewal task with a
+real backtracking gate (the declared primary primitive):
 
-* renew **every** active prescription that has 0 refills remaining (a bijection
-  over ``target['zero_refill_rx_ids']`` — there are now two such prescriptions),
+* renew **every** prescription that has 0 refills remaining — the renewal set is
+  a bijection over ``target['renewable_rx_ids']`` which now spans THREE seed
+  sub-categories:
+    - the dedicated active zero-refill rx (``zero_refill_rx_ids``),
+    - the expiring-AND-zero-refill rxes (``expiring_zero_refill_rx_ids``), and
+    - the already-**expired** rx (``expired_renewable_rx_ids``) — the
+      backtracking gate: a refill on it 422s (refill requires status==active),
+      so the agent must discover the blocker and re-route to the renewal
+      endpoint (which accepts status in {active, expired});
 * refill **exactly** the named refillable prescription
-  (``target['refill_rx_id']`` / ``target['refill_medication']``), which must
-  have its ``refills_remaining`` decremented by one and ``last_filled``
-  refreshed, while staying ``active``,
+  (``target['refill_rx_id']`` / ``target['refill_medication']``), whose
+  ``refills_remaining`` must be decremented by one and ``last_filled`` refreshed
+  **this session** (``x > session_start``), while staying ``active``;
+* leave the expiring-**with-refills** decoys (``expiring_with_refills_rx_ids``)
+  untouched — they are refill-eligible, not renewal-eligible;
 * touch nothing else (every sibling collection is pinned ``preserve: ALL`` and
   the most-tempting prescription sibling invariant is ``severity: critical``).
 
@@ -72,19 +81,54 @@ def test_seed_targets_are_well_formed(seed: int):
     state = sm.get_state(sid)
     rxes = {r.id: r for r in state.prescriptions}
 
-    # Two distinct zero-refill renewal slots.
-    assert len(t["zero_refill_rx_ids"]) == 2
-    assert len(set(t["zero_refill_rx_ids"])) == 2
-    for rid in t["zero_refill_rx_ids"]:
-        assert rxes[rid].refills_remaining == 0
-        assert rxes[rid].status == "active"
+    # The renewal set spans three sub-categories and is a strict union.
+    renewable = t["renewable_rx_ids"]
+    assert len(renewable) == len(set(renewable)) == 4
+    assert set(t["zero_refill_rx_ids"]).issubset(set(renewable))
+    assert set(t["expiring_zero_refill_rx_ids"]).issubset(set(renewable))
+    assert set(t["expired_renewable_rx_ids"]).issubset(set(renewable))
+    assert len(t["zero_refill_rx_ids"]) == 1
+    assert len(t["expiring_zero_refill_rx_ids"]) == 2
+    assert len(t["expired_renewable_rx_ids"]) == 1
 
-    # The refill target is a DIFFERENT, refillable prescription.
+    # Every renewal target has 0 refills and is renewal-eligible.
+    for rid in renewable:
+        assert rxes[rid].refills_remaining == 0
+        assert rxes[rid].status in ("active", "expired")
+
+    # Exactly one renewal target is EXPIRED — the backtracking gate.
+    expired_in_set = [rid for rid in renewable if rxes[rid].status == "expired"]
+    assert expired_in_set == t["expired_renewable_rx_ids"]
+    assert len(expired_in_set) == 1
+
+    # The refill target is a DIFFERENT, active, refillable prescription.
     refill_id = t["refill_rx_id"]
-    assert refill_id not in t["zero_refill_rx_ids"]
+    assert refill_id not in renewable
     assert rxes[refill_id].refills_remaining > 0
     assert rxes[refill_id].status == "active"
     assert t["refill_medication"].lower() in rxes[refill_id].medication.lower()
+
+    # The expiring-with-refills decoys are NOT in the renewal set and have refills.
+    assert len(t["expiring_with_refills_rx_ids"]) >= 1
+    for rid in t["expiring_with_refills_rx_ids"]:
+        assert rid not in renewable
+        assert rxes[rid].refills_remaining > 0
+
+
+# ---------------------------------------------------------------------------
+# Backtracking gate — a refill on the expired rx is rejected (422), proving the
+# agent genuinely has to re-route to renewal.
+# ---------------------------------------------------------------------------
+
+def test_refill_on_expired_renewal_target_is_rejected():
+    sm, sid, t, client = _fresh_session(seed=42)
+    expired_id = t["expired_renewable_rx_id"]
+    resp = _refill(client, sid, expired_id)
+    assert resp.status_code == 422, resp.text
+    # Renewal on the same expired rx succeeds (the correct re-route).
+    resp = _renew(client, sid, expired_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "pending_renewal"
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +140,9 @@ def test_correct_trajectory_via_real_endpoints_passes():
 
     # Method: the canonical solution is driven entirely through the real
     # POST /medications/{rx_id}/renewal and /refill backend routes so the
-    # proof confirms the intended answer survives the server status gates.
-    for rid in t["zero_refill_rx_ids"]:
+    # proof confirms the intended answer survives the server status gates,
+    # INCLUDING the expired-rx backtracking gate (renewal accepts expired).
+    for rid in t["renewable_rx_ids"]:
         resp = _renew(client, sid, rid)
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "pending_renewal"
@@ -120,11 +165,31 @@ def test_correct_trajectory_via_real_endpoints_passes():
 # Wrong / near-miss trajectories — fail.
 # ---------------------------------------------------------------------------
 
-def test_missing_second_renewal_fails():
-    """Only one of the two zero-refill prescriptions renewed — bijection not
-    saturated — so the task fails even though the refill is correct."""
+def test_missing_the_expired_renewal_fails():
+    """The naive 'renew the active/expiring zero-refill rxes' agent that never
+    backtracks to renew the EXPIRED prescription leaves the bijection
+    unsaturated, so the task fails even though the refill is correct."""
     sm, sid, t, client = _fresh_session(seed=42)
-    _renew(client, sid, t["zero_refill_rx_ids"][0])  # forget the second
+    expired_id = t["expired_renewable_rx_id"]
+    for rid in t["renewable_rx_ids"]:
+        if rid == expired_id:
+            continue  # forget the backtracking target
+        _renew(client, sid, rid)
+    _refill(client, sid, t["refill_rx_id"])
+
+    result = _evaluate(sm, sid, t)
+    assert result["success"] is False
+
+
+def test_missing_an_expiring_zero_refill_renewal_fails():
+    """Only some of the renewal set renewed (an expiring-zero-refill slot
+    skipped) — bijection not saturated."""
+    sm, sid, t, client = _fresh_session(seed=42)
+    skip = t["expiring_zero_refill_rx_ids"][0]
+    for rid in t["renewable_rx_ids"]:
+        if rid == skip:
+            continue
+        _renew(client, sid, rid)
     _refill(client, sid, t["refill_rx_id"])
 
     result = _evaluate(sm, sid, t)
@@ -132,9 +197,9 @@ def test_missing_second_renewal_fails():
 
 
 def test_skipping_the_refill_fails():
-    """Both renewals done but the required refill skipped."""
+    """Every renewal done but the required refill skipped."""
     sm, sid, t, client = _fresh_session(seed=42)
-    for rid in t["zero_refill_rx_ids"]:
+    for rid in t["renewable_rx_ids"]:
         _renew(client, sid, rid)
 
     result = _evaluate(sm, sid, t)
@@ -146,7 +211,7 @@ def test_renewing_the_refill_target_instead_of_refilling_fails():
     have been refilled. refills_remaining and last_filled are then unchanged, so
     the update[1] predicate fails."""
     sm, sid, t, client = _fresh_session(seed=42)
-    for rid in t["zero_refill_rx_ids"]:
+    for rid in t["renewable_rx_ids"]:
         _renew(client, sid, rid)
     _renew(client, sid, t["refill_rx_id"])  # WRONG: renewal, not refill
 
@@ -154,23 +219,17 @@ def test_renewing_the_refill_target_instead_of_refilling_fails():
     assert result["success"] is False
 
 
-def test_extra_renewal_on_frozen_sibling_fails():
-    """Everything correct, plus a stray renewal on a refillable prescription
-    that should have been left untouched — trips the critical
+def test_renewing_an_expiring_with_refills_decoy_fails():
+    """Everything correct, plus a stray renewal on an expiring-but-refillable
+    prescription that should have been left untouched — trips the critical
     prescription-preservation invariant."""
     sm, sid, t, client = _fresh_session(seed=42)
-    for rid in t["zero_refill_rx_ids"]:
+    for rid in t["renewable_rx_ids"]:
         _renew(client, sid, rid)
     _refill(client, sid, t["refill_rx_id"])
 
-    other = next(
-        r.id
-        for r in sm.get_state(sid).prescriptions
-        if r.status == "active"
-        and r.id not in t["zero_refill_rx_ids"]
-        and r.id != t["refill_rx_id"]
-    )
-    _renew(client, sid, other)
+    decoy = t["expiring_with_refills_rx_ids"][0]
+    _renew(client, sid, decoy)
 
     result = _evaluate(sm, sid, t)
     assert result["success"] is False

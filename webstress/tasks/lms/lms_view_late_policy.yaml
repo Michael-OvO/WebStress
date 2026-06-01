@@ -5,13 +5,15 @@ instruction_template: 'You have fallen behind in several courses. Review the syl
   late policy (the maximum number of late days allowed) for every course you are enrolled
   in. For each assignment that has not been submitted and is now past its due date,
   decide whether it can still be turned in: it is recoverable only if the number of
-  days it is overdue is within that course''s maximum late days. Submit every recoverable
-  overdue assignment with file "late_submit.pdf". Do NOT submit any overdue assignment
-  whose course no longer allows it (it is past the maximum late days), do NOT re-upload
-  assignments you have already turned in, and do NOT send any messages.'
+  days it is overdue is within (less than or equal to) that course''s maximum late
+  days. An assignment overdue by exactly the maximum is still recoverable; one overdue
+  by even a single day more is not. Submit every recoverable overdue assignment with
+  file "late_submit.pdf". Do NOT submit any overdue assignment whose course no longer
+  allows it (it is past the maximum late days), do NOT re-upload assignments you have
+  already turned in, and do NOT send any messages.'
 difficulty: medium
-time_limit_seconds: 180
-expected_steps: 11
+time_limit_seconds: 240
+expected_steps: 14
 primary_primitives:
 - grounding
 start_path: /courses
@@ -24,7 +26,7 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 4
+      count: 5
       vary_late_policies: true
     outputs:
     - course_ids
@@ -36,15 +38,17 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 6
+      per_course_count: 8
       missing_count: 3
       unrecoverable_missing_count: 2
-      late_within_grace_count: 1
+      late_within_grace_count: 2
+      boundary_missing_count: 5
     outputs:
     - assignment_ids
     - overdue_assignment_id
     - overdue_assignment_title
     - allows_late_submit
+    - decoy_assignment_id
     - missing_assignment_ids
     - recoverable_missing_assignment_ids
     - recoverable_late_assignment_ids
@@ -62,6 +66,7 @@ seed:
     overdue_assignment_id: '{output.overdue_assignment_id}'
     overdue_assignment_title: '{output.overdue_assignment_title}'
     allows_late_submit: '{output.allows_late_submit}'
+    decoy_assignment_id: '{output.decoy_assignment_id}'
     latest_announcement_id: '{output.latest_announcement_id}'
     missing_assignment_ids: '{output.missing_assignment_ids}'
     recoverable_missing_assignment_ids: '{output.recoverable_missing_assignment_ids}'

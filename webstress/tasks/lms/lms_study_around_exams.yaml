@@ -1,17 +1,20 @@
 task_id: lms_study_around_exams
 env_id: lms
 title: Mark Announcements Read for Courses With Upcoming Exams
-instruction_template: Open the calendar and read every exam date. A course counts
-  as having an upcoming exam only when its exam starts within the next 14 days from
-  now. For each course with an upcoming exam in that 14-day window, mark every UNREAD
-  announcement in that course as read so no last-minute exam update is missed. Do
-  NOT mark any announcement as read in a course whose only exam is more than 14 days
-  away or already past. Do NOT mark any announcement that is already read, and do
-  NOT touch announcements in courses without an upcoming exam. Do not send any
-  message.
+instruction_template: Open the calendar and read EVERY exam date for every course.
+  A course counts as having an upcoming exam ONLY when its exam starts within the
+  next 14 days from now (an exam 15 or more days out does NOT count, even if it is
+  the soonest one on the calendar). Several courses have exams clustered right around
+  the 14-day boundary, so check each course's exam date against the cutoff individually
+  rather than assuming the nearest few exams all qualify. For each course with an exam
+  in that 14-day window, mark every UNREAD announcement in that course as read so no
+  last-minute exam update is missed. Do NOT mark any announcement as read in a course
+  whose only exam is more than 14 days away or already past. Do NOT mark any announcement
+  that is already read, and do NOT touch announcements in courses without an upcoming
+  exam. Do not send any message.
 difficulty: hard
-time_limit_seconds: 300
-expected_steps: 16
+time_limit_seconds: 360
+expected_steps: 20
 primary_primitives:
 - state_tracking
 start_path: /calendar
@@ -49,17 +52,24 @@ seed:
   - use: calendar_events
     params:
       include_recurring: true
-      weeks: 4
-      near_exam_courses: 2
+      weeks: 6
+      near_exam_courses: 3
+      boundary_spread: true
+      boundary_out_courses: 2
     outputs:
     - event_ids
     - courses_with_upcoming_exams
     - courses_without_upcoming_exams
+    - first_non_exam_course_id
+    - second_non_exam_course_id
+    - stale_exam_datetime
+    - stale_exam_end_datetime
+    - upcoming_exam_cutoff_date
   - use: announcements_feed
     params:
-      count: 12
-      unread_count: 7
-      urgent_count: 2
+      count: 16
+      unread_count: 10
+      urgent_count: 3
     outputs:
     - announcement_ids
     - unread_announcement_ids
@@ -73,6 +83,11 @@ seed:
     unread_in_exam_courses_ids: '{output.unread_in_exam_courses_ids}'
     unread_in_non_exam_courses_ids: '{output.unread_in_non_exam_courses_ids}'
     unread_in_exam_courses_count: '{output.unread_in_exam_courses_count}'
+    first_non_exam_course_id: '{output.first_non_exam_course_id}'
+    second_non_exam_course_id: '{output.second_non_exam_course_id}'
+    stale_exam_datetime: '{output.stale_exam_datetime}'
+    stale_exam_end_datetime: '{output.stale_exam_end_datetime}'
+    upcoming_exam_cutoff_date: '{output.upcoming_exam_cutoff_date}'
 
 canonical_diff:
   update:
@@ -121,13 +136,19 @@ canonical_diff:
       for a in state.announcements
       if a.id in (target['unread_in_non_exam_courses_ids'].split(',') if target['unread_in_non_exam_courses_ids'] else []))"
     severity: critical
-  - desc: Exactly the unread announcements in exam courses became read
-    expr: "sum(1 for a in state.announcements if a.is_read and not next((b for b in initial.announcements if b.id == a.id), a).is_read) == int(target['unread_in_exam_courses_count'])"
-    severity: high
+  - desc: No announcement was marked read in a course whose only exam falls JUST OUTSIDE the 14-day window (near-boundary decoy courses)
+    expr: "all(a.is_read == next((b for b in initial.announcements if b.id == a.id), a).is_read
+      for a in state.announcements
+      if a.course_id in {target['first_non_exam_course_id'], target['second_non_exam_course_id']})"
+    severity: critical
+  - desc: Exactly the unread announcements in exam courses (no more, no fewer) became read
+    expr: "sorted(a.id for a in state.announcements if a.is_read and not next((b for b in initial.announcements if b.id == a.id), a).is_read)
+      == sorted(i for i in (target['unread_in_exam_courses_ids'].split(',') if target['unread_in_exam_courses_ids'] else []))"
+    severity: critical
   named_invariants:
   - name: Agent marked the exam-course unread announcements as read
     ref: update[0]
-    severity: high
+    severity: critical
   - name: Agent did not mark unread announcements read in courses without an upcoming exam
     ref: invariant[0]
     severity: critical

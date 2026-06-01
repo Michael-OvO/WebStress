@@ -2,21 +2,26 @@ task_id: lms_submit_assignment
 env_id: lms
 title: Catch Up on Recoverable Missing Assignments
 instruction_template: >-
-  You have fallen behind in several courses. Go through every assignment that is
-  currently past its due date, has not been submitted, AND is still inside its
-  course's late-submission window — meaning the number of days the assignment is
-  past due does not exceed that course's maximum allowed late days (shown in each
-  course's syllabus late policy). Submit each one of those assignments. Do NOT
-  submit any past-due assignment whose days-late already exceeds its course's
-  maximum allowed late days, and do NOT submit any assignment that is not yet
-  past due or has already been submitted. For each assignment you submit, upload
-  a file named "catchup_<CODE>.pdf" where <CODE> is the course code that the
-  assignment belongs to (for example, an assignment in a course coded ZZZ999
-  must be submitted with the file name catchup_ZZZ999.pdf). Do not send any
-  messages.
+  You have fallen behind across all of your courses. Go through every single
+  assignment in every course and submit EXACTLY the ones that meet ALL THREE of
+  these conditions: (1) the assignment is currently past its due date, (2) it
+  has not been submitted yet (its status is still "not submitted"), AND (3) it
+  is still inside its course's late-submission window — meaning the number of
+  whole days the assignment is past due does NOT exceed that course's maximum
+  allowed late days (each course's syllabus late policy lists its own maximum,
+  and different courses have different limits). Submit each one of those, and
+  ONLY those. Do NOT submit any past-due assignment whose days-late already
+  exceeds its course's maximum allowed late days. Do NOT submit any assignment
+  that is not yet past due. Do NOT touch any assignment that has already been
+  submitted, graded, or submitted late — even if it was turned in past its due
+  date. For each assignment you submit, upload a file named "catchup_<CODE>.pdf"
+  where <CODE> is the course code of the course THAT ASSIGNMENT belongs to — not
+  the course you happen to be viewing (for example, an assignment in a course
+  coded ZZZ999 must be submitted with the file name catchup_ZZZ999.pdf). Do not
+  send any messages.
 difficulty: medium
-time_limit_seconds: 180
-expected_steps: 11
+time_limit_seconds: 210
+expected_steps: 14
 primary_primitives:
   - grounding
 secondary_primitives:
@@ -32,22 +37,23 @@ seed:
         - student_id
     - use: course_catalog
       params:
-        count: 4
-        must_include: ["CS101", "MATH201"]
+        count: 6
         vary_late_policies: true
       outputs:
         - course_ids
         - course_codes
+        - course_code_2
     - use: enrollment_set
       params: {}
       outputs:
         - enrollment_ids
     - use: assignment_battery
       params:
-        per_course_count: 7
-        missing_count: 4
-        unrecoverable_missing_count: 2
+        per_course_count: 8
+        missing_count: 6
+        unrecoverable_missing_count: 3
         late_count: 1
+        late_within_grace_count: 2
         target_assignment_status: "not_submitted"
       outputs:
         - assignment_ids
@@ -59,14 +65,17 @@ seed:
         - file_name
         - recoverable_missing_assignment_ids
         - unrecoverable_assignment_ids
+        - late_within_grace_ids
   targets:
     assignment_title: '{output.target_assignment_title}'
     course_code: '{output.target_course_code}'
+    course_code_2: '{output.course_code_2}'
     target_assignment_id: '{output.target_assignment_id}'
     decoy_assignment_id: '{output.decoy_assignment_id}'
     file_name: '{output.file_name}'
     recoverable_missing_assignment_ids: '{output.recoverable_missing_assignment_ids}'
     unrecoverable_assignment_ids: '{output.unrecoverable_assignment_ids}'
+    late_within_grace_ids: '{output.late_within_grace_ids}'
 
 canonical_diff:
   update:
@@ -120,14 +129,31 @@ canonical_diff:
         if a.id in (target['unrecoverable_assignment_ids'].split(',') if target['unrecoverable_assignment_ids'] else [])
       )
     severity: critical
+  - desc: Agent did not re-submit any already-late (within-grace) assignment
+    expr: >-
+      all(
+        a.submission_status == 'late'
+        and a.attempt_count == initial.get_assignment(a.id).attempt_count
+        for a in state.assignments
+        if a.id in (target['late_within_grace_ids'].split(',') if target['late_within_grace_ids'] else [])
+      )
+    severity: critical
+  - desc: Every freshly-submitted assignment belongs to the recoverable-missing set
+    expr: >-
+      all(
+        a.id in (target['recoverable_missing_assignment_ids'].split(',') if target['recoverable_missing_assignment_ids'] else [])
+        for a in state.assignments
+        if a.attempt_count > initial.get_assignment(a.id).attempt_count
+      )
+    severity: critical
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
   named_invariants:
     - name: Agent submitted every recoverable missing assignment with the right file
       ref: update[0]
-      severity: high
-    - name: Agent did not submit unrecoverable or already-submitted assignments
+      severity: critical
+    - name: Agent submitted exactly the recoverable set — no decoy, grace, or unrecoverable extras
       ref: invariant[0]
       severity: critical
     - name: Agent did not modify course records

@@ -29,7 +29,7 @@ seed:
     - advisor_name
   - use: course_catalog
     params:
-      count: 5
+      count: 4
       must_include:
       - CS101
       vary_late_policies: true
@@ -45,10 +45,9 @@ seed:
     params:
       per_course_count: 9
       graded_fraction: 0.7
-      late_count: 1
+      late_count: 2
     outputs:
     - assignment_ids
-    - lowest_hw_id
   - use: announcements_feed
     params:
       count: 5
@@ -61,13 +60,25 @@ seed:
   # the GLOBALLY newest, which can live in a non-target course — so it is NOT
   # declared as an output here to avoid a mismatch with the instruction.
   - use: grade_book
-    params: {}
+    params:
+      # v2: deterministically FORCE the demanding "submit" branch. The random
+      # grade distribution almost never produced drop_changes_letter_grounded
+      # == 'true', so both frontier models trivially took the one-click "mark
+      # announcement" branch and the recompute-and-verify weak point was never
+      # exercised. This re-sculpts the target course's homework grades so the
+      # drop genuinely flips the coarse letter (B without-drop -> A with-drop),
+      # with a late penalty on the dropped grade (an un-penalized recompute
+      # reads NO flip and takes the wrong branch) and a live ratio trap (the
+      # dropped homework is lowest by score-to-points RATIO, not lowest raw
+      # earned points). Fully re-derivable from the visible Grades page.
+      force_drop_letter_flip: true
     outputs:
     - grade_ids
     - current_weighted_scores
     - dropped_grade_ids
     - drop_changes_letter
     - drop_changes_letter_grounded
+    - lowest_hw_id
     - lowest_dropped_hw_id
     - latest_announcement_id
   targets:

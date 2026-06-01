@@ -1,15 +1,19 @@
 task_id: lms_three_module_chain
 env_id: lms
 title: Unlock and Complete the Next Prerequisite Chain Segment
-instruction_template: In {target.course_code}, the modules form a prerequisite chain
-  where each module unlocks the next. Starting from the chain module that is currently
-  available, complete the next three modules of that prerequisite chain in order.
-  A module can only be marked done after every one of its content items is completed.
-  Other modules in this course that are not part of the prerequisite chain must be
-  left untouched, and you must not send any messages.
+instruction_template: In {target.course_code}, the modules form a single prerequisite
+  chain where each module unlocks the next via its unlock condition (some links are a
+  plain prerequisite, others require the prior module to be completed with a passing
+  score). Several other "available" modules in this course are NOT part of that chain.
+  Identify the chain by following the unlock links, find the chain module that is
+  currently available, and complete the next three modules of the chain in
+  prerequisite order. A module can only be marked done after every one of its content
+  items is completed. Do not complete any module that is not one of those three
+  (including any other module that merely shows as available), leave all other modules
+  untouched, and do not send any messages.
 difficulty: expert
-time_limit_seconds: 360
-expected_steps: 22
+time_limit_seconds: 420
+expected_steps: 28
 primary_primitives:
 - planning
 start_path: /courses
@@ -36,10 +40,16 @@ seed:
   - use: module_sequence
     params:
       course_id: '{output.target_course_id}'
-      count: 6
-      chain_type: linear
-      completed_count: 1
+      count: 7
+      chain_type: mixed
+      completed_count: 2
+      content_items_per_module: 3
       decoy_count: 3
+      decoy_positions:
+      - 1
+      - 2
+      - 4
+      decoy_title_style: chain
       chain_segment: 3
     outputs:
     - module_ids
@@ -49,15 +59,20 @@ seed:
     - next_chain_module_ids
     - cascade_unlocked_module_id
     - decoy_module_ids
+    - completed_module_ids
+    - last_completed_module_id
   targets:
     course_code: '{output.course_code}'
     target_course_id: '{output.target_course_id}'
     module_ids: '{output.module_ids}'
     next_available_module_id: '{output.next_available_module_id}'
+    first_locked_module_id: '{output.first_locked_module_id}'
     chain_module_ids: '{output.chain_module_ids}'
     next_chain_module_ids: '{output.next_chain_module_ids}'
     cascade_unlocked_module_id: '{output.cascade_unlocked_module_id}'
     decoy_module_ids: '{output.decoy_module_ids}'
+    completed_module_ids: '{output.completed_module_ids}'
+    last_completed_module_id: '{output.last_completed_module_id}'
 canonical_diff:
   update:
     - entity: Module
@@ -77,9 +92,15 @@ canonical_diff:
         status:
           eq: completed
         unlock_condition:
-          # Real chain modules (after the first) gate on "prerequisite"; the
-          # off-chain decoys gate on "none". This pins the agent to the chain.
-          eq: prerequisite
+          # Mixed chain: real chain modules (after the first) gate on a
+          # HETEROGENEOUS mix of "prerequisite" and "min_score" conditions,
+          # while the off-chain decoys gate on "none". Membership over the two
+          # real chain gate types (not a single eq) is what pins the agent to
+          # the chain: it must recognise a min_score-gated module as part of the
+          # SAME chain even though its unlock_condition string differs.
+          in:
+          - prerequisite
+          - min_score
         content_items:
           expr: "all(item.get('completed') is True for item in x)"
   invariant:
@@ -120,8 +141,17 @@ canonical_diff:
   - desc: Agent did not complete any off-chain decoy module
     expr: "all(m.status != 'completed' for m in state.modules if m.id in target['decoy_module_ids'].split(','))"
     severity: critical
-  - desc: Agent did not over-complete the chain beyond the requested three modules
-    expr: "len([m for m in state.modules if m.status == 'completed']) == 1 + len(target['next_chain_module_ids'].split(','))"
+  - desc: Agent completed exactly the seeded-completed modules plus the requested three (no over- or under-completion)
+    expr: "len([m for m in state.modules if m.status == 'completed']) == len([m for m in initial.modules if m.status == 'completed']) + len(target['next_chain_module_ids'].split(','))"
+    severity: high
+  - desc: The completed set is exactly the seeded-completed modules union the requested chain segment (no off-chain or out-of-segment module was completed)
+    expr: "set(m.id for m in state.modules if m.status == 'completed') == set(m.id for m in initial.modules if m.status == 'completed') | set(target['next_chain_module_ids'].split(','))"
+    severity: critical
+  - desc: The first segment module the agent completed was the currently-available chain module (segment start), not a decoy or a later module
+    expr: "target['next_chain_module_ids'].split(',')[0] == target['next_available_module_id'] and next((m for m in initial.modules if m.id == target['next_available_module_id']), None) is not None and next(m for m in initial.modules if m.id == target['next_available_module_id']).status == 'available'"
+    severity: high
+  - desc: Each newly completed chain module gates only on a prior chain module (heterogeneous prerequisite/min_score chain followed in order, never an off-chain decoy)
+    expr: "all(all(spec.split(':')[0] in (target['chain_module_ids'].split(',')) for spec in m.unlock_value) for m in state.modules if m.id in target['next_chain_module_ids'].split(',') and m.unlock_condition in ('prerequisite', 'min_score'))"
     severity: high
   named_invariants:
     - name: Agent completed the next three prerequisite-chain modules

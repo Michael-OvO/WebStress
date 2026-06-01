@@ -1,8 +1,16 @@
-"""Solvability + near-miss proof for the hardened lms_peer_review_cycle task.
+"""Solvability + near-miss proof for the hardened (v2) lms_peer_review_cycle task.
 
 Drives the CORRECT solution through the REAL backend endpoint handler
 (``submit_peer_review``) using a real ``SessionManager`` instance, then evaluates
 via the canonical_diff evaluator. Also asserts several near-miss trajectories fail.
+
+The v2 base partitions the pending set into a RETURNED subset (which must receive
+the EXACT rule-derived corrected scores: previous + 2 capped at 5, else 3) and a
+FRESH subset (any valid 1-5). Each comment must be >= 60 chars, address the
+reviewee by first name, AND name the criterion that received that review's LOWEST
+corrected score. These are precomputed per-review and exposed as seed targets:
+``pending_review_req_scores`` (rid=clarity~depth~originality), ``pending_review_low_crit``
+(rid:criterion) and ``pending_review_name_tokens`` (rid:first_name).
 
 Method note: the correct path calls the route handler ``submit_peer_review`` directly
 (passing the same SessionManager the session was created on). This is the real
@@ -34,20 +42,42 @@ def _pending_ids(targets: dict) -> list[str]:
     return [r.strip() for r in targets["pending_review_ids"].split(",") if r.strip()]
 
 
-def _correct_scores_for(review) -> dict[str, int]:
-    """All three criteria 1-5; for each previously-scored criterion choose a
-    strictly-higher value than the prior score (re-derived from prior feedback)."""
-    scores = {"clarity": 4, "depth": 4, "originality": 4}
-    for crit, prev in dict(review.previous_rubric_scores).items():
-        scores[crit] = min(5, int(prev) + 1)
-    return scores
+def _req_scores(targets: dict) -> dict[str, list[int]]:
+    out: dict[str, list[int]] = {}
+    for entry in targets["pending_review_req_scores"].split("|"):
+        rid, vec = entry.split("=")
+        out[rid] = [int(s) for s in vec.split("~")]
+    return out
 
 
-def _correct_comment_for(review) -> str:
-    first_name = str(review.reviewee_name).split()[0]
+def _low_crit(targets: dict) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for entry in targets["pending_review_low_crit"].split("|"):
+        rid, crit = entry.split(":", 1)
+        out[rid] = crit
+    return out
+
+
+def _name_tokens(targets: dict) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for entry in targets["pending_review_name_tokens"].split("|"):
+        rid, name = entry.split(":", 1)
+        out[rid] = name
+    return out
+
+
+def _correct_scores_for(rid: str, targets: dict) -> dict[str, int]:
+    """The EXACT rule-derived corrected scores for the given review id."""
+    c, d, o = _req_scores(targets)[rid]
+    return {"clarity": c, "depth": d, "originality": o}
+
+
+def _correct_comment_for(rid: str, targets: dict) -> str:
+    first_name = _name_tokens(targets)[rid]
+    crit = _low_crit(targets)[rid]
     return (
-        f"{first_name}, your clarity and depth are strong; tighten the "
-        f"originality of the conclusion to lift the overall argument."
+        f"{first_name}, the {crit} dimension is the weakest part of this submission "
+        f"and needs the most improvement to lift the overall quality of the argument."
     )
 
 
@@ -72,16 +102,21 @@ def _evaluate(state, targets):
 def test_correct_trajectory_passes():
     sm, sid, targets, state = _make_session()
     pending = _pending_ids(targets)
-    assert len(pending) >= 3, f"expected a non-trivial pending set, got {pending}"
+    assert len(pending) >= 4, f"expected a non-trivial pending set, got {pending}"
 
-    # Sanity: at least one returned-for-revision review carries prior scores.
-    returned = [r for r in state.peer_reviews if r.id in pending and r.previous_rubric_scores]
-    assert returned, "expected >=1 returned review with previous_rubric_scores"
+    # Sanity: there are >=2 returned-for-revision reviews carrying DISTINCT prior
+    # scores (so they demand DIFFERENT exact corrected vectors — no uniform vector
+    # passes both). This is the v2 discriminator.
+    returned = sorted(r.strip() for r in targets["returned_review_ids"].split(",") if r.strip())
+    assert len(returned) >= 2, f"expected >=2 returned reviews, got {returned}"
+    req = _req_scores(targets)
+    assert req[returned[0]] != req[returned[1]], (
+        f"returned reviews should demand distinct exact vectors, got {req[returned[0]]} "
+        f"and {req[returned[1]]}"
+    )
 
-    by_id = {r.id: r for r in state.peer_reviews}
     for rid in pending:
-        review = by_id[rid]
-        _submit(sm, sid, rid, _correct_scores_for(review), _correct_comment_for(review))
+        _submit(sm, sid, rid, _correct_scores_for(rid, targets), _correct_comment_for(rid, targets))
 
     result = _evaluate(state, targets)
     assert result.get("success") is True, f"reasoning:\n{result.get('reasoning')}"
@@ -91,75 +126,119 @@ def test_correct_trajectory_passes():
 
 
 # ---------------------------------------------------------------------------
-# Near-miss A: ignores prior feedback (does not raise above previous scores)
+# Near-miss A: the old "all 5s" shortcut (was the v1 exploit) now fails
 # ---------------------------------------------------------------------------
 
-def test_wrong_ignores_prior_feedback_fails():
+def test_wrong_all_fives_shortcut_fails():
     sm, sid, targets, state = _make_session()
     pending = _pending_ids(targets)
-    by_id = {r.id: r for r in state.peer_reviews}
     for rid in pending:
-        review = by_id[rid]
-        # All three criteria present and in-range, but for returned reviews we
-        # re-use the previous (too-low) scores instead of raising them.
-        scores = {"clarity": 4, "depth": 4, "originality": 4}
-        for crit, prev in dict(review.previous_rubric_scores).items():
-            scores[crit] = int(prev)  # NOT strictly higher
-        _submit(sm, sid, rid, scores, _correct_comment_for(review))
+        # Uniform max vector. Strictly-higher than any previous score, but NOT the
+        # exact rule-derived value for the returned reviews -> must fail update[0].
+        _submit(sm, sid, rid, {"clarity": 5, "depth": 5, "originality": 5}, _correct_comment_for(rid, targets))
 
     result = _evaluate(state, targets)
     assert result.get("success") is False, f"reasoning:\n{result.get('reasoning')}"
 
 
 # ---------------------------------------------------------------------------
-# Near-miss B: generic comment not addressed to the reviewee
+# Near-miss B: off-by-one exact scores (applied +1 instead of +2) fails
+# ---------------------------------------------------------------------------
+
+def test_wrong_off_by_one_exact_scores_fails():
+    sm, sid, targets, state = _make_session()
+    pending = _pending_ids(targets)
+    for rid in pending:
+        scores = _correct_scores_for(rid, targets)
+        scores["clarity"] = max(1, scores["clarity"] - 1)  # one point too low
+        _submit(sm, sid, rid, scores, _correct_comment_for(rid, targets))
+
+    result = _evaluate(state, targets)
+    assert result.get("success") is False, f"reasoning:\n{result.get('reasoning')}"
+
+
+# ---------------------------------------------------------------------------
+# Near-miss C: comment names the WRONG (non-lowest) criterion -> fails
+# ---------------------------------------------------------------------------
+
+def test_wrong_comment_names_wrong_criterion_fails():
+    sm, sid, targets, state = _make_session()
+    pending = _pending_ids(targets)
+    low = _low_crit(targets)
+    name = _name_tokens(targets)
+    for rid in pending:
+        # Always blame "clarity"; for reviews whose true lowest criterion is NOT
+        # clarity (the returned ones), this names the wrong criterion.
+        wrong = "originality" if low[rid] == "clarity" else "clarity"
+        comment = (
+            f"{name[rid]}, the {wrong} dimension is the weakest part of this work "
+            f"and needs the most improvement to lift the overall quality here."
+        )
+        _submit(sm, sid, rid, _correct_scores_for(rid, targets), comment)
+
+    result = _evaluate(state, targets)
+    assert result.get("success") is False, f"reasoning:\n{result.get('reasoning')}"
+
+
+# ---------------------------------------------------------------------------
+# Near-miss D: generic comment not addressed to the reviewee
 # ---------------------------------------------------------------------------
 
 def test_wrong_generic_comment_fails():
     sm, sid, targets, state = _make_session()
     pending = _pending_ids(targets)
-    by_id = {r.id: r for r in state.peer_reviews}
     generic = (
-        "Good clarity overall; please expand the depth of the analysis "
-        "and add more originality in the conclusion section."
+        "Good clarity overall; please expand the depth of the analysis and add more "
+        "originality in the conclusion section to strengthen the overall argument here."
     )
     for rid in pending:
-        review = by_id[rid]
-        _submit(sm, sid, rid, _correct_scores_for(review), generic)
+        _submit(sm, sid, rid, _correct_scores_for(rid, targets), generic)
 
     result = _evaluate(state, targets)
     assert result.get("success") is False, f"reasoning:\n{result.get('reasoning')}"
 
 
 # ---------------------------------------------------------------------------
-# Near-miss C: missing a criterion (only two rubric scores)
+# Near-miss E: comment too short (< 60 chars)
+# ---------------------------------------------------------------------------
+
+def test_wrong_short_comment_fails():
+    sm, sid, targets, state = _make_session()
+    pending = _pending_ids(targets)
+    low = _low_crit(targets)
+    name = _name_tokens(targets)
+    for rid in pending:
+        _submit(sm, sid, rid, _correct_scores_for(rid, targets), f"{name[rid]} {low[rid]} weak.")
+
+    result = _evaluate(state, targets)
+    assert result.get("success") is False, f"reasoning:\n{result.get('reasoning')}"
+
+
+# ---------------------------------------------------------------------------
+# Near-miss F: missing a criterion (only two rubric scores)
 # ---------------------------------------------------------------------------
 
 def test_wrong_missing_criterion_fails():
     sm, sid, targets, state = _make_session()
     pending = _pending_ids(targets)
-    by_id = {r.id: r for r in state.peer_reviews}
     for rid in pending:
-        review = by_id[rid]
-        scores = _correct_scores_for(review)
+        scores = _correct_scores_for(rid, targets)
         scores.pop("originality", None)  # drop a criterion
-        _submit(sm, sid, rid, scores, _correct_comment_for(review))
+        _submit(sm, sid, rid, scores, _correct_comment_for(rid, targets))
 
     result = _evaluate(state, targets)
     assert result.get("success") is False, f"reasoning:\n{result.get('reasoning')}"
 
 
 # ---------------------------------------------------------------------------
-# Near-miss D: leaves one pending review unsubmitted
+# Near-miss G: leaves one pending review unsubmitted
 # ---------------------------------------------------------------------------
 
 def test_wrong_incomplete_fails():
     sm, sid, targets, state = _make_session()
     pending = _pending_ids(targets)
-    by_id = {r.id: r for r in state.peer_reviews}
     for rid in pending[:-1]:  # skip the last pending review
-        review = by_id[rid]
-        _submit(sm, sid, rid, _correct_scores_for(review), _correct_comment_for(review))
+        _submit(sm, sid, rid, _correct_scores_for(rid, targets), _correct_comment_for(rid, targets))
 
     result = _evaluate(state, targets)
     assert result.get("success") is False, f"reasoning:\n{result.get('reasoning')}"

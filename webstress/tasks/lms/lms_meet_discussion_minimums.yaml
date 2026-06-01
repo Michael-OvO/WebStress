@@ -2,16 +2,18 @@ task_id: lms_meet_discussion_minimums
 env_id: lms
 title: Meet Discussion Post and Reply Minimums
 instruction_template: In the discussion "{target.discussion_title}" for {target.course_code},
-  meet the minimum participation requirements. Open the discussion and read its stated
-  minimum number of top-level posts and minimum number of replies. Author exactly that
-  many new top-level posts, then post that many replies, with each reply attached to a
-  different existing classmate post. Do not edit any existing post, do not post in any
-  other discussion, and do not send any messages.
+  meet that discussion's own stated participation requirements. Open the discussion and
+  read ITS stated minimum number of top-level posts and minimum number of replies (other
+  discussions have different minimums, so do not assume they match). Author exactly the
+  stated number of new top-level posts, then post exactly the stated number of replies,
+  with each reply attached to a different existing classmate post. Every post and reply
+  you write must contain a substantive body (at least 20 characters). Do not edit any
+  existing post, do not post in any other discussion, and do not send any messages.
 difficulty: hard
 time_limit_seconds: 300
-expected_steps: 16
+expected_steps: 18
 primary_primitives:
-- patience
+- state_tracking
 start_path: /courses
 seed:
   distractors: 1
@@ -33,9 +35,11 @@ seed:
   - use: discussion_forums
     params:
       count: 4
-      posts_per: 5
-      target_min_posts: 2
+      posts_per: 7
+      target_min_posts: 3
       target_min_replies: 2
+      min_posts: 1
+      min_replies: 3
     outputs:
     - discussion_ids
     - target_discussion_id
@@ -66,7 +70,7 @@ canonical_diff:
           expr: "x == state.student.name"
         body:
           length:
-            expr: "x >= 1"
+            expr: "x >= 20"
         parent_post_id:
           eq: null
         timestamp:
@@ -86,7 +90,27 @@ canonical_diff:
           expr: "x == state.student.name"
         body:
           length:
-            expr: "x >= 1"
+            expr: "x >= 20"
+        parent_post_id:
+          eq: null
+        timestamp:
+          expr: "x >= session_start"
+        updated_at:
+          eq: null
+        is_anonymous:
+          eq: false
+    - entity: DiscussionPost
+      desc: Create the third new top-level post in the target discussion
+      properties:
+        discussion_id:
+          expr: "x == target['target_discussion_id']"
+        author_id:
+          expr: "x == state.student.id"
+        author_name:
+          expr: "x == state.student.name"
+        body:
+          length:
+            expr: "x >= 20"
         parent_post_id:
           eq: null
         timestamp:
@@ -109,7 +133,7 @@ canonical_diff:
           expr: "x == state.student.name"
         body:
           length:
-            expr: "x >= 1"
+            expr: "x >= 20"
         parent_post_id:
           expr: "x == v"
         timestamp:
@@ -168,6 +192,12 @@ canonical_diff:
     severity: high
   - desc: Each new reply attaches to a distinct existing classmate post
     expr: "len({p.parent_post_id for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.parent_post_id is not None}) == int(target['target_min_replies'])"
+    severity: critical
+  - desc: New replies cover exactly the required distinct classmate parents (no duplicate, no off-target parent)
+    expr: "{p.parent_post_id for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.parent_post_id is not None} == {pid.strip() for pid in target['reply_parent_post_ids'].split(',') if pid.strip()}"
+    severity: critical
+  - desc: Every new post and reply the student authored in the target discussion has a substantive body
+    expr: "all(len(p.body.strip()) >= 20 for p in state.discussion_posts if p.discussion_id == target['target_discussion_id'] and p.author_id == state.student.id and p.timestamp >= session_start)"
     severity: high
   named_invariants:
     - name: Agent did not post in non-target discussions

@@ -5,15 +5,18 @@ instruction_template: "Perform a complete account audit. (1) Mark every unread a
   in your feed as read — leave no unread announcement behind. (2) Clear every
   pending peer review obligation: for each peer review still in 'assigned' or 'in_progress'
   state, score all three rubric criteria (clarity, depth, originality) with a value
-  from 1 to 5 and write reviewer comments of at least 50 characters, then submit it.
-  (3) Send a single audit summary message to your advisor ({target.advisor_name}):
-  the subject line must state the exact number of announcements you marked as read,
-  and the body must be at least 60 characters describing the audit. Do not modify grades,
-  enrollments, assignments, modules, discussions, calendar events, or any already-read
-  announcement, and do not touch any peer review that was already submitted."
+  from 1 to 5 — and do NOT give every criterion the identical score (the three scores
+  must not be all the same) — and write reviewer comments of at least 80 characters,
+  then submit it. (3) Send a single audit summary message to your advisor
+  ({target.advisor_name}): the subject line must state BOTH the exact number of
+  announcements you marked as read AND the exact number of peer reviews you submitted
+  (both integers must appear in the subject), and the body must be at least 60
+  characters describing the audit. Do not modify grades, enrollments, assignments,
+  modules, discussions, calendar events, or any already-read announcement, and do not
+  touch any peer review that was already submitted."
 difficulty: frontier
 time_limit_seconds: 600
-expected_steps: 48
+expected_steps: 58
 primary_primitives:
 - patience
 start_path: /dashboard
@@ -65,7 +68,7 @@ seed:
     - discussion_ids
   - use: peer_review_assignments
     params:
-      count: 6
+      count: 8
       statuses:
       - assigned
       - in_progress
@@ -73,15 +76,19 @@ seed:
       - assigned
       - in_progress
       - submitted
+      - assigned
+      - in_progress
     outputs:
     - review_ids
     - pending_review_ids
     - completed_review_ids
     - peer_review_assignment_ids
+    - pending_review_count
   - use: announcements_feed
     params:
-      count: 12
-      unread_count: 6
+      count: 20
+      unread_count: 10
+      urgent_count: 2
     outputs:
     - announcement_ids
     - unread_announcement_ids
@@ -90,6 +97,7 @@ seed:
     course_codes: '{output.course_codes}'
     course_ids: '{output.course_ids}'
     pending_review_ids: '{output.pending_review_ids}'
+    pending_review_count: '{output.pending_review_count}'
     completed_review_ids: '{output.completed_review_ids}'
     peer_review_assignment_ids: '{output.peer_review_assignment_ids}'
     module_ids: '{output.module_ids}'
@@ -121,8 +129,9 @@ canonical_diff:
           len(x) == 3
           and set(x) == {'clarity', 'depth', 'originality'}
           and all(1 <= score <= 5 for score in x.values())
+          and len(set(x.values())) >= 2
       comments:
-        expr: "len(x.strip()) >= 50"
+        expr: "len(x.strip()) >= 80"
       status:
         eq: submitted
   invariant:
@@ -155,11 +164,12 @@ canonical_diff:
   - collection: state.student
     preserve: ALL
   constraints:
-  - desc: Agent sent an audit summary to the advisor whose subject states the exact unread count it cleared
+  - desc: Agent sent an audit summary to the advisor whose subject states BOTH the exact unread count it cleared and the exact number of peer reviews it submitted
     expr: >-
       any(
         target['advisor_name'] in (m.get('to', '') or '')
         and str(len([aid for aid in target['unread_announcement_ids'].split(',') if aid.strip()])) in (m.get('subject', '') or '')
+        and str(len([rid for rid in target['pending_review_ids'].split(',') if rid.strip()])) in (m.get('subject', '') or '')
         and len((m.get('body', '') or '').strip()) >= 60
         for m in state.sent_messages
       )

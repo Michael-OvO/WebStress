@@ -10,15 +10,18 @@ instruction_template: 'Your insurance has changed to a new plan named "Aetna PPO
   and prefixing them with "GRP-AET-" (for example GRP-12345 becomes GRP-AET-12345).
   Leave copay and deductible unchanged. 2) Set the mail-order pharmacy already in your
   pharmacy list as the default pharmacy. 3) Read the formulary coverage message from
-  the pharmacy benefits team. The new plan covers maintenance medications only through
-  mail order: transfer every active prescription whose medication is listed as a
-  maintenance medication to the mail-order pharmacy. 4) Leave every other active
-  prescription at your current default retail pharmacy. Do not send any messages, do
-  not cancel appointments, do not discontinue any medications, and do not refill or
-  renew any prescription.'
+  the pharmacy benefits team. It describes the coverage for EACH of your active
+  medications individually. Transfer to the mail-order pharmacy ONLY the active
+  prescriptions whose coverage line says the medication must be filled through the
+  plan mail service / home-delivery pharmacy. 4) Leave every other active prescription
+  at your current default retail pharmacy, including any medication whose line merely
+  mentions that a 90-day supply is available or that it will move to mail service in a
+  future quarter — those stay at retail for now. Do not send any messages, do not
+  cancel appointments, do not discontinue any medications, and do not refill or renew
+  any prescription.'
 difficulty: frontier
 time_limit_seconds: 600
-expected_steps: 58
+expected_steps: 64
 primary_primitives:
 - backtracking
 start_path: /
@@ -62,7 +65,11 @@ seed:
     - mail_order_pharmacy_id
   - use: prescription_cabinet
     params:
-      active_count: 5
+      # 7 active rxes (3 maintenance pinned to the front, 4 non-maintenance
+      # retail distractors) so the agent must reconcile a longer medication
+      # list against the (deliberately non-verbatim) coverage message rather
+      # than string-matching the word "maintenance".
+      active_count: 7
       expired_count: 1
       # Force every active rx to the default (retail) pharmacy so the
       # maintenance subset is a real state change (default -> mail order)
@@ -70,7 +77,7 @@ seed:
       active_at_default_only: true
       # Formulary partition: these three maintenance medications are pinned
       # into the active set and route to mail order under the new plan; the
-      # remaining two active rxes are NOT maintenance meds and stay at retail.
+      # remaining active rxes are NOT maintenance meds and stay at retail.
       maintenance_medications:
       - Lisinopril
       - Atorvastatin
@@ -86,20 +93,25 @@ seed:
       unread_count: 1
       categories:
       - clinical
-      # The carrier message lists each active medication's coverage so the
-      # agent can identify which rxes are maintenance (mail-order) meds. The
-      # three maintenance meds are marked "not covered" at retail (their
-      # preferred channel is mail order); the rest are "covered" at retail.
+      # The carrier message lists every active medication's coverage. The
+      # three maintenance meds are described with DISTINCT, non-verbatim
+      # phrasings that each mean "must be filled through mail service" (no
+      # literal "maintenance" / "mail-order only" tag to string-match). Every
+      # other active med inherits `coverage_status` below — a DISTRACTOR line
+      # that dangles "90-day supply available" (tempting toward mail order)
+      # yet explicitly keeps the med at the current retail pharmacy. The agent
+      # must reconcile each med's phrasing against the structured cabinet
+      # rather than pattern-matching a single keyword.
       body_context:
         type: formulary_info
         category: clinical
         subject: Formulary Coverage Update for New Plan
         include_all_active: true
         coverage_status_by_medication:
-          Lisinopril 10mg: mail-order only (90-day maintenance)
-          Atorvastatin 20mg: mail-order only (90-day maintenance)
-          Levothyroxine 75mcg: mail-order only (90-day maintenance)
-        coverage_status: covered at retail
+          Lisinopril 10mg: Tier 1 preferred; 90-day fill required through the plan mail service
+          Atorvastatin 20mg: maintenance class M - dispense via mail service only
+          Levothyroxine 75mcg: retail fill not covered; route to the plan home-delivery pharmacy
+        coverage_status: 90-day supply available and scheduled to move to mail service next quarter (effective 2026-01-01); for now no pharmacy change is required - continue filling at your current retail pharmacy
         preferred_pharmacy: Express Scripts Mail Order
     outputs:
     - thread_ids
@@ -145,9 +157,9 @@ canonical_diff:
         fields:
           plan_name: { eq: "Aetna PPO Silver" }
           member_id:
-            expr: "x == 'AET-' + initial.patient.insurance_plan.member_id.split('-')[1]"
+            expr: "x == 'AET-' + initial.patient.insurance_plan.member_id.split('-')[1] and len(initial.patient.insurance_plan.member_id.split('-')[1]) == 7"
           group_number:
-            expr: "x == 'GRP-AET-' + initial.patient.insurance_plan.group_number.split('-')[1]"
+            expr: "x == 'GRP-AET-' + initial.patient.insurance_plan.group_number.split('-')[1] and len(initial.patient.insurance_plan.group_number.split('-')[1]) == 5"
           copay:
             expr: "float(x) == float(initial.patient.insurance_plan.copay)"
           deductible:

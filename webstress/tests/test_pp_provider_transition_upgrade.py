@@ -1,15 +1,18 @@
 """Solvability proof for the hardened pp_provider_transition (frontier tier).
 
 The upgraded task requires the agent to:
-  1. Read the approved endocrinology referral and identify the SPECIFIC
-     endocrinologist it names as its destination provider (to_provider_id) —
-     not just "any endocrinologist accepting new patients". The seed now
-     contains THREE endocrinologists, and the referral's named provider is
-     frequently NOT the one with the globally-earliest slot, so a naive
-     "earliest endo slot overall" strategy fails.
-  2. Confirm that provider is accepting new patients.
-  3. Book that exact provider's single earliest available slot, linked to the
-     approved referral, with the exact reason string.
+  1. Read the approved endocrinology referrals (there are now TWO approved endo
+     referrals, each naming a DIFFERENT accepting endocrinologist) and identify
+     the SPECIFIC endocrinologist named as the transfer-of-care referral's
+     destination provider (to_provider_id) — not just "any endocrinologist".
+     Linking the OTHER approved endo referral books/links the wrong provider.
+  2. Reject the closed-panel endocrinologist. The seed now contains THREE
+     endocrinologists; the FIRST is accepting_new=False AND holds the
+     GLOBALLY-EARLIEST endocrinology slot (a deliberately-injected decoy slot
+     one hour before the earliest accepting slot). A naive "earliest endo slot
+     overall" strategy books the closed-panel provider and fails.
+  3. Book the target accepting provider's single earliest available slot, linked
+     to the matching approved referral, with the exact reason string.
   4. Complete the two-step workflow: because endocrinology visits require
      confirmation, the new appointment must be CONFIRMED
      (confirmation_state == "confirmed").
@@ -81,10 +84,40 @@ def test_correct_trajectory_passes_via_endpoints():
     referral_id = targets["approved_ref_ids"][0]
     slot_iso = _earliest_slot_for(state, target_prov)
 
-    # Sanity: the referral's named provider is one of the three endos and is
-    # accepting new patients, and the pinned slot matches its earliest slot.
+    # Sanity: the referral's named provider is one of the endos and is accepting
+    # new patients, and the pinned slot matches its earliest slot.
     assert target_prov in targets["endo_provider_ids"]
     assert slot_iso == targets["referral_target_slot"]
+    tprov = next(p for p in state.providers if p.id == target_prov)
+    assert tprov.accepting_new is True
+
+    # Trap structure: there is a CLOSED-PANEL endo holding the globally-earliest
+    # endo slot, and a SECOND approved endo referral naming a DIFFERENT accepting
+    # endo. Both make the naive strategies wrong.
+    endos = [p for p in state.providers if p.specialty == "endocrinology"]
+    closed = [p for p in endos if not p.accepting_new]
+    assert closed, "expected a closed-panel endocrinologist decoy"
+    all_endo_slots = sorted(
+        (s.datetime.isoformat(), p.id) for p in endos for s in p.available_slots
+    )
+    global_earliest_provider = all_endo_slots[0][1]
+    assert global_earliest_provider != target_prov, (
+        "globally-earliest endo slot must belong to a non-target (decoy) provider"
+    )
+    assert not next(
+        p for p in endos if p.id == global_earliest_provider
+    ).accepting_new, "the globally-earliest endo slot must be the closed-panel decoy"
+    approved_endo_refs = [
+        r for r in state.referrals
+        if r.to_specialty == "endocrinology" and r.status == "approved"
+    ]
+    assert len(approved_endo_refs) >= 2, "expected >=2 approved endo referrals"
+    assert len({r.to_provider_id for r in approved_endo_refs}) >= 2, (
+        "the approved endo referrals must name DIFFERENT providers"
+    )
+    # The canonical referral is the one whose to_provider_id is the target.
+    matching = [r for r in approved_endo_refs if r.to_provider_id == target_prov]
+    assert len(matching) == 1 and matching[0].id == referral_id
 
     with TestClient(app) as client:
         _book_via_endpoints(
@@ -133,6 +166,42 @@ def test_wrong_provider_globally_earliest_endo_fails():
         trajectory=[],
     )
     assert result.get("success") is False, f"wrong provider should fail: {result}"
+
+
+def test_wrong_approved_referral_linked_fails():
+    """Booking the CORRECT target provider's earliest slot but linking the OTHER
+    approved endo referral (the decoy naming a different accepting endo) must
+    fail the linked_referral_id discriminator."""
+    sm, sid, targets = _setup()
+    state = sm.get_state(sid)
+
+    target_prov = targets["referral_target_provider_id"]
+    slot_iso = _earliest_slot_for(state, target_prov)
+
+    approved_endo_refs = [
+        r for r in state.referrals
+        if r.to_specialty == "endocrinology" and r.status == "approved"
+    ]
+    # The decoy referral is the approved endo referral whose to_provider_id is
+    # NOT the target provider.
+    decoy_refs = [r for r in approved_endo_refs if r.to_provider_id != target_prov]
+    assert decoy_refs, "seed must have a competing approved endo referral"
+    decoy_ref_id = decoy_refs[0].id
+
+    with TestClient(app) as client:
+        _book_via_endpoints(
+            client, sid, target_prov, slot_iso, decoy_ref_id, confirm=True,
+        )
+
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=sm.get_state(sid),
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert result.get("success") is False, (
+        f"linking the wrong approved referral should fail: {result}"
+    )
 
 
 def test_unconfirmed_appointment_fails():

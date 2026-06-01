@@ -4,12 +4,16 @@ title: Complete Referral-to-Schedule Chain
 instruction_template: 'Review your existing referrals. Exactly one approved referral
   is schedulable right now: its status is approved and, where pre-authorization is
   required, the pre-authorization status is approved. Other approved referrals are
-  blocked because their required pre-authorization is still pending. In the schedulable
-  referral''s specialty, schedule one appointment with a provider who is accepting
-  new patients, choosing the earliest available slot offered by an accepting provider
-  in that specialty, and link the new appointment to the schedulable referral. Do
-  not book the closed-panel (not accepting) provider even if it offers an earlier
-  slot.'
+  blocked because their required pre-authorization is still pending — including one
+  in the very same specialty as the schedulable referral, so do not pattern-match on
+  specialty alone; you must check each candidate''s pre-authorization status and link
+  only the referral whose pre-auth is approved. In the schedulable referral''s specialty,
+  schedule one appointment with a provider who is accepting new patients, choosing the
+  earliest available slot offered by an accepting provider in that specialty, and link
+  the new appointment to the schedulable referral. Do not book any closed-panel (not
+  accepting) provider even if it offers an earlier slot. Finally, complete the
+  confirmation step so the appointment shows as confirmed — booking alone leaves it
+  pending and is not sufficient.'
 difficulty: hard
 time_limit_seconds: 360
 expected_steps: 22
@@ -45,9 +49,9 @@ seed:
       - pcp
       - dermatology
       count_per_specialty:
-        dermatology: 3
+        dermatology: 4
       non_accepting_provider_specs:
-        dermatology: 1
+        dermatology: 2
       min_slot_specialty: dermatology
     outputs:
     - provider_ids
@@ -68,6 +72,11 @@ seed:
       pending_preauth_count: 2
       must_have_specialties:
       - dermatology
+      extra_specialty_referrals:
+      - specialty: dermatology
+        status: approved
+        prior_auth: true
+        prior_auth_status: pending
     outputs:
     - approved_ref_ids
     - pending_ref_ids
@@ -76,6 +85,7 @@ seed:
     - eligible_ref_id
     - eligible_specialty
     - preauth_pending_ref_ids
+    - ineligible_approved_ref_ids
   - use: appointment_history
     params:
       upcoming_count: 2
@@ -92,6 +102,7 @@ seed:
     eligible_ref_id: '{output.eligible_ref_id}'
     eligible_specialty: '{output.eligible_specialty}'
     preauth_pending_ref_ids: '{output.preauth_pending_ref_ids}'
+    ineligible_approved_ref_ids: '{output.ineligible_approved_ref_ids}'
     earliest_slot_dt: '{output.earliest_slot_dt}'
     earliest_slot_provider_ids: '{output.earliest_slot_provider_ids}'
 canonical_diff:
@@ -111,6 +122,7 @@ canonical_diff:
             x is not None
             and x == target['eligible_ref_id']
             and x not in target['preauth_pending_ref_ids']
+            and x not in target['ineligible_approved_ref_ids']
             and any(
               r.id == x and r.status == 'approved'
               and r.to_specialty == target['eligible_specialty']

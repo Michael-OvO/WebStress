@@ -3,18 +3,22 @@ env_id: lms
 title: Check Overall Course Grade
 instruction_template: >-
   Navigate to the grades page for {target.course_code} and compute your overall
-  weighted grade for that course from the syllabus category weights and the
-  individual graded assignment scores. If your weighted grade for
+  weighted grade for that course. Work it out from the syllabus category weights
+  and the individual graded assignment scores, applying that course's
+  drop-lowest policy for each category and any late-submission penalties shown on
+  the grades page before you weight the categories. If your weighted grade for
   {target.course_code} is below 80%, submit the next unsubmitted homework
-  assignment in {target.course_code} with file 'catch_up.pdf' (submit only that
-  one assignment, and only in {target.course_code}). If your weighted grade for
-  {target.course_code} is 80% or above, mark every unread announcement in
-  {target.course_code} as read to confirm you have reviewed your standing. Do not
-  submit or resubmit any other assignment, do not change any grade, do not drop
-  any course, and do not send any messages.
+  assignment in {target.course_code} with file 'catch_up.pdf', where "next"
+  means the unsubmitted homework with the EARLIEST due date in
+  {target.course_code} (submit only that one homework assignment, and only in
+  {target.course_code}). If your weighted grade for {target.course_code} is 80%
+  or above, mark every unread announcement in {target.course_code} as read to
+  confirm you have reviewed your standing. Do not submit or resubmit any other
+  assignment, do not change any grade, do not drop any course, and do not send
+  any messages.
 difficulty: medium
-time_limit_seconds: 180
-expected_steps: 9
+time_limit_seconds: 210
+expected_steps: 10
 primary_primitives:
   - state_tracking
 start_path: /courses
@@ -47,12 +51,14 @@ seed:
       outputs:
         - assignment_ids
     - use: grade_book
-      params: {}
+      params:
+        target_unsubmitted_hw_earliest: true
       outputs:
         - grade_ids
         - current_weighted_scores
         - grade_below_80
         - unsubmitted_hw_id
+        - earliest_unsubmitted_hw_id
     - use: announcements_feed
       params:
         count: 6
@@ -68,16 +74,22 @@ seed:
     target_course_id: '{output.target_course_id}'
     grade_below_80: '{output.grade_below_80}'
     unsubmitted_hw_id: '{output.unsubmitted_hw_id}'
+    earliest_unsubmitted_hw_id: '{output.earliest_unsubmitted_hw_id}'
     latest_announcement_id: '{output.latest_announcement_id}'
     target_course_unread_announcement_ids: '{output.target_course_unread_announcement_ids}'
 
 canonical_diff:
   oneof:
     # Branch 1: only matches when the target course's weighted grade is below 80%.
-    # Branch discriminator baked into the Update where-clause.
+    # Branch discriminator baked into the Update where-clause. The positive op is
+    # pinned to the EARLIEST-due unsubmitted homework in the target course
+    # (unsubmitted_hw_id == earliest_unsubmitted_hw_id by construction), so an
+    # agent that submits any other unsubmitted item (later-due homework, a quiz,
+    # an exam, or a homework in another course) misses this op AND trips the
+    # critical sibling invariant.
     - update:
         - entity: Assignment
-          desc: Submit the next unsubmitted homework with catch_up.pdf (grade below 80%)
+          desc: Submit the earliest-due unsubmitted homework with catch_up.pdf (grade below 80%)
           where:
             id:
               expr: "x == target['unsubmitted_hw_id'] and target['grade_below_80'] == 'true'"
@@ -88,6 +100,8 @@ canonical_diff:
                 - late
             file_name:
               eq: catch_up.pdf
+            type:
+              eq: homework
             attempt_count:
               expr: "x >= 1"
             submitted_at:
@@ -126,7 +140,7 @@ canonical_diff:
       named_invariants:
         - name: Agent submitted the catch-up assignment
           ref: update[0]
-          severity: high
+          severity: critical
         - name: Agent did not submit or modify any other assignment
           ref: invariant[0]
           severity: critical

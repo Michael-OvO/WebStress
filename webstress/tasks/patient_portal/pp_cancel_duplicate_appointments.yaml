@@ -10,12 +10,12 @@ instruction_template: Three of your upcoming appointments are all scheduled for 
   do not touch any other appointment. Do not send any messages.
 difficulty: hard
 time_limit_seconds: 300
-expected_steps: 14
+expected_steps: 16
 primary_primitives:
 - backtracking
 start_path: /appointments
 seed:
-  distractors: 8
+  distractors: 12
   steps:
   - use: patient_profile
     params:
@@ -50,6 +50,17 @@ seed:
       cancelled_count: 1
       conflict_pair: true
       conflict_count: 3
+      # PP-CD v2: decouple booked_at order from id/creation order so the
+      # earliest-booked member is NOT the lowest-id / first-listed one. The
+      # agent must actually compare booked_at timestamps to find the KEEP.
+      conflict_shuffle_booked_at: true
+      # PP-CD v2: a second, legitimately-distinct same-time group the agent
+      # must NOT cancel — turns "find the same-time trio" into "identify WHICH
+      # same-time group is the duplicate set".
+      conflict_decoy_same_time_count: 2
+      # PP-CD v2: an already-cancelled appointment sharing the live cluster's
+      # exact datetime (a trap against double-cancel / "already resolved").
+      conflict_cancelled_same_time_count: 1
     outputs:
     - upcoming_ids
     - conflict_apt_ids
@@ -106,6 +117,26 @@ canonical_diff:
       filter: "a.status != 'cancelled'"
       preserve: ALL
       comprehensive: true
+  constraints:
+    # PP-CD v2: a SECOND, independent verification surface on the load-bearing
+    # discriminator (which same-time member is the earliest-BOOKED one to keep).
+    # The bijection above pins the cancel-set ids; this constraint pins the
+    # KEEP decision by booked_at directly: the kept member's booked_at must be
+    # the strict minimum over the whole same-time cluster, AND the kept member
+    # must still be scheduled in the final state. An agent that mis-orders the
+    # booked_at timestamps and keeps the wrong member (or cancels the kept one)
+    # fails this critical constraint even before the invariant fires — closing
+    # the "keep the first/lowest-id same-time appointment" shortcut. Uses only
+    # seed-computed target ids + initial/final state helpers (no inline group-by).
+    - desc: "The kept appointment is exactly the earliest-BOOKED member of the same-time cluster and remains scheduled"
+      expr: >-
+        initial.get_appointment(target['conflict_keep_apt_id']).booked_at
+        == min(
+            initial.get_appointment(aid).booked_at
+            for aid in target['conflict_apt_ids']
+        )
+        and state.get_appointment(target['conflict_keep_apt_id']).status == 'scheduled'
+      severity: critical
   named_invariants:
     - name: "Agent did not modify the earliest-booked conflict appointment or any other appointment"
       ref: invariant[0]

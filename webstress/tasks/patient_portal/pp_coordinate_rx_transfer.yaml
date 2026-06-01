@@ -1,17 +1,22 @@
 task_id: pp_coordinate_rx_transfer
 env_id: patient_portal
 title: Coordinate Pharmacy Transfer
-instruction_template: Your default pharmacy is closing. Among the retail pharmacies
-  in your pharmacy list, identify the one retail pharmacy (never a mail-order pharmacy,
-  and never your current default) that charges the lowest dispensing fee; if two
-  retail pharmacies tie on dispensing fee, choose the one whose pharmacy id sorts
-  first alphabetically. Transfer every active prescription to that retail pharmacy,
-  then set that same retail pharmacy as your new default. Do not transfer any
-  prescription to a mail-order pharmacy. Do not modify, refill, renew, or transfer
-  any expired prescription. Do not add or remove any pharmacy.
+instruction_template: Your default pharmacy is closing. First restrict your attention
+  to the retail pharmacies that are in YOUR pharmacy list (the pharmacy_ids on your
+  profile) — ignore any retail pharmacy that is not in your pharmacy list even if it
+  is visible and charges a lower fee. Among only those in-list retail pharmacies,
+  identify the one retail pharmacy (never a mail-order pharmacy, and never your current
+  default) that charges the lowest dispensing fee; if two in-list retail pharmacies tie
+  on dispensing fee, choose the one whose pharmacy id sorts first (the lower numeric
+  id suffix). Transfer every active prescription to that retail pharmacy, then set that
+  same retail pharmacy as your new default. Do not transfer any prescription to a
+  mail-order pharmacy or to a pharmacy outside your pharmacy list. Do not modify,
+  refill, renew, or transfer any expired prescription; prescriptions that are expiring
+  soon or have zero refills remaining are still active and MUST be transferred. Do not
+  add or remove any pharmacy.
 difficulty: hard
-time_limit_seconds: 300
-expected_steps: 22
+time_limit_seconds: 360
+expected_steps: 28
 primary_primitives:
 - backtracking
 start_path: /medications
@@ -43,19 +48,30 @@ seed:
     - providers_by_specialty
   - use: pharmacy_list
     params:
-      count: 3
+      count: 4
       include_mail_order: true
+      distinct_retail_fees:
+      - 9
+      - 8
+      - 6
+      - 6
+      retail_decoy_fees:
+      - 4
+      - 5
     outputs:
     - pharmacy_ids
     - default_pharmacy_id
     - mail_order_pharmacy_id
     - new_default_pharmacy_id
     - cheapest_retail_pharmacy_id
+    - cheapest_overall_retail_pharmacy_id
+    - retail_decoy_pharmacy_ids
   - use: prescription_cabinet
     params:
       active_count: 6
-      expired_count: 2
-      zero_refill_count: 0
+      expired_count: 1
+      zero_refill_count: 1
+      expiring_soon_count: 2
       active_at_default_only: true
     outputs:
     - active_rx_ids
@@ -67,6 +83,8 @@ seed:
     mail_order_pharmacy_id: '{output.mail_order_pharmacy_id}'
     new_default_pharmacy_id: '{output.new_default_pharmacy_id}'
     cheapest_retail_pharmacy_id: '{output.cheapest_retail_pharmacy_id}'
+    cheapest_overall_retail_pharmacy_id: '{output.cheapest_overall_retail_pharmacy_id}'
+    retail_decoy_pharmacy_ids: '{output.retail_decoy_pharmacy_ids}'
 canonical_diff:
   update:
     - entity: Prescription

@@ -1,14 +1,22 @@
 """Solvability + near-miss proof for the hardened lms_three_module_chain task.
 
-The task was re-tiered to EXPERT. The agent must, within the prerequisite
-chain of CS101, complete exactly the next three completable chain modules
-(re-derived by following the unlock links from the currently-available chain
-module) while leaving the three off-chain "available" decoy modules untouched.
+The task is EXPERT. CS101 contains a single prerequisite chain whose links are a
+HETEROGENEOUS mix of ``prerequisite`` and ``min_score`` gates, interleaved among
+three off-chain "available" decoy modules that share the chain's title style and
+sit at positions that PRECEDE the real currently-available chain module (so the
+first module that shows as "available" in position order is a decoy, not the
+answer). The agent must re-derive the chain by following the unlock links and
+complete exactly the next three chain modules (each requires finishing all three
+of its content items first) while leaving the decoys — and every other module —
+untouched.
 
 The correct solution is driven through the REAL backend endpoints via a
 TestClient so the proof confirms the seed targets are achievable past the
-server's prerequisite + content-item gates (and that the server's
-auto-unlock cascade is tolerated by the canonical_diff).
+server's prerequisite + min_score + content-item gates (and that the server's
+auto-unlock cascade is tolerated by the canonical_diff). Several near-miss
+trajectories — completing a decoy, stopping one module short, picking the
+position-first "available" decoy, and over-completing into the cascade successor
+— must all fail.
 """
 
 from starlette.testclient import TestClient
@@ -55,6 +63,26 @@ def test_correct_trajectory_passes_via_backend():
 
     chain = targets["next_chain_module_ids"].split(",")
     assert len(chain) == 3, targets["next_chain_module_ids"]
+
+    by_id_initial = {m.id: m for m in state.modules}
+
+    # Structural hardening assertions: the chain is heterogeneous (a min_score
+    # gate appears alongside prerequisite gates), each target module carries the
+    # bumped 3 content items, and the FIRST module that shows as "available" in
+    # position order is an off-chain decoy — so a "pick the first available
+    # module" heuristic is actively wrong.
+    gate_types = {by_id_initial[m].unlock_condition for m in chain}
+    assert "min_score" in gate_types and "prerequisite" in gate_types, gate_types
+    for m in chain:
+        assert len(by_id_initial[m].content_items) == 3, (m, by_id_initial[m].content_items)
+    course_modules = state.modules_for_course(targets["target_course_id"])
+    first_available = next(m for m in course_modules if m.status == "available")
+    decoy_ids = set(targets["decoy_module_ids"].split(","))
+    assert first_available.id in decoy_ids, (
+        "expected the position-first available module to be a decoy, got "
+        f"{first_available.id}"
+    )
+    assert chain[0] == targets["next_available_module_id"], (chain[0], targets)
 
     with TestClient(app) as client:
         for module_id in chain:
@@ -121,6 +149,69 @@ def test_completing_only_two_chain_modules_fails():
     with TestClient(app) as client:
         for module_id in chain[:2]:
             _complete_module_via_api(client, sid, state, module_id)
+
+    state = sm.get_state(sid)
+    result = evaluate(
+        task=get_task("lms_three_module_chain"),
+        server_state=state,
+        targets=targets,
+        trajectory=[],
+    )
+    assert result.get("success") is False, f"expected failure, got: {result}"
+
+
+def test_picking_position_first_available_decoy_fails():
+    """Near-miss: agent follows a "first available module in the list" heuristic.
+
+    The position-first available module is an off-chain decoy. Completing it
+    (plus the three real chain modules) must fail the decoy / exact-set
+    constraints.
+    """
+    sm, sid, targets = _create_session()
+    state = sm.get_state(sid)
+
+    chain = targets["next_chain_module_ids"].split(",")
+    course_modules = state.modules_for_course(targets["target_course_id"])
+    decoy_ids = set(targets["decoy_module_ids"].split(","))
+    first_available_decoy = next(
+        m for m in course_modules if m.status == "available" and m.id in decoy_ids
+    )
+
+    with TestClient(app) as client:
+        for module_id in chain:
+            _complete_module_via_api(client, sid, state, module_id)
+        _complete_module_via_api(client, sid, state, first_available_decoy.id)
+
+    state = sm.get_state(sid)
+    result = evaluate(
+        task=get_task("lms_three_module_chain"),
+        server_state=state,
+        targets=targets,
+        trajectory=[],
+    )
+    assert result.get("success") is False, f"expected failure, got: {result}"
+
+
+def test_over_completing_into_cascade_successor_fails():
+    """Near-miss: agent completes the requested three AND the cascade successor.
+
+    The successor auto-unlocks when the third module is completed; a greedy
+    "keep going" agent then completes it too, busting the exact-completed-count
+    and exact-set constraints.
+    """
+    sm, sid, targets = _create_session()
+    state = sm.get_state(sid)
+
+    chain = targets["next_chain_module_ids"].split(",")
+    cascade_id = targets["cascade_unlocked_module_id"]
+    assert cascade_id, "expected a cascade successor for this near-miss"
+
+    with TestClient(app) as client:
+        for module_id in chain:
+            _complete_module_via_api(client, sid, state, module_id)
+        # Refresh so the successor is now unlocked/available before completing.
+        state = sm.get_state(sid)
+        _complete_module_via_api(client, sid, state, cascade_id)
 
     state = sm.get_state(sid)
     result = evaluate(

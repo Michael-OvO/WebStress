@@ -1,20 +1,26 @@
 task_id: pp_update_insurance
 env_id: patient_portal
 title: Update Insurance From New Card Notice
-instruction_template: 'Your Billing Department sent you a secure message with the
-  subject "New Insurance Card on File" describing your new insurance card. Open that
-  message and apply exactly what it states: 1) update your insurance plan name, member
-  ID, and group number to the values listed on the new card, and 2) update your
-  contact phone and contact email to the new contact details listed in that same
-  message. An older billing message also discusses an insurance card update, but it
-  is the superseded prior-period card; use only the most recent "New Insurance Card
-  on File" message. Do not change your name. Do not send any messages, do not reply
-  to any message, do not cancel or create appointments, do not touch any insurance
-  claims, and do not modify any prescriptions, referrals, pharmacies, lab results,
-  or immunization records.'
+instruction_template: 'Your Billing Department sent secure messages about a new
+  insurance card. Several billing messages discuss insurance-card updates; some are
+  superseded and some look nearly identical, so identify the SINGLE most recent
+  card notice by its message timestamp (do not rely on the subject line, which is
+  reused). From the most recent card notice and its follow-up reply in the same
+  thread, apply exactly the new card details: 1) update your insurance plan name,
+  member ID, and group number. NOTE: the body of the most recent card notice
+  contains a correction — the Member ID first printed in the prose was
+  mis-transcribed, and the message states the corrected Member ID; apply the
+  CORRECTED Member ID, not the mis-transcribed one. 2) Update your contact phone to
+  the number in that most recent card notice, and your contact email to the address
+  given in the follow-up message in the same thread (the email is not in the first
+  message). Older or near-identical billing messages describe superseded or prior
+  cards; do not apply their values. Do not change your name. Do not send any
+  messages, do not reply to any message, do not cancel or create appointments, do
+  not touch any insurance claims, and do not modify any prescriptions, referrals,
+  pharmacies, lab results, or immunization records.'
 difficulty: hard
-time_limit_seconds: 300
-expected_steps: 14
+time_limit_seconds: 360
+expected_steps: 18
 primary_primitives:
 - verification
 start_path: /messages
@@ -75,58 +81,76 @@ seed:
   - use: insurance_card_message
     params:
       stale_offset_days: 21
+      near_offset_days: 3
       current_offset_days: 1
+      followup_offset_hours: 2
     outputs:
     - new_plan_name
     - new_member_id
+    - new_member_id_typo
     - new_group_number
     - new_phone
     - new_email
     - stale_plan_name
     - stale_member_id
     - stale_group_number
+    - near_plan_name
+    - near_member_id
+    - near_group_number
+    - near_phone
     - current_card_msg_id
     - stale_card_msg_id
+    - near_card_msg_id
+    - followup_msg_id
   targets:
     pcp_id: '{output.pcp_id}'
     old_plan_name: '{output.insurance_plan_name}'
     old_member_id: '{output.member_id}'
     new_plan_name: '{output.new_plan_name}'
     new_member_id: '{output.new_member_id}'
+    new_member_id_typo: '{output.new_member_id_typo}'
     new_group_number: '{output.new_group_number}'
     new_phone: '{output.new_phone}'
     new_email: '{output.new_email}'
     stale_plan_name: '{output.stale_plan_name}'
     stale_member_id: '{output.stale_member_id}'
     stale_group_number: '{output.stale_group_number}'
+    near_plan_name: '{output.near_plan_name}'
+    near_member_id: '{output.near_member_id}'
+    near_group_number: '{output.near_group_number}'
+    near_phone: '{output.near_phone}'
     current_card_msg_id: '{output.current_card_msg_id}'
     stale_card_msg_id: '{output.stale_card_msg_id}'
+    near_card_msg_id: '{output.near_card_msg_id}'
+    followup_msg_id: '{output.followup_msg_id}'
 canonical_diff:
   # The authoritative new-card values are computed in the seed builder and are
-  # NOT present in the instruction text — the agent must open the most-recent
-  # billing message ("New Insurance Card on File"), disambiguate it from the
-  # older superseded message, and extract the exact strings. Every graded
-  # field is compared to a seed target via expr so the values are never
-  # leaked. The patient singleton update covers insurance_plan, phone, and
-  # email; all three are guarded against the stale decoy and against the
-  # patient's original values, and `name` is pinned to its initial value.
+  # NOT present in the instruction text. The agent must read the billing
+  # thread, identify the MOST RECENT card notice by timestamp (subjects are
+  # reused / near-identical), reconcile the prose/footer member-ID
+  # CONTRADICTION (apply the CORRECTED member id, not the mis-transcribed
+  # `new_member_id_typo`), and read the follow-up message in the same thread
+  # for the new email. Every graded field is compared by `expr` to the seed
+  # targets so no value is leaked, and each is guarded against the stale decoy,
+  # the same-carrier near-recency decoy, the patient's original value, and (for
+  # member_id) the mis-transcribed typo value. `name` is pinned to its initial.
   update:
     - entity: patient
-      desc: Insurance and contact details updated to the new-card values from the most recent billing message
+      desc: Insurance and contact details updated to the corrected new-card values from the most recent billing thread
       where: { id: { any: true } }
       changes:
         insurance_plan:
           fields:
             plan_name:
-              expr: "x == target['new_plan_name']"
+              expr: "x == target['new_plan_name'] and x != target['stale_plan_name'] and x != initial.patient.insurance_plan.plan_name"
             member_id:
-              expr: "x == target['new_member_id']"
+              expr: "x == target['new_member_id'] and x != target['new_member_id_typo'] and x != target['near_member_id'] and x != target['stale_member_id'] and x != initial.patient.insurance_plan.member_id"
             group_number:
-              expr: "x == target['new_group_number']"
+              expr: "x == target['new_group_number'] and x != target['near_group_number'] and x != target['stale_group_number']"
         phone:
-          expr: "x == target['new_phone']"
+          expr: "x == target['new_phone'] and x != target['near_phone'] and x != initial.patient.phone"
         email:
-          expr: "x == target['new_email']"
+          expr: "x == target['new_email'] and x != initial.patient.email"
         name:
           expr: "x == initial.patient.name"
   invariant:

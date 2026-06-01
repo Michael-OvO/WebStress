@@ -4,16 +4,18 @@ title: Submit the Sole Recoverable Late Assignment
 instruction_template: 'In {target.course_code_1}, {target.course_code_2}, and {target.course_code_3}
   you have several past-due assignments that you never submitted. Each course''s syllabus
   sets a late-submission window (a maximum number of days past the due date during
-  which late work is still accepted). Exactly one of your past-due, never-submitted
-  assignments is still inside its course''s late window; every other past-due, never-submitted
-  assignment is already outside its window and can no longer be accepted. Submit that
-  one assignment. Name the uploaded file using the assignment''s course code in capital
-  letters followed by "_late_submission.pdf" (for example, a course coded ABC123 would
-  use ABC123_late_submission.pdf). Do not submit, resubmit, or otherwise modify any
-  other assignment, and do not send any messages.'
+  which late work is still accepted), and these windows differ from course to course,
+  so how many days late an assignment is does not by itself tell you whether it can
+  still be accepted. Exactly one of your past-due, never-submitted assignments is still
+  inside its own course''s late window; every other past-due, never-submitted assignment
+  is already outside its window and can no longer be accepted. Submit that one assignment.
+  Name the uploaded file using the assignment''s course code in capital letters followed
+  by "_late_submission.pdf" (for example, a course coded ABC123 would use ABC123_late_submission.pdf).
+  Do not submit, resubmit, or otherwise modify any other assignment, and do not send
+  any messages.'
 difficulty: hard
 time_limit_seconds: 300
-expected_steps: 18
+expected_steps: 20
 primary_primitives:
 - state_tracking
 secondary_primitives:
@@ -49,8 +51,10 @@ seed:
       late_count: 1
       missing_count: 3
       unrecoverable_missing_count: 2
+      late_within_grace_count: 1
       sole_recoverable_missing: true
       target_recoverable_missing: true
+      lookalike_same_days_late: 2
       target_assignment_status: not_submitted
     outputs:
     - assignment_ids
@@ -60,6 +64,9 @@ seed:
     - target_course_code
     - decoy_assignment_id
     - sole_recoverable_missing_id
+    - lookalike_assignment_id
+    - lookalike_assignment_ids
+    - out_of_window_assignment_ids
     - file_name
   targets:
     assignment_title: '{output.target_assignment_title}'
@@ -71,6 +78,9 @@ seed:
     target_course_id: '{output.target_course_id}'
     decoy_assignment_id: '{output.decoy_assignment_id}'
     sole_recoverable_missing_id: '{output.sole_recoverable_missing_id}'
+    lookalike_assignment_id: '{output.lookalike_assignment_id}'
+    lookalike_assignment_ids: '{output.lookalike_assignment_ids}'
+    out_of_window_assignment_ids: '{output.out_of_window_assignment_ids}'
     file_name: '{output.file_name}'
     required_file_name: '{output.target_course_code}_late_submission.pdf'
 canonical_diff:
@@ -119,12 +129,26 @@ canonical_diff:
   - desc: Agent did not send messages
     expr: "len(state.sent_messages) == 0"
     severity: medium
+  - desc: The same-days-late look-alike assignment (past due in a stricter course,
+      already outside its late window) was left untouched in status and attempt count
+    expr: "target['lookalike_assignment_id'] == '' or any(a.id == target['lookalike_assignment_id']
+      and a.submission_status == next((b.submission_status for b in initial.assignments
+      if b.id == a.id), None) and a.attempt_count == next((b.attempt_count for b in
+      initial.assignments if b.id == a.id), -1) for a in state.assignments)"
+    severity: high
   - desc: The decoy assignment in another course was left untouched (status and attempt
       count unchanged from the initial state)
     expr: "any(a.id == target['decoy_assignment_id'] and a.submission_status == next((b.submission_status
       for b in initial.assignments if b.id == a.id), None) and a.attempt_count == next((b.attempt_count
       for b in initial.assignments if b.id == a.id), -1) for a in state.assignments)"
     severity: high
+  - desc: No out-of-window (unrecoverable) past-due assignment was submitted; every
+      assignment the agent moved out of not_submitted was still inside its own
+      course's late window
+    expr: "all(a.id not in target['out_of_window_assignment_ids'].split(',') for a
+      in state.assignments if a.submission_status in ('late', 'submitted') and next((b.submission_status
+      for b in initial.assignments if b.id == a.id), None) == 'not_submitted')"
+    severity: critical
   - desc: Only the targeted assignment changed status from its initial not_submitted
       state (no wrong or extra submissions)
     expr: "len([a for a in state.assignments if a.submission_status != next((b.submission_status

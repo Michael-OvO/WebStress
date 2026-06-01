@@ -57,18 +57,47 @@ seed:
   - use: insurance_claims
     params:
       approved_count: 3
-      denied_count: 6
+      denied_count: 12
       processing_count: 2
-      denied_no_eob_count: 3
-      denied_expired_count: 3
+      denied_no_eob_count: 4
+      denied_expired_count: 4
       with_eob: true
       near_appeal_deadline: true
+      # Force the INELIGIBLE denied decoys (no-EOB + expired-deadline) to draw
+      # patient_responsibility from the high end so all 8 of them OUTRANK every
+      # genuine eligible claim by raw PR. An agent that ranks top-3-by-PR before
+      # (or without) applying the full eligibility filter lands on decoys the
+      # appeal route rejects (422). The genuine eligible top PR is 1500 (below
+      # this floor), so the top ~8 by raw PR are all ineligible.
+      ineligible_pr_floor: 1600
+      ineligible_pr_ceiling: 2000
+      # Plant DELIBERATE TIES at the top-3 boundary among the 12 eligible denied
+      # claims. Three eligible claims tie at PR 1300 (positions 1,2,3 in
+      # creation order); the top-3 is {1500} plus the TWO lowest-claim-id of the
+      # three 1300s, so the ascending-claim-id tiebreaker decides which 1300
+      # claim is the genuine #3 and which is the excluded #4. A model that holds
+      # the ranked set but skips the tiebreaker picks the wrong third claim and
+      # trips the exact-3 bijection.
+      eligible_pr_plan:
+      - 1500
+      - 1300
+      - 1300
+      - 1300
+      - 1180
+      - 1040
+      - 920
+      - 780
+      - 640
+      - 500
+      - 360
+      - 200
     outputs:
     - denied_claim_ids
     - appealable_claim_id
     - appealable_claim_ids
     - approved_claim_ids
     - top_3_appealable_claim_ids
+    - ineligible_denied_ids
   - use: referral_chain
     params:
       approved_count: 2
@@ -82,6 +111,7 @@ seed:
     appealable_claim_ids: '{output.appealable_claim_ids}'
     approved_claim_ids: '{output.approved_claim_ids}'
     top_3_appealable_claim_ids: '{output.top_3_appealable_claim_ids}'
+    ineligible_denied_ids: '{output.ineligible_denied_ids}'
 canonical_diff:
   update:
     - entity: InsuranceClaim

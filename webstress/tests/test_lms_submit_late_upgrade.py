@@ -1,4 +1,4 @@
-"""Solvability proof for the hardened ``lms_submit_late`` task.
+"""Solvability proof for the hardened ``lms_submit_late`` task (v2).
 
 Drives the CORRECT solution through the REAL LMS backend endpoints
 (``/api/env/lms/session`` + ``/api/env/lms/assignments/{id}/submit``) using the
@@ -10,9 +10,17 @@ The hardened task no longer leaks the assignment id/title or the file name in
 its instruction. The agent must:
   * filter to past-due, never-submitted assignments,
   * compute each one's days-late against its own course's late-submission
-    window (``max_late_days``),
-  * identify the single assignment still inside its window, and
-  * upload a file named ``<COURSE_CODE>_late_submission.pdf``.
+    window (``max_late_days``), and
+  * identify the single assignment still inside its window.
+
+v2 hardening (the load-bearing difficulty lever): the seed now plants a
+SAME-DAYS-LATE LOOK-ALIKE — a past-due never-submitted assignment in a STRICTER
+course that is the EXACT same number of days late as the sole recoverable target
+but is already OUTSIDE its (smaller) window. "Sort by how many days late" no
+longer separates the answer from the trap; the agent must read each course's
+``max_late_days`` and do per-course window math. Submitting the look-alike trips
+a high-severity look-alike constraint, a critical "out-of-window submission"
+constraint, and the critical "only the target changed" constraint.
 
 The seed builder guarantees exactly one recoverable past-due assignment (with
 margin against the floating seed anchor), so ``target_assignment_id`` /
@@ -111,6 +119,51 @@ def test_seed_has_exactly_one_recoverable_target():
     assert decoy.course_id != targets["target_course_id"]
 
 
+def _days_late(a, now: datetime) -> int:
+    due = a.due_at if a.due_at.tzinfo else a.due_at.replace(tzinfo=timezone.utc)
+    return (now - due).days
+
+
+def test_seed_has_same_days_late_lookalike_trap():
+    """v2: a past-due look-alike in a STRICTER course is the EXACT same number of
+    days late as the sole recoverable target, but is already OUT of its window.
+
+    This is the load-bearing difficulty lever: days-late no longer separates the
+    answer from the trap, so the agent MUST read each course's max_late_days.
+    """
+    for seed in (SEED, 1, 7, 100, 999, 2026):
+        sm = SessionManager()
+        sid, targets, _ = sm.create_session(env_id=ENV_ID, task_id=TASK_ID, seed=seed)
+        state = sm.get_state(sid)
+        now = datetime.now(timezone.utc)
+        courses = {c.id: c for c in state.courses}
+
+        look_id = targets["lookalike_assignment_id"]
+        assert look_id, f"seed {seed}: expected a same-days-late look-alike"
+
+        target = next(a for a in state.assignments if a.id == targets["target_assignment_id"])
+        look = next(a for a in state.assignments if a.id == look_id)
+
+        # Same number of days late as the target.
+        assert _days_late(look, now) == _days_late(target, now), (
+            f"seed {seed}: look-alike days-late must equal target days-late"
+        )
+        # Different (stricter) course.
+        assert look.course_id != target.course_id
+        look_max = courses[look.course_id].syllabus.late_policy.max_late_days
+        target_max = courses[target.course_id].syllabus.late_policy.max_late_days
+        assert look_max < target_max, f"seed {seed}: look-alike course must be stricter"
+        # Target is INSIDE its window; look-alike is OUTSIDE its window.
+        assert _days_late(target, now) <= target_max
+        assert _days_late(look, now) > look_max
+        # The look-alike is exposed as the canonical decoy.
+        assert targets["decoy_assignment_id"] == look_id
+        # The look-alike is in the authoritative out-of-window set.
+        out_ids = [x for x in targets["out_of_window_assignment_ids"].split(",") if x]
+        assert look_id in out_ids
+        assert targets["target_assignment_id"] not in out_ids
+
+
 # ---------------------------------------------------------------------------
 # Correct solution through the REAL backend → evaluator passes.
 # ---------------------------------------------------------------------------
@@ -182,6 +235,34 @@ def test_wrong_assignment_fails(client: TestClient):
     result = _evaluate_live(sid, targets)
     assert result["success"] is False
     assert result["score"] < 0.99
+
+
+def test_same_days_late_lookalike_submission_fails(client: TestClient):
+    """v2: submitting the SAME-DAYS-LATE look-alike (the days-late-sort trap)
+    must fail and fire the look-alike + out-of-window + only-target constraints.
+
+    An agent that shortcuts to "submit whichever past-due assignment is fewest
+    days late" picks this look-alike (it ties the target on days-late) and fails.
+    """
+    sid, targets = _create(client)
+    look_id = targets["lookalike_assignment_id"]
+    assert look_id, "expected a same-days-late look-alike in the seed"
+
+    resp = _submit(client, sid, look_id, targets["required_file_name"])
+    assert resp.status_code == 200, resp.text
+    result = _evaluate_live(sid, targets)
+    assert result["success"] is False
+    assert result["score"] < 0.99
+
+    failed = {
+        nc["desc"]
+        for nc in result["negative_checks"]
+        if not nc["passed"]
+    }
+    # The dedicated look-alike, out-of-window, and only-target constraints fire.
+    assert any("look-alike" in d for d in failed), failed
+    assert any("out-of-window" in d for d in failed), failed
+    assert any("Only the targeted assignment" in d for d in failed), failed
 
 
 def test_correct_plus_decoy_fails(client: TestClient):

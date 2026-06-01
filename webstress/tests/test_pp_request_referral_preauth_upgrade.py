@@ -3,14 +3,18 @@
 The hardened task requires the agent to:
   1. Identify the SINGLE schedulable approved referral (status approved AND, where
      pre-auth is required, pre-auth approved) — rejecting the approved-but-
-     pre-auth-pending decoys.
+     pre-auth-pending decoys, INCLUDING one in the SAME specialty (dermatology)
+     as the eligible referral, so specialty-only pattern-matching links the wrong
+     referral and fails.
   2. In that referral's specialty, pick a provider that is ACCEPTING new patients
-     (rejecting the closed-panel decoy provider that holds a strictly-earlier slot).
+     (rejecting the TWO closed-panel decoy providers, one of which holds a
+     strictly-earlier slot).
   3. Book the EARLIEST slot offered by an accepting provider in that specialty.
   4. Link the new appointment to the schedulable referral.
   5. Confirm the appointment (the specialty is in auto_confirm_specialties, so the
      backend lands the create as confirmation_state='pending' and a second
-     POST .../confirm is required).
+     POST .../confirm is required). The instruction now explicitly states the
+     confirmation step, so this is a discoverable, fair backtracking requirement.
 
 The correct solution is driven through the REAL backend endpoints
 (POST /appointments/create then POST /appointments/{id}/confirm) so the test also
@@ -65,6 +69,20 @@ def test_correct_trajectory_via_endpoints_passes():
     for did in targets["preauth_pending_ref_ids"]:
         d = next(r for r in state.referrals if r.id == did)
         assert d.status == "approved" and d.prior_auth_status == "pending"
+    # There is a SAME-SPECIALTY (dermatology) approved-but-pre-auth-pending decoy
+    # in the ineligible set — the new backtracking trap. It must NOT be the
+    # eligible referral, and it must share the eligible specialty.
+    same_spec_decoys = [
+        r
+        for r in state.referrals
+        if r.id in targets["ineligible_approved_ref_ids"]
+        and r.to_specialty == targets["eligible_specialty"]
+    ]
+    assert same_spec_decoys, "expected a same-specialty pre-auth-pending decoy referral"
+    for d in same_spec_decoys:
+        assert d.id != eligible_ref
+        assert d.status == "approved"
+        assert d.prior_auth_required and d.prior_auth_status == "pending"
 
     # Step 1: create the appointment through the gated endpoint.
     create_resp = client.post(
@@ -113,10 +131,13 @@ def test_closed_panel_provider_with_earlier_slot_fails():
     state = sm.get_state(sid)
 
     # Find the non-accepting dermatology provider and its earliest slot.
-    closed = next(
+    closed_providers = [
         p for p in state.providers
         if p.specialty == targets["eligible_specialty"] and not p.accepting_new
-    )
+    ]
+    # The upgrade widens the closed-panel haystack to TWO non-accepting derm providers.
+    assert len(closed_providers) >= 2, "expected >=2 closed-panel dermatology providers"
+    closed = closed_providers[0]
     closed_slot = min(s.datetime.isoformat() for s in closed.available_slots)
     # It must be strictly earlier than the correct earliest accepting slot.
     assert closed_slot < targets["earliest_slot_dt"]
@@ -169,6 +190,54 @@ def test_unconfirmed_appointment_fails():
     )
     assert create_resp.status_code == 200, create_resp.text
     # Deliberately do NOT confirm.
+
+    state = sm.get_state(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert result.get("success") is False, f"result should fail: {result}"
+
+
+def test_same_specialty_preauth_pending_decoy_link_fails():
+    """Near-miss: book the correct accepting provider + earliest slot + confirm,
+    but link the SAME-SPECIALTY approved-but-pre-auth-pending decoy referral
+    instead of the eligible one. The backend create gate still accepts the
+    booking (it resolves the FIRST approved dermatology referral — the eligible
+    one — independent of linked_referral_id), but the canonical_diff pins the
+    exact eligible_ref_id and excludes the ineligible set, so it must fail."""
+    client, sid, targets, sm = _new_session()
+    state = sm.get_state(sid)
+
+    # The same-specialty decoy: approved, dermatology, pre-auth pending, != eligible.
+    decoy = next(
+        r
+        for r in state.referrals
+        if r.id in targets["ineligible_approved_ref_ids"]
+        and r.to_specialty == targets["eligible_specialty"]
+        and r.id != targets["eligible_ref_id"]
+    )
+
+    provider_id = _correct_provider_id(targets, state)
+    create_resp = client.post(
+        f"{ENV_PREFIX}/appointments/create",
+        json={
+            "session_id": sid,
+            "provider_id": provider_id,
+            "slot_datetime": targets["earliest_slot_dt"],
+            "type": "in-person",
+            "reason": "Dermatology specialist consultation",
+            "linked_referral_id": decoy.id,
+        },
+    )
+    assert create_resp.status_code == 200, create_resp.text
+    new_apt_id = create_resp.json()["id"]
+    client.post(
+        f"{ENV_PREFIX}/appointments/{new_apt_id}/confirm",
+        json={"session_id": sid},
+    )
 
     state = sm.get_state(sid)
     result = evaluate(

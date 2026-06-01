@@ -19,7 +19,7 @@ instruction_template: Review your active medications and recent lab results. The
   reschedule, or confirm any pre-existing appointment.
 difficulty: expert
 time_limit_seconds: 420
-expected_steps: 32
+expected_steps: 34
 primary_primitives:
 - state_tracking
 start_path: /medications
@@ -69,9 +69,9 @@ seed:
     - interacting_medications
   - use: lab_results_panel
     params:
-      resulted_count: 7
+      resulted_count: 8
       pending_count: 2
-      abnormal_count: 3
+      abnormal_count: 4
       critical_count: 1
     outputs:
     - resulted_lab_ids

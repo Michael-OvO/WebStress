@@ -1,16 +1,23 @@
 task_id: lms_resubmit_after_feedback
 env_id: lms
-title: Resubmit Every Flagged Assignment With Category-Named Revisions
+title: Resubmit Every In-Window Flagged Assignment With Category-Attempt Named Revisions
 instruction_template: Across your courses, find every assignment whose submission
-  status is "resubmit_requested". Read the instructor feedback on each one, then resubmit
-  it. Name each resubmission file "revision_<category>_v2.pdf", where <category> is
-  that assignment's own weight category (for example a homework assignment becomes
-  "revision_homework_v2.pdf" and a project becomes "revision_project_v2.pdf"). Resubmit
-  only the flagged assignments. Do not submit or resubmit any other assignment in {target.course_code}
-  or any other course, do not mark any announcement as read, and do not send any messages.
+  status is "resubmit_requested". Each course has its own late policy (penalty_per_day,
+  max_late_days, grace_period_hours) in its syllabus. A resubmission is only still
+  open if the assignment is within its course's resubmission window, i.e. the number
+  of days since its due date is at most that course's max_late_days; if the feedback
+  or due date shows the window has already lapsed, the resubmission is closed. Resubmit
+  ONLY the flagged assignments whose resubmission window is still open, and do NOT
+  resubmit any flagged assignment whose window has already closed. For each one you
+  resubmit, read the instructor feedback, then name the resubmission file
+  "revision_<category>_attempt<n>.pdf", where <category> is that assignment's own
+  weight category and <n> is its next attempt number (its current attempt_count plus
+  one) — so a homework on its second attempt becomes "revision_homework_attempt2.pdf".
+  Do not submit or resubmit any other assignment in {target.course_code} or any other
+  course, do not mark any announcement as read, and do not send any messages.
 difficulty: hard
-time_limit_seconds: 300
-expected_steps: 16
+time_limit_seconds: 360
+expected_steps: 20
 primary_primitives:
 - planning
 start_path: /courses
@@ -23,9 +30,10 @@ seed:
     - student_id
   - use: course_catalog
     params:
-      count: 4
+      count: 5
       must_include:
       - CS201
+      vary_late_policies: true
     outputs:
     - course_ids
     - course_code
@@ -36,18 +44,22 @@ seed:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 8
+      per_course_count: 10
       graded_fraction: 0.5
       resubmit_count: 3
+      vary_resubmit_attempts: true
+      resubmit_window_discriminator: 3
     outputs:
     - assignment_ids
     - resubmit_assignment_ids
+    - expired_resubmit_assignment_ids
     - decoy_assignment_id
   targets:
     course_code: '{output.course_code}'
     target_course_id: '{output.target_course_id}'
     resubmit_assignment_id: '{output.resubmit_assignment_ids[0]}'
     resubmit_assignment_ids: '{output.resubmit_assignment_ids}'
+    expired_resubmit_assignment_ids: '{output.expired_resubmit_assignment_ids}'
     decoy_assignment_id: '{output.decoy_assignment_id}'
     resubmit_file_name: revision_v2.pdf
 canonical_diff:
@@ -66,9 +78,9 @@ canonical_diff:
         - submitted
         - late
       file_name:
-        expr: "x == 'revision_' + initial.get_assignment(v).weight_category + '_v2.pdf'"
+        expr: "x == 'revision_' + initial.get_assignment(v).weight_category + '_attempt' + str(initial.get_assignment(v).attempt_count + 1) + '.pdf'"
       attempt_count:
-        expr: "x >= 2"
+        expr: "x == initial.get_assignment(v).attempt_count + 1"
       submitted_at:
         expr: "x >= session_start"
   invariant:

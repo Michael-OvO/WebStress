@@ -48,7 +48,8 @@ seed:
     - assignment_ids
     - exam_assignment_id
   - use: grade_book
-    params: {}
+    params:
+      target_curve_boundary: auto
     outputs:
     - grade_ids
     - current_weighted_scores
@@ -57,6 +58,7 @@ seed:
     params:
       count: 12
       unread_count: 8
+      target_course_unread_min: 3
     outputs:
     - announcement_ids
     - unread_announcement_ids

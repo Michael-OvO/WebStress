@@ -5,8 +5,11 @@ instruction_template: Find every assignment across all four of your courses that
   instructor has flagged for resubmission (submission status "resubmit_requested").
   Read the feedback on each one, then resubmit it with an updated file. Name each
   resubmission "revision_v{attempt}.pdf", where {attempt} is that assignment's next
-  attempt number (one greater than its current attempt count). Do not resubmit any
-  assignment that is not flagged, and do not contact anyone.
+  attempt number (one greater than its current attempt count). If a flagged assignment
+  has no attempts remaining (its attempt count already equals its maximum attempts),
+  it cannot be resubmitted -- leave it untouched and do not count it. Do not resubmit
+  any assignment that is not flagged for resubmission, even if it shares a title with
+  one that is. Do not contact anyone.
 difficulty: expert
 time_limit_seconds: 360
 expected_steps: 28
@@ -39,17 +42,25 @@ seed:
     params:
       per_course_count: 7
       graded_fraction: 0.5
-      resubmit_count: 4
+      resubmit_count: 5
       vary_resubmit_attempts: true
+      blocked_resubmit_count: 1
+      add_resubmit_lookalike: true
     outputs:
     - assignment_ids
     - resubmit_assignment_ids
     - resubmit_filenames
     - decoy_assignment_id
+    - blocked_resubmit_assignment_id
+    - lookalike_decoy_assignment_id
+    - first_resubmit_assignment_id
   targets:
     resubmit_assignment_ids: '{output.resubmit_assignment_ids}'
     resubmit_filenames: '{output.resubmit_filenames}'
     decoy_assignment_id: '{output.decoy_assignment_id}'
+    blocked_resubmit_assignment_id: '{output.blocked_resubmit_assignment_id}'
+    lookalike_decoy_assignment_id: '{output.lookalike_decoy_assignment_id}'
+    first_resubmit_assignment_id: '{output.first_resubmit_assignment_id}'
 canonical_diff:
   update:
     - entity: Assignment
@@ -95,10 +106,25 @@ canonical_diff:
       preserve: ALL
     - collection: state.sent_messages
       preserve: ALL
+    - collection: state.assignments
+      filter: "a.id == target['blocked_resubmit_assignment_id']"
+      preserve: ALL
+    - collection: state.assignments
+      filter: "a.id == target['lookalike_decoy_assignment_id']"
+      preserve: ALL
   constraints:
   - desc: Agent did not contact anyone
     expr: "len(state.sent_messages) == 0"
     severity: high
+  - desc: Agent resubmitted exactly the four resubmittable flagged assignments (no more, no fewer)
+    expr: "len([a for a in state.assignments if a.id in (target['resubmit_assignment_ids'].split(',') if target['resubmit_assignment_ids'] else []) and a.submission_status in ('submitted', 'late') and a.file_name == 'revision_v' + str(initial.get_assignment(a.id).attempt_count + 1) + '.pdf' and a.attempt_count == initial.get_assignment(a.id).attempt_count + 1]) == len(target['resubmit_assignment_ids'].split(','))"
+    severity: critical
+  - desc: Agent left the un-resubmittable (max-attempts-reached) flagged assignment untouched
+    expr: "state.get_assignment(target['blocked_resubmit_assignment_id']).submission_status == 'resubmit_requested' and state.get_assignment(target['blocked_resubmit_assignment_id']).attempt_count == initial.get_assignment(target['blocked_resubmit_assignment_id']).attempt_count"
+    severity: critical
+  - desc: Agent did not resubmit the graded look-alike assignment that shares a flagged title
+    expr: "state.get_assignment(target['lookalike_decoy_assignment_id']).submission_status == 'graded' and state.get_assignment(target['lookalike_decoy_assignment_id']).attempt_count == initial.get_assignment(target['lookalike_decoy_assignment_id']).attempt_count"
+    severity: critical
   named_invariants:
     - name: Agent resubmitted every flagged assignment with the correct filename
       ref: update[0]
@@ -136,4 +162,10 @@ canonical_diff:
     - name: Agent did not send messages
       ref: invariant[10]
       severity: high
+    - name: Agent did not touch the un-resubmittable flagged assignment (must backtrack off the 422 blocker)
+      ref: invariant[11]
+      severity: critical
+    - name: Agent did not touch the graded title look-alike decoy
+      ref: invariant[12]
+      severity: critical
 secondary_primitives: []

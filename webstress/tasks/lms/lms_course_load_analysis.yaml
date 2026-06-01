@@ -1,20 +1,27 @@
 task_id: lms_course_load_analysis
 env_id: lms
 title: Course Load Analysis for Adding a Fifth Course
-instruction_template: 'You are considering adding a fifth course next term. Decide
-  whether it is safe to add using the standard credit-weighted GPA rule. Read your
-  cumulative GPA from your Profile and the credit hours of every course you are
-  currently enrolled in. Model the new course as a 3-credit course in which you would
-  earn a C, which counts as 2.0 grade points per credit. Compute the projected
-  cumulative GPA as (current_GPA * current_total_credits + 2.0 * 3) / (current_total_credits
-  + 3). If that projected GPA is greater than or equal to 3.0, adding the course is
-  safe: in that case mark every unread announcement as read and make no other
-  changes. If the projected GPA is below 3.0, adding the course is not safe: in that
-  case do NOT touch any announcement and instead drop exactly the single course in
-  which you currently have the lowest weighted grade (recompute each course''s
-  weighted grade from its graded work and grading-policy weights to identify it).
-  Do not enroll in or create any new course, do not modify any grade, and do not
-  send any message.'
+instruction_template: 'You are considering adding one more course next term and
+  must decide whether it is safe to add. Use the standard credit-weighted GPA rule:
+  a cumulative GPA is the credit-weighted average of grade points, so projecting a
+  new course means folding its grade points and credits into your current totals.
+  Read your cumulative GPA from your Profile. Then determine your current total
+  credit hours by summing the credit hours of ONLY the courses you are actively
+  enrolled in right now (status enrolled) -- do not count any course you are merely
+  waitlisted for, have completed, or have dropped, even if it still appears in your
+  records. Model the prospective course as a 3-credit course in which you would earn
+  a grade of C. Derive the projected cumulative GPA from your current GPA, your
+  current enrolled credit total, and that new 3-credit C. If the projected
+  cumulative GPA is at or above 3.0, adding the course is safe: in that case mark
+  every unread announcement as read and make no other changes. If the projected
+  cumulative GPA falls below 3.0, adding the course is NOT safe: in that case do NOT
+  touch any announcement and instead drop exactly the single enrolled course in
+  which you currently have the lowest weighted grade. To identify it, recompute each
+  enrolled course''s current weighted grade from its graded work and that course''s
+  grading-policy category weights, honoring any drop-lowest rule in the policy; the
+  lowest-weighted-grade course among your enrolled courses is the one to drop. Do
+  not enroll in or create any new course, do not modify any grade, and do not send
+  any message.'
 difficulty: expert
 time_limit_seconds: 420
 expected_steps: 26
@@ -33,31 +40,43 @@ seed:
     - gpa
   - use: course_catalog
     params:
-      count: 4
+      count: 5
       must_include:
-      - CS101
       - MATH201
+      - PHYS201
+      - CS101
+      grading_template_indices:
+      - 1
+      - 0
+      - 0
+      - 2
+      - 3
     outputs:
     - course_ids
     - course_codes
   - use: enrollment_set
-    params: {}
+    params:
+      include_waitlisted: true
     outputs:
     - enrollment_ids
   - use: assignment_battery
     params:
-      per_course_count: 6
-      graded_fraction: 0.5
+      per_course_count: 8
+      graded_fraction: 0.375
     outputs:
     - assignment_ids
   - use: grade_book
-    params: {}
+    params:
+      enrolled_scoped_decision: true
     outputs:
     - grade_ids
     - current_weighted_scores
     - can_add_course
     - lowest_performing_course_id
     - lower_grade_enrollment_id
+    - current_total_credits
+    - all_courses_total_credits
+    - projected_gpa
   - use: calendar_events
     params:
       include_recurring: false
@@ -75,6 +94,9 @@ seed:
     lowest_performing_course_id: '{output.lowest_performing_course_id}'
     lower_grade_enrollment_id: '{output.lower_grade_enrollment_id}'
     unread_announcement_ids: '{output.unread_announcement_ids}'
+    current_total_credits: '{output.current_total_credits}'
+    all_courses_total_credits: '{output.all_courses_total_credits}'
+    projected_gpa: '{output.projected_gpa}'
 canonical_diff:
   oneof:
   # Branch 1 — "safe to add": projected GPA >= 3.0 (can_add_course == 'true').
@@ -171,12 +193,18 @@ canonical_diff:
       severity: medium
   # Branch 2 — "not safe to add": projected GPA < 3.0 (can_add_course == 'false').
   # The agent must RE-DERIVE both the projected GPA (to reach this branch) AND the
-  # lowest-weighted-grade course (to pick the drop target). No bijection; the
-  # where-clause discriminator rejects the wrong branch, and the wrong drop target
-  # is frozen by the filtered enrollment invariant.
+  # lowest-weighted-grade course (to pick the drop target). Reaching this branch at
+  # all requires summing credits over ONLY the actively-enrolled courses: an agent
+  # that also counts the waitlisted decoy course inflates current_total_credits,
+  # computes a projected GPA >= 3.0, takes the SAFE branch instead, and so both
+  # misses this drop AND trips the safe branch's announcement invariant. The
+  # where-clause discriminator rejects the wrong branch, the wrong drop target is
+  # frozen by the filtered enrollment invariant, and dropping the waitlisted decoy
+  # (the credit-scope confusion surfacing as the wrong action) is rejected by the
+  # critical "only an enrolled course was dropped" constraint below.
   - update:
     - entity: Enrollment
-      desc: Drop the single lowest-weighted-grade current course (projected GPA falls below 3.0, so the fifth course cannot be added)
+      desc: Drop the single lowest-weighted-grade currently-enrolled course (projected GPA falls below 3.0, so the prospective course cannot be added)
       where:
         course_id:
           expr: "x == target['lowest_performing_course_id'] and target['can_add_course'] == 'false'"
@@ -219,6 +247,12 @@ canonical_diff:
     - desc: Exactly one enrollment was dropped
       expr: "len([e for e in state.enrollments if e.status == 'dropped']) == len([e for e in initial.enrollments if e.status == 'dropped']) + 1"
       severity: critical
+    - desc: The only newly-dropped course was one the student was actively enrolled in (not the waitlisted decoy course)
+      expr: "all(ig.status == 'enrolled' for e in state.enrollments if e.status == 'dropped' for ig in initial.enrollments if ig.id == e.id and ig.status != 'dropped')"
+      severity: critical
+    - desc: The waitlisted course was left untouched (it does not count toward the enrolled credit load)
+      expr: "all(e.status == ig.status for e in state.enrollments for ig in initial.enrollments if e.id == ig.id and ig.status == 'waitlisted')"
+      severity: high
     - desc: No grade score was altered
       expr: "all(str(gr.score) == str(ig.score) for gr in state.grades for ig in initial.grades if gr.id == ig.id)"
       severity: high

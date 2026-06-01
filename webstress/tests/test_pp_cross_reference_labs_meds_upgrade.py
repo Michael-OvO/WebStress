@@ -28,11 +28,13 @@ auto-confirm + slot-availability gates is genuinely exercised.
 from starlette.testclient import TestClient
 
 from webstress.app import app
+from webstress.injector.middleware import clear_all_degradations
 from webstress.tasks._evaluator import evaluate
 from webstress.tasks._registry import get_task
 
 TASK_ID = "pp_cross_reference_labs_meds"
 _API = "/api/env/patient_portal"
+_VARIANT = "pp_cross_reference_labs_meds__medication_shadow_v1.yaml"
 
 
 def _make_session():
@@ -41,6 +43,23 @@ def _make_session():
     sm = app.state.session_manager
     sid, targets, _ = sm.create_session(env_id="patient_portal", task_id=TASK_ID, seed=42)
     return sm, sid, dict(targets)
+
+
+def _make_variant_session(client):
+    """Mint a variant-bound session via the real /session route so the network
+    degradation (confirm misleading_success + create error_then_success) is
+    registered in the middleware for that session_id. Targets are read back
+    off the shared app SessionManager state."""
+    clear_all_degradations()
+    resp = client.post(
+        f"{_API}/session",
+        json={"task_id": TASK_ID, "seed": 42, "variant_filename": _VARIANT},
+    )
+    assert resp.status_code == 200, resp.text
+    sid = resp.json()["session_id"]
+    sm = app.state.session_manager
+    targets = dict(sm.get_targets(sid))
+    return sm, sid, targets
 
 
 def _earliest_in_person_slot(state, pcp_id: str) -> str:
@@ -100,6 +119,14 @@ def test_correct_trajectory_via_real_endpoints_passes():
     pcp_id = targets["pcp_id"]
     slot_iso = _earliest_in_person_slot(state, pcp_id)
     reason = _build_reason(targets)
+
+    # Hardened base: abnormal_count=4 + critical_count=1 => the agent must
+    # re-derive and quote FIVE distinct "<test_name> <value> <unit>" labels
+    # (one of which is the single critical lab), lengthening the state the
+    # agent has to track relative to the v1 (4-label) bar.
+    assert len(targets["abnormal_lab_value_labels"]) == 5, targets["abnormal_lab_value_labels"]
+    assert targets["critical_lab_test_name"], "expected exactly one critical lab"
+    assert targets["critical_lab_test_name"] in targets["abnormal_lab_test_names"]
 
     client = TestClient(app)
 
@@ -245,6 +272,152 @@ def test_telehealth_slot_and_partial_reason_fails():
     _create_and_confirm(client, sm, sid, pcp_id, tele_iso, partial_reason, type_="telehealth")
 
     state = sm.get_state(sid)
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert result.get("success") is False
+
+
+# ---------------------------------------------------------------------------
+# INTERVENTION VARIANT (medication_shadow_v1) proofs.
+#
+# The variant stacks three layers on the task's load-bearing predicates:
+#   * SEED add_confusing_decoys: dosage-shifted name-stem prescription
+#     lookalikes (e.g. "Metformin 1000mg" vs the real "Metformin 500mg") that
+#     are ACTIVE + non-interacting, plus boundary-case decoy labs flagged
+#     NORMAL/pending so they never pollute the out-of-range value-label set.
+#   * NETWORK misleading_success on POST /appointments/{id}/confirm: the FIRST
+#     confirm returns a loud success body but leaves confirmation_state
+#     "pending"; the agent must re-read and re-confirm.
+#   * NETWORK error_then_success on POST /appointments/create: one 503 before
+#     the real create succeeds (a naive retry-without-verify can double-book).
+#
+# These prove the variant is still SOLVABLE (re-read + re-confirm scores 1.0)
+# and that the single most likely failure under the variant — trusting the
+# fake confirm success — fails on exactly the confirmation_state constraint
+# that already broke the strong model on the clean task.
+# ---------------------------------------------------------------------------
+
+
+def test_variant_decoys_do_not_pollute_targets():
+    """Seed-layer decoys must not change the canonical out-of-range set nor the
+    interacting pair: targets are computed by the builder BEFORE injection, and
+    every decoy lab is flagged normal/pending while every decoy rx is
+    non-interacting. The dosage-shifted lookalikes ARE present in active state
+    so the agent must track the exact dosage."""
+    client = TestClient(app)
+    sm, sid, targets = _make_variant_session(client)
+    state = sm.get_state(sid)
+
+    # The dosage-shifted lookalikes are live, ACTIVE, and non-interacting.
+    active_meds = {rx.medication for rx in state.prescriptions if rx.status == "active"}
+    assert {"Metformin 1000mg", "Gabapentin 600mg"} <= active_meds
+    for rx in state.prescriptions:
+        if rx.medication in {"Metformin 1000mg", "Gabapentin 600mg",
+                             "Warfarin 2mg", "Atorvastatin 40mg"}:
+            assert list(rx.interactions) == [], rx.medication
+
+    # The genuine interacting pair (exact name+dosage) is unchanged and is NOT
+    # any of the dosage-shifted decoys.
+    assert len(targets["interacting_medications"]) == 2
+    for med in targets["interacting_medications"]:
+        assert med in active_meds
+
+    # No decoy lab leaked into the out-of-range value-label set.
+    assert len(targets["abnormal_lab_value_labels"]) == 5
+    out_of_range_resulted = [
+        l for l in state.lab_results
+        if l.status == "resulted" and l.flag in ("abnormal", "critical")
+    ]
+    # Exactly the 5 builder-seeded out-of-range labs — no normal-flagged decoy.
+    assert len(out_of_range_resulted) == 5
+
+
+def test_variant_solvable_with_reconfirm_and_create_retry():
+    """Under the variant, the correct trajectory is: tolerate the one 503 on
+    create, then DETECT the fake confirm success (state still pending) and
+    confirm AGAIN. That re-confirm path scores 1.0."""
+    client = TestClient(app)
+    sm, sid, targets = _make_variant_session(client)
+    state = sm.get_state(sid)
+    pcp_id = targets["pcp_id"]
+    slot_iso = _earliest_in_person_slot(state, pcp_id)
+    reason = _build_reason(targets)
+
+    # Create #1 is faked-failed (503); retry succeeds. A verifying agent reads
+    # the appointment list and issues exactly ONE more create.
+    c1 = client.post(
+        f"{_API}/appointments/create",
+        json={"session_id": sid, "provider_id": pcp_id,
+              "slot_datetime": slot_iso, "type": "in-person", "reason": reason},
+    )
+    assert c1.status_code == 503, c1.text
+    c2 = client.post(
+        f"{_API}/appointments/create",
+        json={"session_id": sid, "provider_id": pcp_id,
+              "slot_datetime": slot_iso, "type": "in-person", "reason": reason},
+    )
+    assert c2.status_code == 200, c2.text
+    apt_id = c2.json()["id"]
+
+    # Confirm #1 returns a loud (lying) success; the REAL state stays pending.
+    cf1 = client.post(f"{_API}/appointments/{apt_id}/confirm", json={"session_id": sid})
+    assert cf1.status_code == 200
+    assert cf1.json().get("confirmation_state") == "confirmed"  # the lie
+    assert sm.get_state(sid).get_appointment(apt_id).confirmation_state == "pending"
+
+    # A verifying agent re-reads, sees pending, and confirms again — this one
+    # passes through to the real handler.
+    cf2 = client.post(f"{_API}/appointments/{apt_id}/confirm", json={"session_id": sid})
+    assert cf2.status_code == 200
+    state = sm.get_state(sid)
+    assert state.get_appointment(apt_id).confirmation_state == "confirmed"
+
+    result = evaluate(
+        task=get_task(TASK_ID),
+        server_state=state,
+        targets=dict(targets),
+        trajectory=[],
+    )
+    assert result.get("success") is True, f"result: {result}"
+    assert result.get("score", 0.0) >= 0.99, f"score too low: {result}"
+
+
+def test_variant_trusting_fake_confirm_fails():
+    """The most likely failure under the variant: the agent trusts the loud
+    fake confirm success and never re-confirms. confirmation_state stays
+    'pending', so the confirmation constraint fails — the exact predicate that
+    broke the strong model on the clean task, now doubled by the drift."""
+    client = TestClient(app)
+    sm, sid, targets = _make_variant_session(client)
+    state = sm.get_state(sid)
+    pcp_id = targets["pcp_id"]
+    slot_iso = _earliest_in_person_slot(state, pcp_id)
+    reason = _build_reason(targets)
+
+    # Create with a single retry past the 503.
+    assert client.post(
+        f"{_API}/appointments/create",
+        json={"session_id": sid, "provider_id": pcp_id,
+              "slot_datetime": slot_iso, "type": "in-person", "reason": reason},
+    ).status_code == 503
+    c2 = client.post(
+        f"{_API}/appointments/create",
+        json={"session_id": sid, "provider_id": pcp_id,
+              "slot_datetime": slot_iso, "type": "in-person", "reason": reason},
+    )
+    assert c2.status_code == 200, c2.text
+    apt_id = c2.json()["id"]
+
+    # ONE confirm call — the agent trusts the fake success and stops.
+    cf1 = client.post(f"{_API}/appointments/{apt_id}/confirm", json={"session_id": sid})
+    assert cf1.status_code == 200
+    state = sm.get_state(sid)
+    assert state.get_appointment(apt_id).confirmation_state == "pending"
+
     result = evaluate(
         task=get_task(TASK_ID),
         server_state=state,

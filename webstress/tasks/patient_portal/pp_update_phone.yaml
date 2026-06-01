@@ -3,15 +3,19 @@ env_id: patient_portal
 title: Update Contact Details After a Move
 instruction_template: >-
   You recently moved and switched carriers, so your contact information on file
-  is out of date. On your profile, update your phone number to {target.new_phone}
-  and your email address to {target.new_email}. Then replace your emergency
-  contact: set the emergency contact name to {target.ec_name}, the emergency
-  contact phone to {target.ec_new_phone}, and the emergency contact relationship
-  to {target.ec_relationship}. Change only those contact fields. Do not alter any
-  other profile field (name, date of birth, sex, insurance, primary care
-  provider, allergies, conditions, or pharmacies), do not send any messages, and
-  do not create, cancel, or modify any appointment, prescription, lab result,
-  referral, or insurance claim.
+  is out of date and is NOT the number/address you should keep. Update your
+  profile so the phone number is exactly {target.new_phone} and the email address
+  is exactly {target.new_email}. Then replace your emergency contact entirely: set
+  the emergency contact name to {target.ec_name}, the emergency contact phone to
+  {target.ec_new_phone}, and the emergency contact relationship to
+  {target.ec_relationship}. Several values already on file or referenced in your
+  messages look almost identical to these (a digit transposed, a hyphen added) --
+  verify each value character-by-character before you save, because saving a
+  look-alike instead of the exact target counts as a failure. Change only those
+  contact fields. Do not alter any other profile field (name, date of birth, sex,
+  insurance, primary care provider, allergies, conditions, or pharmacies), do not
+  send any messages, and do not create, cancel, or modify any appointment,
+  prescription, lab result, referral, or insurance claim.
 difficulty: medium
 time_limit_seconds: 180
 expected_steps: 9
@@ -30,11 +34,31 @@ seed:
       - Hypertension
       - Type 2 Diabetes
       insurance_tier: standard
+      # --- Verification lever: the values ALREADY ON FILE are deliberate
+      # near-misses of the targets the agent must write. The on-file phone is
+      # the new phone with its last two digits transposed (...5390 vs target
+      # ...5309); the on-file email is the new email with a hyphen inserted in
+      # the domain (meridian-health vs meridianhealth). The OLD emergency
+      # contact is a DIFFERENT person whose phone is a look-alike of the
+      # patient's NEW phone (cross-wire bait) and a different relationship.
+      # A careless agent that re-saves what it sees, copies the wrong look-alike,
+      # or cross-wires the EC number trips a high/critical constraint.
+      phone: (555) 867-5390
+      email: jordan.casey@meridian-health.org
+      emergency_contact:
+        name: Morgan Pratt
+        phone: (555) 867-5093
+        relationship: Parent
     outputs:
     - pcp_id
     - patient_name
     - insurance_plan_name
     - member_id
+    - on_file_phone
+    - on_file_email
+    - on_file_ec_name
+    - on_file_ec_phone
+    - on_file_ec_relationship
   - use: provider_directory
     params:
       count: 5
@@ -98,28 +122,46 @@ seed:
     ec_name: Avery Sloane
     ec_new_phone: (555) 318-7742
     ec_relationship: Spouse
+    # The exact on-file (pre-task) look-alikes, surfaced as targets so the
+    # disambiguation constraints can compare against the precise baseline the
+    # agent must NOT re-save. (Also recoverable via initial.patient.*.)
+    on_file_phone: '{output.on_file_phone}'
+    on_file_email: '{output.on_file_email}'
+    on_file_ec_phone: '{output.on_file_ec_phone}'
 canonical_diff:
   # `state.patient` is a diffable singleton with a real id field, so the
   # contact-info change appears as a single Update("patient", "<id>", {...}).
   # Because one Update already covers the patient row, untouched fields cannot
-  # be guarded by a singleton preserve:ALL invariant — they MUST be pinned with
+  # be guarded by a singleton preserve:ALL invariant -- they MUST be pinned with
   # field-level `expr: x == initial.patient.<field>` predicates inside the same
   # changes: block (Singleton Update field-guard rule). The three contact
   # fields are exact-matched; every other patient field is frozen.
   update:
     - entity: patient
       desc: >-
-        Phone, email, and emergency contact updated to the exact target values
-        via the demographics endpoint, with every other profile field frozen.
+        Phone, email, and emergency contact updated to the EXACT target values
+        (not the on-file look-alikes), with every other profile field frozen.
       where: { id: { any: true } }
       changes:
-        phone: { eq: "(555) 867-5309" }
-        email: { eq: "jordan.casey@meridianhealth.org" }
+        # --- positive contact writes (exact value, must beat the look-alikes) ---
+        phone:
+          expr: >-
+            x == target['new_phone']
+            and x != initial.patient.phone
+            and x != initial.patient.emergency_contact.phone
+            and x != target['ec_new_phone']
+        email:
+          expr: >-
+            x == target['new_email']
+            and x != initial.patient.email
         emergency_contact:
           expr: >-
             x.get('name') == target['ec_name']
             and x.get('phone') == target['ec_new_phone']
             and x.get('relationship') == target['ec_relationship']
+            and x.get('name') != initial.patient.emergency_contact.name
+            and x.get('phone') != initial.patient.emergency_contact.phone
+            and x.get('phone') != target['new_phone']
         # --- frozen singleton fields (untouched-field guard) ---
         name:
           expr: "x == initial.patient.name"
@@ -148,23 +190,31 @@ canonical_diff:
             [s.get('screening_name') for s in x]
             == [s.screening_name for s in initial.patient.applicable_screenings]
   constraints:
-    # Honest disambiguation guards: the new phone must genuinely differ from the
-    # phone already on file (the move actually changed it), and the patient's
-    # own new phone must NOT be cross-wired with the emergency contact's number.
-    # The two seeded numbers and the two target numbers all look alike, so a
-    # careless copy/paste trips one of these.
-    - desc: New patient phone differs from the prior phone on file (a real change occurred)
-      expr: "state.patient.phone != initial.patient.phone"
+    # Honest disambiguation guards. Because the on-file values are deliberate
+    # one-character look-alikes of the targets, an agent that re-saves the
+    # displayed value, copies a look-alike, or cross-wires the EC number will
+    # trip one of these -- and a single failed constraint forces success=False.
+    - desc: New patient phone is the exact target, not the look-alike already on file
+      expr: "state.patient.phone == target['new_phone'] and state.patient.phone != initial.patient.phone"
+      severity: critical
+    - desc: New patient email is the exact target, not the look-alike already on file
+      expr: "state.patient.email == target['new_email'] and state.patient.email != initial.patient.email"
       severity: high
-    - desc: New patient email differs from the prior email on file (a real change occurred)
-      expr: "state.patient.email != initial.patient.email"
-      severity: medium
     - desc: Patient phone and emergency-contact phone are not cross-wired
       expr: "state.patient.phone != state.patient.emergency_contact.phone"
+      severity: critical
+    - desc: Emergency-contact phone is the exact new EC number, not the patient's new number or the old EC number
+      expr: >-
+        state.patient.emergency_contact.phone == target['ec_new_phone']
+        and state.patient.emergency_contact.phone != target['new_phone']
+        and state.patient.emergency_contact.phone != initial.patient.emergency_contact.phone
       severity: high
-    - desc: Exactly the emergency-contact identity was replaced (relationship reflects the new contact)
-      expr: "state.patient.emergency_contact.relationship == target['ec_relationship']"
-      severity: medium
+    - desc: Emergency contact was genuinely replaced (name and relationship reflect the new contact, not the old one)
+      expr: >-
+        state.patient.emergency_contact.name == target['ec_name']
+        and state.patient.emergency_contact.relationship == target['ec_relationship']
+        and state.patient.emergency_contact.name != initial.patient.emergency_contact.name
+      severity: high
   invariant:
   - collection: state.appointments
     preserve: ALL

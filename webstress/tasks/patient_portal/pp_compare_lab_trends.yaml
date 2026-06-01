@@ -19,7 +19,7 @@ primary_primitives:
 - grounding
 start_path: /labs
 seed:
-  distractors: 14
+  distractors: 20
   steps:
   - use: patient_profile
     params:
@@ -33,7 +33,7 @@ seed:
     - pcp_name
   - use: provider_directory
     params:
-      count: 6
+      count: 8
       specialties:
       - pcp
       - endocrinology
@@ -44,6 +44,14 @@ seed:
       must_include:
       - pcp
       - endocrinology
+      # Two endocrinologists so the earliest-endo-slot discriminator must take
+      # the GLOBAL min over slots across BOTH endo providers (the canonical
+      # datetime expr already iterates every provider in endo_provider_ids).
+      # An agent that books the first endocrinologist's earliest slot without
+      # comparing the second endocrinologist's calendar can miss the true
+      # earliest slot and fail the datetime predicate.
+      count_per_specialty:
+        endocrinology: 2
     outputs:
     - provider_ids
     - providers_by_specialty
@@ -55,13 +63,42 @@ seed:
   - use: lab_results_panel
     params:
       resulted_count: 6
-      pending_count: 2
+      pending_count: 3
       abnormal_count: 3
       trend_test: HbA1c
+      # Overall the series FALLS (8.4 -> 7.8) so an agent that eyeballs the
+      # whole trajectory reads "improving" -- but the strict last-two
+      # RESULTED-by-collected_at pair (7.5 -> 7.8) INCREASES, i.e. worsening.
+      # The discriminator expr uses [-1] > [-2] over resulted points sorted by
+      # collected_at, so the most-recent pair (not the overall direction) is
+      # what decides the branch.
       trend_values:
-      - '6.9'
-      - '7.4'
-      - '8.1'
+      - '8.4'
+      - '7.9'
+      - '7.5'
+      - '7.8'
+      # Adversarial same-test HbA1c points that punish lazy grounding while
+      # staying fair (the expr filters status=='resulted' and sorts strictly by
+      # collected_at). The trend points land at days_ago 360/270/180/90.
+      #   - A 'collected' (NON-resulted) HbA1c dated 30 days ago is the most
+      #     recent HbA1c overall and the visible tail of /labs/trend (which
+      #     returns every status). Its low value (6.4) would, if an agent
+      #     skips the resulted filter, push 6.4 into [-1] vs 7.8 -> falsely
+      #     "improving" and flip the branch to PCP. The expr's resulted filter
+      #     drops it, so it is a fair trap.
+      #   - A 'resulted' near-duplicate dated 91 days ago (one day BEFORE the
+      #     true most-recent 90-days-ago point) becomes the genuine [-2] with
+      #     value 7.7; the true last pair becomes 7.7 -> 7.8 which STILL
+      #     increases (worsening preserved) -- but only when the agent sorts by
+      #     date precisely; a sloppy sort that keeps 7.5 as [-2] still worsens,
+      #     while one that mis-orders these two near-tie points can invert it.
+      trend_adversarial_points:
+      - days_ago: 30
+        value: '6.4'
+        status: collected
+      - days_ago: 91
+        value: '7.7'
+        status: resulted
       critical_count: 1
     outputs:
     - resulted_lab_ids
@@ -101,11 +138,17 @@ canonical_diff:
   # The agent must RE-DERIVE the most-recent-pair HbA1c trend direction from
   # initial.lab_results (it is NOT stated in the instruction). The direction
   # selects BOTH the provider specialty and the exact reason string, and gates
-  # which oneof branch is satisfiable. The trend in this seed is WORSENING
-  # (6.9 -> 7.4 -> 8.1; the most recent pair 7.4 -> 8.1 increases), so only
-  # the endocrinology branch can be satisfied. The "_pair_increases" clause in
-  # the provider_id expr binds the branch to the seeded data so an agent that
-  # misreads the trend and books the PCP (improving) branch cannot pass.
+  # which oneof branch is satisfiable. The seeded resulted HbA1c series is
+  # 8.4 -> 7.9 -> 7.5 -> 7.8 by collected_at: overall it FALLS (an eyeballer
+  # reads "improving"), but the strict last-two RESULTED-by-collected_at pair
+  # 7.5 -> 7.8 INCREASES, so the trend is WORSENING and only the endocrinology
+  # branch can be satisfied. A 'collected' (non-resulted) HbA1c is the most
+  # recent HbA1c overall and a resulted near-duplicate is dated one day before
+  # the true most-recent point; the expr's status=='resulted' filter and the
+  # strict collected_at sort are what neutralize both traps. The
+  # "_pair_increases" clause in the provider_id expr binds the branch to the
+  # seeded data so an agent that misreads the trend and books the PCP
+  # (improving) branch cannot pass.
   oneof:
   # -------------------------------------------------------------------
   # Branch A -- WORSENING (most recent value higher than the prior one):

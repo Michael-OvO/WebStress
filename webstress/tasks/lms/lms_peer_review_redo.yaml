@@ -4,12 +4,14 @@ title: Peer Review Quality Audit and Redo
 instruction_template: Three of your submitted peer reviews for the assignment in {target.course_code}
   were returned for revision because they were incomplete. Open every returned review
   and redo it by re-scoring all three rubric criteria (clarity, depth, originality)
-  using this exact rule, computed from the previous scores shown on each review. For
-  any criterion that already has a previous score, the corrected score is exactly two
+  using this exact rule, computed separately from the previous scores shown on each
+  individual review (the previous scores differ from review to review). For any criterion
+  that already has a previous score on that review, the corrected score is exactly two
   points higher than the previous score, capped at a maximum of 5. For any criterion
-  that has no previous score, the corrected score is exactly 3. Write a fresh comment
-  of at least 80 characters for each review and submit all three. Do not touch any
-  peer review that was not returned for revision, and do not send any messages.
+  that has no previous score on that review, the corrected score is exactly 3. Write a
+  fresh comment of at least 80 characters for each review that addresses the reviewee
+  by their first name, and submit all three. Do not touch any peer review that was not
+  returned for revision, and do not send any messages.
 difficulty: expert
 time_limit_seconds: 440
 expected_steps: 30
@@ -59,6 +61,7 @@ seed:
       - submitted
       - in_progress
       returned_review_count: 3
+      returned_prev_variation: per_review
     outputs:
     - review_ids
     - pending_review_ids
@@ -69,6 +72,8 @@ seed:
     - req_score_clarity
     - req_score_depth
     - req_score_originality
+    - returned_req_scores
+    - returned_review_name_tokens
   targets:
     course_code: '{output.course_code}'
     pending_review_ids: '{output.pending_review_ids}'
@@ -79,6 +84,8 @@ seed:
     req_score_clarity: '{output.req_score_clarity}'
     req_score_depth: '{output.req_score_depth}'
     req_score_originality: '{output.req_score_originality}'
+    returned_req_scores: '{output.returned_req_scores}'
+    returned_review_name_tokens: '{output.returned_review_name_tokens}'
 canonical_diff:
   update:
     - entity: PeerReview
@@ -94,11 +101,19 @@ canonical_diff:
           expr: >-
             len(x) == 3
             and set(x) == {'clarity', 'depth', 'originality'}
-            and int(x['clarity']) == int(target['req_score_clarity'])
-            and int(x['depth']) == int(target['req_score_depth'])
-            and int(x['originality']) == int(target['req_score_originality'])
+            and (lambda parts: len(parts) == 3
+              and int(x['clarity']) == int(parts[0])
+              and int(x['depth']) == int(parts[1])
+              and int(x['originality']) == int(parts[2]))(
+                next(e.split('=')[1].split('~')
+                  for e in target['returned_req_scores'].split('|')
+                  if e.split('=')[0] == v.strip()))
         comments:
-          expr: "len(x.strip()) >= 80"
+          expr: >-
+            len(x.strip()) >= 80
+            and next(e.split(':', 1)[1]
+              for e in target['returned_review_name_tokens'].split('|')
+              if e.split(':', 1)[0] == v.strip()).lower() in x.lower()
         status: {eq: submitted}
   invariant:
     - collection: state.peer_reviews

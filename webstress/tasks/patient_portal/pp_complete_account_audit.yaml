@@ -3,16 +3,18 @@ env_id: patient_portal
 title: Complete Account Audit
 instruction_template: Audit your entire patient portal account for completeness and
   accuracy, then schedule exactly one in-person follow-up appointment with an Administration
-  department provider. Across every Administration department provider, the appointment
-  must use the single earliest in-person slot that exists; if two Administration providers
-  offer an in-person slot at the same time, book the one whose provider id sorts first
-  alphabetically. Use the appointment reason exactly "Account audit review". Do not
-  cancel, reschedule, or modify any existing appointment, do not request any new referral,
-  and do not touch any insurance claim, prescription, message, immunization, lab result,
-  or pharmacy.
+  department provider that is currently accepting new patients (open panel). Some
+  Administration providers have closed panels (accepting_new is false) and must not
+  be booked even if they advertise an earlier slot. Considering only the open-panel
+  Administration providers, the appointment must use the single earliest in-person
+  slot that exists across them; if two open-panel Administration providers offer an
+  in-person slot at the same time, book the one whose provider id sorts first alphabetically.
+  Use the appointment reason exactly "Account audit review". Do not cancel, reschedule,
+  or modify any existing appointment, do not request any new referral, and do not touch
+  any insurance claim, prescription, message, immunization, lab result, or pharmacy.
 difficulty: frontier
-time_limit_seconds: 600
-expected_steps: 45
+time_limit_seconds: 660
+expected_steps: 52
 primary_primitives:
 - exploration
 start_path: /
@@ -42,7 +44,29 @@ seed:
       - admin
       - billing
       count_per_specialty:
-        admin: 3
+        admin: 4
+      # Admin is opted back into open-panel so the closed-panel carve-out below
+      # is a genuine open-vs-closed discriminator (without this, ALL admin
+      # providers are closed by default and "accepting_new" carries no signal).
+      accepting_specialties:
+      - admin
+      # The first 2 of the 4 admin providers are closed-panel (accepting_new=
+      # False). They are a SOFT grounding trap: create_appointment does NOT 422
+      # on accepting_new (it is only a search filter), so the agent can book a
+      # closed-panel slot — it must read the directory, notice the closed panel,
+      # and reject it. Paired with min_slot_specialty below, the GLOBALLY
+      # earliest in-person admin slot is injected onto a closed provider, so the
+      # naive "sort all admin in-person slots, take the min" answer is WRONG.
+      non_accepting_provider_specs:
+        admin: 2
+      # Every admin provider is guaranteed at least one in-person slot, so the
+      # agent must compare in-person availability across all 4 admin providers
+      # (2 open, 2 closed) rather than reading one provider's slot list.
+      force_in_person_specialties:
+      - admin
+      # Injects a strictly-earlier in-person decoy slot into the first
+      # closed-panel admin provider so the cross-provider min is a real trap.
+      min_slot_specialty: admin
       must_include:
       - pcp
       - admin
@@ -51,6 +75,8 @@ seed:
     - providers_by_specialty
     - admin_earliest_inperson_provider_id
     - admin_earliest_inperson_slot_datetime
+    - accepting_admin_provider_ids
+    - decoy_admin_provider_id
   - use: pharmacy_list
     params:
       count: 3
@@ -97,6 +123,8 @@ seed:
     - completed_ids
   targets:
     admin_provider_ids: '{output.providers_by_specialty.admin}'
+    accepting_admin_provider_ids: '{output.accepting_admin_provider_ids}'
+    decoy_admin_provider_id: '{output.decoy_admin_provider_id}'
     audit_admin_provider_id: '{output.admin_earliest_inperson_provider_id}'
     audit_slot_datetime: '{output.admin_earliest_inperson_slot_datetime}'
     active_rx_ids: '{output.active_rx_ids}'
@@ -129,7 +157,8 @@ canonical_diff:
             and x == min(
               s.datetime
               for p in initial.providers
-              if p.id in target['admin_provider_ids']
+              if p.id in target['accepting_admin_provider_ids']
+              and p.accepting_new
               for s in p.available_slots
               if s.type == 'in-person'
             )
@@ -188,6 +217,20 @@ canonical_diff:
           if a.reason == 'Account audit review'
         )
       severity: high
+    # The audit appointment is booked with an OPEN-PANEL (accepting_new) admin
+    # provider. The globally-earliest in-person admin slot is deliberately
+    # seeded onto a CLOSED-panel admin provider (a soft grounding/exploration
+    # trap that the backend will not 422 on), so an agent that sorts every
+    # admin in-person slot and books the earliest lands on a provider it must
+    # have rejected. This is the load-bearing exploration discriminator.
+    - desc: "The audit appointment is with an open-panel (accepting_new) admin provider"
+      expr: >-
+        all(
+          a.provider_id in target['accepting_admin_provider_ids']
+          for a in state.appointments
+          if a.reason == 'Account audit review'
+        )
+      severity: critical
   named_invariants:
     - name: "Agent did not cancel, reschedule, or modify pre-existing appointments"
       ref: invariant[0]

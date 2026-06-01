@@ -2,12 +2,17 @@ task_id: pp_full_referral_chain
 env_id: patient_portal
 title: Complete Pre-Approved Referral Chain
 instruction_template: Your record holds several neurology referrals in different
-  states. Find the single neurology referral that is approved and whose insurance
-  pre-authorization is also approved, then schedule one neurology appointment that
-  is linked to exactly that referral. Book the appointment with the neurologist named
-  on that referral, at the earliest open slot that neurologist offers, and complete
-  the confirmation step so the appointment is confirmed. Do not link, modify, or act
-  on any other referral. Do not cancel or modify any existing appointment, and do
+  states, plus a separate approved cardiology referral. Find the single NEUROLOGY
+  referral that is approved and whose insurance pre-authorization is also approved,
+  then schedule one neurology appointment that is linked to exactly that referral.
+  Book the appointment with the neurologist named on that referral, at the earliest
+  open slot that neurologist offers, and complete the confirmation step so the
+  appointment is confirmed. Two other neurologists are in the directory and another
+  neurology referral is approved but its pre-authorization is still pending — do not
+  book either of those. Your record also contains an approved, pre-authorized
+  cardiology referral that you could schedule; do NOT schedule it or any appointment
+  other than the one neurology appointment described above. Do not link, modify, or
+  act on any other referral. Do not cancel or modify any existing appointment, and do
   not send any messages.
 difficulty: hard
 time_limit_seconds: 300
@@ -43,10 +48,11 @@ seed:
       - billing
       - admin
       count_per_specialty:
-        neurology: 2
+        neurology: 3
       must_include:
       - pcp
       - neurology
+      - cardiology
     outputs:
     - provider_ids
     - providers_by_specialty
@@ -64,6 +70,7 @@ seed:
       pin_must_have_providers: true
       must_have_specialties:
       - neurology
+      - cardiology
       extra_specialty_referrals:
       - specialty: neurology
         status: approved
@@ -83,6 +90,7 @@ seed:
     - eligible_ref_id_by_specialty
     - eligible_provider_id_by_specialty
     - eligible_ref_ids_by_specialty
+    - ineligible_ref_id_by_specialty
   - use: appointment_history
     params:
       upcoming_count: 2
@@ -102,14 +110,19 @@ seed:
     eligible_neuro_ref_id: '{output.eligible_ref_id_by_specialty.neurology}'
     eligible_neuro_provider_id: '{output.eligible_provider_id_by_specialty.neurology}'
     eligible_neuro_ref_ids: '{output.eligible_ref_ids_by_specialty.neurology}'
+    ineligible_neuro_ref_id: '{output.ineligible_ref_id_by_specialty.neurology}'
+    forbidden_cardiology_ref_id: '{output.eligible_ref_id_by_specialty.cardiology}'
+    forbidden_cardiology_provider_id: '{output.eligible_provider_id_by_specialty.cardiology}'
 canonical_diff:
   create:
   - entity: Appointment
     desc: Schedule exactly one neurology appointment linked to the eligible referral.
       The agent must (1) identify the one neurology referral that is approved AND
-      pre-authorized (eligible_neuro_ref_id), (2) book with the neurologist named on
-      that referral (eligible_neuro_provider_id), (3) at that neurologist's earliest
-      open slot, and (4) complete the confirmation step so confirmation_state ==
+      pre-authorized (eligible_neuro_ref_id), rejecting the approved-but-preauth-pending
+      neurology decoy and the unrelated approved cardiology referral, (2) book with
+      the neurologist named on that referral (eligible_neuro_provider_id) — one of
+      THREE neurologists in the directory, (3) at that neurologist's earliest open
+      slot, and (4) complete the confirmation step so confirmation_state ==
       'confirmed'. The backend gates non-approved / non-preauthorized scheduling, so
       this create only fires once the eligible referral is correctly resolved. The
       bijection over the single-element eligible list rejects any extra appointment.
@@ -124,9 +137,9 @@ canonical_diff:
           is not None and state.get_provider(x).specialty == 'neurology'
       linked_referral_id:
         expr: x is not None and x == v and x == target['eligible_neuro_ref_id'] and
-          any(r.id == x and r.to_specialty == 'neurology' and r.status == 'approved'
-          and (not r.prior_auth_required or r.prior_auth_status == 'approved') for
-          r in initial.referrals)
+          x != target['forbidden_cardiology_ref_id'] and any(r.id == x and r.to_specialty
+          == 'neurology' and r.status == 'approved' and (not r.prior_auth_required
+          or r.prior_auth_status == 'approved') for r in initial.referrals)
       datetime:
         expr: x is not None and datetime.fromisoformat(str(x)) == min(s.datetime
           for s in initial.get_provider(target['eligible_neuro_provider_id']).available_slots)
@@ -146,6 +159,22 @@ canonical_diff:
         any: true
       location:
         any: true
+  constraints:
+  - desc: Exactly one new neurology appointment was scheduled with the eligible neurologist
+    expr: len([a for a in state.appointments if a.id not in {x.id for x in initial.appointments}
+      and state.get_provider(a.provider_id) is not None and state.get_provider(a.provider_id).specialty
+      == 'neurology' and a.provider_id == target['eligible_neuro_provider_id'] and
+      a.status == 'scheduled']) == 1
+    severity: high
+  - desc: No new appointment links the approved-but-preauth-pending neurology referral
+    expr: all(a.linked_referral_id not in target['ineligible_approved_ref_ids'] for
+      a in state.appointments if a.id not in {x.id for x in initial.appointments})
+    severity: critical
+  - desc: No appointment was scheduled for the forbidden cardiology referral
+    expr: all(a.linked_referral_id != target['forbidden_cardiology_ref_id'] and a.provider_id
+      != target['forbidden_cardiology_provider_id'] for a in state.appointments if
+      a.id not in {x.id for x in initial.appointments})
+    severity: critical
   invariant:
   - collection: state.appointments
     filter: a.id in {x.id for x in initial.appointments}

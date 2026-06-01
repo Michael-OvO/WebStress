@@ -3,15 +3,18 @@ env_id: patient_portal
 title: Renew Expiring Prescriptions
 instruction_template: 'Review every active prescription in the medication cabinet.
   Request a renewal for each prescription that BOTH expires within the next 30 days
-  AND has 0 refills remaining. For each renewal, the request must be linked to that
-  specific prescription. Do not request a renewal for any prescription that still
-  has refills available, for any prescription whose expiration date is more than 30
-  days away (even if it has 0 refills), or for any expired prescription. Do not send
-  any other provider messages, and do not refill, transfer, discontinue, or otherwise
+  (counting from today) AND has 0 refills remaining. The cabinet contains several
+  zero-refill prescriptions whose expiration dates sit just on either side of the
+  30-day cutoff, so check each prescription''s exact expiration date carefully rather
+  than relying on an "expiring soon" label. For each renewal, the request must be
+  linked to that specific prescription. Do not request a renewal for any prescription
+  that still has refills available, for any zero-refill prescription whose expiration
+  date is more than 30 days away, or for any expired prescription. Do not send any
+  other provider messages, and do not refill, transfer, discontinue, or otherwise
   modify any prescription.'
 difficulty: hard
-time_limit_seconds: 330
-expected_steps: 22
+time_limit_seconds: 390
+expected_steps: 26
 primary_primitives:
 - state_tracking
 start_path: /medications
@@ -51,13 +54,27 @@ seed:
       active_count: 2
       expired_count: 1
       zero_refill_count: 2
-      expiring_soon_count: 5
-      expiring_zero_refill_count: 3
+      expiring_soon_count: 6
+      expiring_zero_refill_count: 4
+      expiring_zero_refill_days:
+      - 26
+      - 28
+      - 29
+      - 30
+      far_zero_refill_count: 4
+      far_zero_refill_days:
+      - 31
+      - 33
+      - 37
+      - 44
     outputs:
     - active_rx_ids
     - zero_refill_rx_id
     - expiring_rx_ids
     - expiring_zero_refill_rx_ids
+    - far_zero_refill_rx_ids
+    - first_expiring_zero_refill_rx_id
+    - second_expiring_zero_refill_rx_id
     - expiring_with_refills_rx_ids
   - use: message_threads
     params:
@@ -73,6 +90,9 @@ seed:
     zero_refill_rx_id: '{output.zero_refill_rx_id}'
     expiring_rx_ids: '{output.expiring_rx_ids}'
     expiring_zero_refill_rx_ids: '{output.expiring_zero_refill_rx_ids}'
+    far_zero_refill_rx_ids: '{output.far_zero_refill_rx_ids}'
+    first_expiring_zero_refill_rx_id: '{output.first_expiring_zero_refill_rx_id}'
+    second_expiring_zero_refill_rx_id: '{output.second_expiring_zero_refill_rx_id}'
     expiring_with_refills_rx_ids: '{output.expiring_with_refills_rx_ids}'
     all_msg_ids: '{output.all_msg_ids}'
 canonical_diff:
@@ -150,6 +170,20 @@ canonical_diff:
         r.status == 'pending_renewal'
         for r in state.prescriptions
         if r.id not in target['expiring_zero_refill_rx_ids']
+      )
+  - desc: No zero-refill prescription that expires MORE than 30 days out was renewed (the out-of-window trap set)
+    severity: critical
+    expr: >-
+      all(
+        next(p.status for p in state.prescriptions if p.id == rid) == 'active'
+        for rid in target['far_zero_refill_rx_ids']
+      )
+  - desc: Every renewed prescription still had 0 refills remaining (renewal must not consume or alter the refill counter)
+    severity: high
+    expr: >-
+      all(
+        int(next(p.refills_remaining for p in state.prescriptions if p.id == rid)) == 0
+        for rid in target['expiring_zero_refill_rx_ids']
       )
   - desc: Every expiring prescription that still has refills was left active and was not renewed
     severity: high

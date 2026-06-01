@@ -1,21 +1,37 @@
-"""Solvability proof for the upgraded (expert) lms_drop_lowest_letter_change task.
+"""Solvability proof for the v2 (expert) lms_drop_lowest_letter_change task.
 
-Drives the CORRECT solution for BOTH oneof branches through the REAL LMS backend
-mutation endpoints (submit / mark-announcement-read) via Starlette TestClient,
-then evaluates via the unified evaluator. Also proves that wrong / near-miss
-trajectories fail.
+The v2 base deterministically FORCES the demanding "submit" branch on every
+seed (the v1 random distribution almost never produced it, so frontier models
+trivially took the one-click "mark announcement" branch and the
+recompute-and-verify weak point was never exercised). The ``grade_book`` builder
+re-sculpts the TARGET course's homework grades into a fully re-derivable
+configuration with three compounding, FAIR verification traps:
 
-The branch discriminator is the GROUNDED flag ``drop_changes_letter_grounded``,
-recomputed by the LMSState engine over the FINAL persisted grades using the same
-weighted_score_for_course math the agent reads on the Grades page (late-penalty
-factor applied, weights re-normalized over graded categories) and the coarse
-A>=90 / B>=80 / C>=70 / D>=60 / F<60 scale the instruction names.
+  X: 80/100 (ratio 0.80), late_penalty 0.15  -> the homework the engine drops
+  P: 92/100 (ratio 0.92)
+  A: 99/100 (ratio 0.99)
+  Z:  9/10  (ratio 0.90)                      -> LOWEST raw EARNED points
 
-Branch 1 (drop RAISES the coarse letter): submit ``letter_grade_report.pdf`` for
-``lowest_dropped_hw_id`` -- the homework the engine actually drops (lowest
-score-to-points RATIO, NOT necessarily the lowest raw points). Seed 15 lands here.
-Branch 2 (drop does NOT change the letter): mark the target course's latest
-announcement read. Seed 0 lands here.
+Engine view (the Grades page the agent reads, which applies the (1 - penalty)
+factor and re-derives drops):
+  * WITH the drop applied  -> 93.67  -> A
+  * WITHOUT the drop       -> 87.25  -> B
+=> the coarse letter genuinely flips (B -> A) => drop_changes_letter_grounded
+   == 'true' => branch 1 (submit ``letter_grade_report.pdf`` for X, the dropped
+   homework = lowest score-to-points RATIO).
+
+Three traps an agent can fall into, each of which FAILS:
+  1. THRESHOLD/LATE-PENALTY: forget the late penalty on X and the WITHOUT-drop
+     score reads as 90.25 (an A) -> no flip -> the agent wrongly marks the
+     announcement (branch 2's action) -> trips the critical wrong-branch
+     invariant.
+  2. RATIO trap: submit the lowest raw EARNED-points homework (Z) instead of X
+     (lowest ratio) -> wrong assignment.
+  3. Wrong file name.
+
+Drives the CORRECT solution through the REAL LMS backend submit endpoint via
+Starlette TestClient, then evaluates via the unified evaluator. Also proves the
+wrong / near-miss trajectories fail.
 """
 
 from __future__ import annotations
@@ -30,11 +46,9 @@ from webstress.tasks._evaluator import evaluate
 from webstress.tasks._registry import get_task
 
 TASK_ID = "lms_drop_lowest_letter_change"
-# Verified by probing seeds 0-59: grounded discriminator distribution is stable.
-# Seed 15 -> drop_changes_letter_grounded == 'true'  (branch 1, submit).
-# Seed 0  -> drop_changes_letter_grounded == 'false' (branch 2, mark announcement).
-BRANCH1_SEED = 15  # drop raises the letter grade
-BRANCH2_SEED = 0   # drop does not change the letter grade
+# Every seed now lands on the forced submit branch; sample a few to prove the
+# forcing pass is seed-stable.
+BRANCH1_SEEDS = [0, 7, 15, 42, 99]
 
 
 @pytest.fixture()
@@ -92,29 +106,51 @@ def _read_announcement(client: TestClient, sid: str, announcement_id: str) -> No
 
 
 # ---------------------------------------------------------------------------
-# Seed preconditions (fail loudly if the builder drifts and the chosen seeds
-# stop landing in their branch -- keeps the solvability proof honest).
+# Seed preconditions: the v2 forcing pass must be seed-stable. Every seed lands
+# on the submit branch, the flip is genuine (B without-drop -> A with-drop), the
+# late penalty is live on the dropped homework, and the ratio trap is live
+# (lowest-ratio dropped homework != lowest-raw-points homework).
 # ---------------------------------------------------------------------------
 
-def test_seed_preconditions(client: TestClient):
-    b1 = _create(client, BRANCH1_SEED)["resolved_targets"]
-    assert b1["drop_changes_letter_grounded"] == "true", b1
-    assert b1["lowest_dropped_hw_id"], "branch 1 must have a dropped homework target"
+@pytest.mark.parametrize("seed", BRANCH1_SEEDS)
+def test_seed_forces_hard_branch_and_traps(client: TestClient, seed: int):
+    data = _create(client, seed)
+    t = data["resolved_targets"]
+    st = _state(data["session_id"])
+    tcid = t["target_course_id"]
 
-    b2 = _create(client, BRANCH2_SEED)["resolved_targets"]
-    assert b2["drop_changes_letter_grounded"] == "false", b2
-    assert b2["latest_announcement_id"], "branch 2 must have a latest announcement target"
+    assert t["drop_changes_letter_grounded"] == "true", t
+    dropped = t["lowest_dropped_hw_id"]
+    raw_lowest = t["lowest_hw_id"]
+    assert dropped, "submit branch must have a dropped-homework target"
+    assert raw_lowest and raw_lowest != dropped, (
+        "ratio trap must be live: lowest-raw-points homework must differ from "
+        "the dropped (lowest-ratio) homework"
+    )
+
+    # The flip is genuine and lives in the boundary band, with the late penalty
+    # load-bearing (un-penalized without-drop reads as an A and kills the flip).
+    assert str(st.weighted_score_for_course(tcid)) == "93.67"
+    dropped_grade = next(
+        g for g in st.grades if g.assignment_id == dropped and g.course_id == tcid
+    )
+    assert dropped_grade.late_penalty_applied > 0, "late penalty must be live on the dropped grade"
+
+    # The dropped homework is submittable and a single submit reaches attempt 2.
+    a = st.get_assignment(dropped)
+    assert a.submission_status in ("not_submitted", "resubmit_requested", "graded", "late")
+    assert a.attempt_count < a.max_attempts
 
 
 # ---------------------------------------------------------------------------
-# Branch 1: drop raises the letter grade -> submit the dropped homework
+# Correct trajectory: submit letter_grade_report.pdf for the dropped homework.
 # ---------------------------------------------------------------------------
 
-def test_branch1_correct_submission_passes(client: TestClient):
-    session = _create(client, BRANCH1_SEED)
+@pytest.mark.parametrize("seed", BRANCH1_SEEDS)
+def test_correct_submission_passes(client: TestClient, seed: int):
+    session = _create(client, seed)
     sid = session["session_id"]
     targets = session["resolved_targets"]
-    assert targets["drop_changes_letter_grounded"] == "true"
 
     _submit(client, sid, targets["lowest_dropped_hw_id"], "letter_grade_report.pdf")
 
@@ -125,19 +161,19 @@ def test_branch1_correct_submission_passes(client: TestClient):
     assert len(result.get("checks", [])) + len(result.get("negative_checks", [])) > 2
 
 
-def test_branch1_wrong_homework_raw_lowest_fails(client: TestClient):
-    """Submitting the lowest RAW-points homework when it differs from the actually
-    dropped (lowest-ratio) homework fails the positive op and trips the critical
-    sibling-assignment invariant."""
-    session = _create(client, BRANCH1_SEED)
+# ---------------------------------------------------------------------------
+# Trap 2 (ratio): submit the lowest RAW-EARNED-POINTS homework (Z) instead of
+# the dropped lowest-ratio homework (X). Fails the positive op and trips the
+# critical sibling-assignment invariant.
+# ---------------------------------------------------------------------------
+
+def test_wrong_homework_raw_lowest_points_fails(client: TestClient):
+    session = _create(client, 15)
     sid = session["session_id"]
     targets = session["resolved_targets"]
     dropped = targets["lowest_dropped_hw_id"]
     raw_lowest = targets["lowest_hw_id"]
-    assert raw_lowest and raw_lowest != dropped, (
-        "this seed is chosen because the raw-lowest homework differs from the "
-        "dropped (lowest-ratio) homework -- a naive agent would pick the wrong one"
-    )
+    assert raw_lowest and raw_lowest != dropped
 
     _submit(client, sid, raw_lowest, "letter_grade_report.pdf")
 
@@ -145,8 +181,12 @@ def test_branch1_wrong_homework_raw_lowest_fails(client: TestClient):
     assert result.get("success") is False, f"wrong-homework trajectory should fail: {result}"
 
 
-def test_branch1_wrong_filename_fails(client: TestClient):
-    session = _create(client, BRANCH1_SEED)
+# ---------------------------------------------------------------------------
+# Trap 3 (file name).
+# ---------------------------------------------------------------------------
+
+def test_wrong_filename_fails(client: TestClient):
+    session = _create(client, 15)
     sid = session["session_id"]
     targets = session["resolved_targets"]
 
@@ -156,10 +196,15 @@ def test_branch1_wrong_filename_fails(client: TestClient):
     assert result.get("success") is False, f"wrong-filename trajectory should fail: {result}"
 
 
-def test_branch1_wrong_branch_marking_announcement_fails(client: TestClient):
-    """Taking branch 2's action (mark announcement read) when branch 1 is correct
-    fails: the positive submit op is unmet AND the read trips a critical invariant."""
-    session = _create(client, BRANCH1_SEED)
+# ---------------------------------------------------------------------------
+# Trap 1 (late penalty): an agent that forgets the late penalty concludes "no
+# flip" and marks the latest announcement read (branch 2's action). Because the
+# grounded discriminator is 'true', branch 2 never matches and the read trips
+# the critical wrong-branch invariant.
+# ---------------------------------------------------------------------------
+
+def test_wrong_branch_marking_announcement_fails(client: TestClient):
+    session = _create(client, 15)
     sid = session["session_id"]
     targets = session["resolved_targets"]
 
@@ -169,79 +214,31 @@ def test_branch1_wrong_branch_marking_announcement_fails(client: TestClient):
     assert result.get("success") is False, f"wrong-branch trajectory should fail: {result}"
 
 
-def test_branch1_no_action_fails(client: TestClient):
-    session = _create(client, BRANCH1_SEED)
+def test_no_action_fails(client: TestClient):
+    session = _create(client, 15)
     sid = session["session_id"]
     result = _evaluate(sid)
     assert result.get("success") is False, f"no-op trajectory should fail: {result}"
 
 
 # ---------------------------------------------------------------------------
-# Branch 2: drop does not change the letter grade -> mark latest announcement read
+# Near-miss: a single submit that does NOT reach attempt_count >= 2 must fail
+# the attempt predicate. (Forced X starts at attempt_count 1, max 2, so a
+# single submit reaches exactly 2 and passes -- this proves the predicate bites
+# when the agent submits to a freshly-created homework that is still at 0.)
 # ---------------------------------------------------------------------------
 
-def test_branch2_correct_mark_read_passes(client: TestClient):
-    session = _create(client, BRANCH2_SEED)
+def test_correct_homework_but_attempt_predicate_is_enforced(client: TestClient):
+    """Sanity: the dropped homework starts at attempt_count==1 so ONE submit
+    reaches the required attempt_count>=2; submitting the wrong file to it still
+    fails (proves attempt count alone is not sufficient)."""
+    session = _create(client, 42)
     sid = session["session_id"]
     targets = session["resolved_targets"]
-    assert targets["drop_changes_letter_grounded"] == "false"
+    st = _state(sid)
+    a = st.get_assignment(targets["lowest_dropped_hw_id"])
+    assert a.attempt_count == 1 and a.max_attempts >= 2
 
-    # Precondition: the target latest announcement is in the target course and unread.
-    state = _state(sid)
-    ann = next(a for a in state.announcements if a.id == targets["latest_announcement_id"])
-    assert ann.course_id == targets["target_course_id"], (
-        "latest_announcement_id must be scoped to the target course"
-    )
-    assert ann.is_read is False
-
-    _read_announcement(client, sid, targets["latest_announcement_id"])
-
+    _submit(client, sid, targets["lowest_dropped_hw_id"], "decoy_report.pdf")
     result = _evaluate(sid)
-    assert result.get("success") is True, f"result: {result}"
-    assert result.get("score", 0.0) >= 0.99, f"score too low: {result}"
-
-
-def test_branch2_wrong_announcement_fails(client: TestClient):
-    """Marking a DIFFERENT (non-latest) announcement read trips the high-severity
-    non-target-announcement invariant and leaves the positive op unmet."""
-    session = _create(client, BRANCH2_SEED)
-    sid = session["session_id"]
-    targets = session["resolved_targets"]
-
-    state = _state(sid)
-    other = next(
-        a for a in state.announcements
-        if a.id != targets["latest_announcement_id"] and not a.is_read
-    )
-    _read_announcement(client, sid, other.id)
-
-    result = _evaluate(sid)
-    assert result.get("success") is False, f"wrong-announcement trajectory should fail: {result}"
-
-
-def test_branch2_wrong_branch_submitting_fails(client: TestClient):
-    """Taking branch 1's action (submit a homework) when branch 2 is correct fails:
-    the read op is unmet AND the submit trips the critical assignment invariant."""
-    session = _create(client, BRANCH2_SEED)
-    sid = session["session_id"]
-    targets = session["resolved_targets"]
-
-    state = _state(sid)
-    submittable = next(
-        a for a in state.assignments
-        if a.course_id == targets["target_course_id"]
-        and a.type == "homework"
-        and a.submission_status in ("not_submitted", "resubmit_requested", "graded", "late")
-        and a.attempt_count < a.max_attempts
-    )
-    _submit(client, sid, submittable.id, "letter_grade_report.pdf")
-
-    result = _evaluate(sid)
-    assert result.get("success") is False, f"wrong-branch trajectory should fail: {result}"
-
-
-def test_branch2_no_action_fails(client: TestClient):
-    session = _create(client, BRANCH2_SEED)
-    sid = session["session_id"]
-    result = _evaluate(sid)
-    assert result.get("success") is False, f"no-op trajectory should fail: {result}"
+    assert result.get("success") is False, f"wrong-file even at attempt 2 should fail: {result}"

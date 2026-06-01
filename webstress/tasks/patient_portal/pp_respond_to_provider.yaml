@@ -56,9 +56,22 @@ seed:
       # the decoy PCP is a real bookable alternative the agent must reject.
       force_in_person_specialties:
       - pcp
+      # MODALITY TRAP (deterministic across every seed): each PCP is guaranteed
+      # to own a TELEHEALTH slot strictly EARLIER than its earliest in-person
+      # slot. So the assigned PCP's globally-earliest slot is ALWAYS telehealth,
+      # and "book the earliest slot of the assigned PCP" (ignoring modality) is
+      # a concrete wrong answer on every seed — the in-person filter in the
+      # datetime min-expr is now an active discriminator, not an occasionally
+      # vacuous predicate. (Previously the trap only fired on the ~1/3 of seeds
+      # where the RNG happened to draw an early telehealth slot, which made the
+      # in-person gate a noisy difficulty signal.)
+      force_earlier_telehealth_specialties:
+      - pcp
     outputs:
     - provider_ids
     - providers_by_specialty
+    - decoy_pcp_id
+    - decoy_pcp_name
   - use: pharmacy_list
     params:
       count: 2
@@ -81,6 +94,7 @@ seed:
     - context_msg_ids
   targets:
     pcp_id: '{output.pcp_id}'
+    pcp_name: '{output.pcp_name}'
     all_msg_ids: '{output.all_msg_ids}'
     thread_ids: '{output.thread_ids}'
     bp_msg_id: '{output.context_msg_ids.bp_medication_adjustment}'
@@ -88,6 +102,12 @@ seed:
     # bounded-creation / sibling invariants can reason about "the other PCP"
     # without recomputing a set inside a filter scope (Class 6 hazard).
     pcp_provider_ids: '{output.providers_by_specialty.pcp}'
+    # The SECOND same-specialty PCP (the decoy / "other PCP"). Pinned as a
+    # scalar so the bounded-create invariant and the grounding intervention
+    # variant can reference the wrong-but-tempting provider directly. prov_1 is
+    # always the assigned PCP, so this is providers_by_specialty.pcp[1].
+    decoy_pcp_id: '{output.decoy_pcp_id}'
+    decoy_pcp_name: '{output.decoy_pcp_name}'
 canonical_diff:
   # Positive signals:
   #   (a) mark the PCP's "Blood Pressure Medication Adjustment" message

@@ -1,15 +1,17 @@
-"""Solvability proof for the upgraded pp_mark_all_read task.
+"""Solvability proof for the v2-upgraded pp_mark_all_read task.
 
-The task was re-tiered easy -> medium: the agent must mark read ONLY the unread
-clinical + scheduling messages (the "actionable care-team" subset) while leaving
-every unread billing message unread. This defeats the one-click
-POST /messages/mark-all-read shortcut.
+The task (medium) requires the agent to mark read ONLY the unread clinical +
+scheduling messages (the "actionable care-team" subset, 7 messages) while
+leaving every unread *billing* AND *prescription-renewal* (rx_renewal) message
+unread (5 messages). This defeats both the one-click
+``POST /messages/mark-all-read`` shortcut and the tempting heuristic of treating
+auto-generated rx_renewal messages as actionable.
 
 Correct solution is driven through the REAL backend mutation endpoint
 ``POST /api/env/patient_portal/messages/{id}/read`` via TestClient, sharing the
 app's session manager so the mutation lands on the same state we evaluate. Wrong
-trajectories (the mark-all-read shortcut, and a partial-only-clinical pass) are
-asserted to fail.
+trajectories (the mark-all-read shortcut, a partial-only-clinical pass, and an
+over-act that also clears the rx_renewal decoy) are asserted to fail.
 """
 
 from __future__ import annotations
@@ -48,13 +50,14 @@ def _create_session() -> tuple[str, dict, object]:
 
 def test_correct_trajectory_via_real_endpoint_passes():
     """Marking exactly the clinical+scheduling unread messages via the real
-    read endpoint evaluates to a pass."""
+    read endpoint evaluates to a pass; billing AND rx_renewal stay unread."""
     sid, targets, state = _create_session()
     actionable = list(targets["clinical_unread_msg_ids"]) + list(
         targets["scheduling_unread_msg_ids"]
     )
-    assert actionable, "seed produced no actionable unread messages"
+    assert len(actionable) == 7, f"expected 7 actionable, got {len(actionable)}: {actionable}"
     assert targets["billing_unread_msg_ids"], "seed produced no protected billing unread"
+    assert targets["rx_renewal_unread_msg_ids"], "seed produced no protected rx_renewal unread"
 
     client = TestClient(app)
     for msg_id in actionable:
@@ -72,8 +75,8 @@ def test_correct_trajectory_via_real_endpoint_passes():
 
 
 def test_mark_all_read_shortcut_fails():
-    """The one-click mark-all-read shortcut over-marks billing -> CRITICAL
-    constraint violation -> fail."""
+    """The one-click mark-all-read shortcut over-marks billing AND rx_renewal ->
+    CRITICAL constraint violation -> fail."""
     sid, targets, state = _create_session()
 
     client = TestClient(app)
@@ -101,3 +104,30 @@ def test_partial_only_clinical_fails():
     task = get_task("pp_mark_all_read")
     result = evaluate(task=task, server_state=state, targets=dict(targets), trajectory=[])
     assert result.get("success") is False, f"partial should fail: {result}"
+
+
+def test_over_act_clearing_rx_renewal_decoy_fails():
+    """Marking the actionable subset PLUS the rx_renewal decoy clears a protected
+    message -> CRITICAL constraint violation + cardinality mismatch -> fail.
+
+    This is the new v2 trap: a model primed by the renewal workflow may treat
+    auto-generated prescription-renewal messages as actionable. They must stay
+    unread.
+    """
+    sid, targets, state = _create_session()
+    over = (
+        list(targets["clinical_unread_msg_ids"])
+        + list(targets["scheduling_unread_msg_ids"])
+        + list(targets["rx_renewal_unread_msg_ids"])
+    )
+
+    client = TestClient(app)
+    for msg_id in over:
+        resp = client.post(
+            f"{_PREFIX}/messages/{msg_id}/read", json={"session_id": sid}
+        )
+        assert resp.status_code == 200, resp.text
+
+    task = get_task("pp_mark_all_read")
+    result = evaluate(task=task, server_state=state, targets=dict(targets), trajectory=[])
+    assert result.get("success") is False, f"over-act on rx_renewal should fail: {result}"

@@ -4,18 +4,32 @@ The upgraded task ("Clear Urgent Announcements for Active Courses") is a
 SELECTIVE announcement-completion task: the agent must mark read ONLY the
 unread announcements that are (a) urgent priority AND (b) belong to a course
 the student is actively enrolled in (status == "enrolled"). Unread+urgent
-announcements in a waitlisted course must stay unread, and every non-urgent
-unread announcement must stay unread.
+announcements in a NON-enrolled course (waitlisted OR dropped) must stay
+unread, and every non-urgent unread announcement must stay unread.
+
+v2 hardening (vs the v1 upgrade):
+  * Urgency is no longer title-readable — the builder runs with
+    plain_urgent_titles=True, so the "URGENT:" prefix is gone and priority is
+    ONLY discoverable in the structured `priority` field.
+  * The non-enrolled cross-reference now spans TWO statuses across TWO courses
+    (one waitlisted + one dropped via dropped_count=1), and the urgent feed is
+    larger (count=20, unread=14, urgent=9), so ~2 urgent-unread land in
+    non-enrolled courses and the positive set is ~7. A single missed
+    cross-reference is no longer the whole failure surface.
+  * Two NEW critical discriminators punish BOTH error directions: an
+    under-marking guard (every target must be read) and an exact-count guard
+    (the number of unread->read transitions must equal the target size).
 
 This test:
   1. Drives the CORRECT solution through the REAL backend
      POST /announcements/{id}/read endpoints via TestClient (confirms the
      intended answer is achievable past every backend gate) and asserts the
      canonical_diff evaluator scores it as a pass.
-  2. Asserts three NEAR-MISS trajectories fail:
+  2. Asserts four NEAR-MISS trajectories fail:
        - the mark_all_read shortcut (touches preserved-unread decoys),
-       - "mark every urgent" (touches the waitlisted-course urgent decoy),
-       - "mark every unread" (touches non-urgent unread decoys).
+       - "mark every urgent" (touches the non-enrolled urgent decoys),
+       - "mark every unread" (touches non-urgent unread decoys),
+       - under-marking (skips one target — trips the no-under-marking guard).
 """
 
 from __future__ import annotations
@@ -85,9 +99,27 @@ def test_correct_selective_completion_passes():
 
     target_ids = _split(targets["enrolled_unread_urgent_announcement_ids"])
     # The discriminator must be non-vacuous and must NOT be the whole unread set.
-    assert len(target_ids) >= 3, target_ids
+    # v2 raises the positive cardinality so a single cross-reference is not the
+    # entire failure surface.
+    assert len(target_ids) >= 5, target_ids
     assert set(target_ids) != set(_split(targets["unread_announcement_ids"]))
     assert _split(targets["preserved_unread_announcement_ids"]), "need decoys"
+
+    # v2: the non-enrolled cross-reference spans >=2 courses (waitlisted+dropped)
+    # and >=2 urgent-unread announcements must be preserved because their course
+    # is not enrolled — confirming the join is genuinely load-bearing.
+    state = _state_for(sid)
+    non_enrolled = set(_split(targets["non_enrolled_course_ids"]))
+    assert len(non_enrolled) >= 2, non_enrolled
+    urgent_unread_in_non_enrolled = [
+        a.id for a in state.announcements
+        if a.priority == "urgent" and not a.is_read and a.course_id in non_enrolled
+    ]
+    assert len(urgent_unread_in_non_enrolled) >= 2, urgent_unread_in_non_enrolled
+    # v2: urgency must NOT be readable from the title string (no "URGENT:" tell).
+    for a in state.announcements:
+        if a.priority == "urgent":
+            assert "URGENT" not in a.title.upper(), a.title
 
     # Drive the REAL mark-read endpoint for each target announcement only.
     for ann_id in target_ids:
@@ -169,3 +201,27 @@ def test_mark_all_unread_fails():
 
     result = _evaluate(sid, targets)
     assert result.get("success") is False, f"all-unread must fail: {result}"
+
+
+# ---------------------------------------------------------------------------
+# Near-miss: under-marking — skip exactly one target announcement
+# ---------------------------------------------------------------------------
+
+def test_under_marking_one_target_fails():
+    client = TestClient(app)
+    app.state.controller_secret = ensure_controller_secret()
+    sid, targets = _create_session(client)
+
+    target_ids = _split(targets["enrolled_unread_urgent_announcement_ids"])
+    assert len(target_ids) >= 2, target_ids
+    # Mark all but the last target — a single missed item must still fail the
+    # v2 "no under-marking" critical discriminator.
+    for ann_id in target_ids[:-1]:
+        resp = client.post(
+            f"/api/env/lms/announcements/{ann_id}/read",
+            json={"session_id": sid},
+        )
+        assert resp.status_code == 200, resp.text
+
+    result = _evaluate(sid, targets)
+    assert result.get("success") is False, f"under-marking must fail: {result}"
