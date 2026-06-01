@@ -457,8 +457,12 @@ def _build_course_catalog(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[s
         "target_course_id": first_course_id or "",
         "course_id_1": course_ids[0] if len(course_ids) > 0 else "",
         "course_id_2": course_ids[1] if len(course_ids) > 1 else "",
+        "course_id_3": course_ids[2] if len(course_ids) > 2 else "",
+        "course_id_4": course_ids[3] if len(course_ids) > 3 else "",
         "course_code_1": course_codes[0] if len(course_codes) > 0 else "",
         "course_code_2": course_codes[1] if len(course_codes) > 1 else "",
+        "course_code_3": course_codes[2] if len(course_codes) > 2 else "",
+        "course_code_4": course_codes[3] if len(course_codes) > 3 else "",
     }
 
 
@@ -473,16 +477,43 @@ def _build_enrollment_set(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[s
     Params
     ------
     roles : dict[str, str]      -- course_id -> role override ("ta")
-    include_waitlisted : bool   -- add a waitlisted enrollment (default False)
+    ta_course_index : int       -- mark the course at this index as the student's
+                                   TA course (role="ta"). Index-based so a task
+                                   YAML can request a TA course without knowing
+                                   the dynamically-generated course_id (dict keys
+                                   in ``roles`` cannot be templated). Default None.
+    include_waitlisted : bool   -- mark the LAST course's enrollment waitlisted
+                                   (default False)
+    dropped_count : int         -- in addition to the optional waitlisted slot,
+                                   mark this many of the trailing courses
+                                   'dropped' (default 0). Combined with
+                                   include_waitlisted this yields a MIX of
+                                   non-enrolled statuses (one waitlisted + N
+                                   dropped) so the enrollment cross-reference the
+                                   agent must compute spans multiple statuses and
+                                   multiple courses rather than a single
+                                   easy-to-spot waitlisted course. The builder's
+                                   non_enrolled_course_ids predicate is
+                                   status != 'enrolled', so dropped courses are
+                                   handled identically to waitlisted ones.
     """
     roles: dict[str, str] = params.get("roles", {})
+    ta_course_index = params.get("ta_course_index", None)
     include_waitlisted = params.get("include_waitlisted", False)
+    dropped_count = int(params.get("dropped_count", 0))
 
     student_id = ctx.base.get("student", {}).get("id", "student_1")
     courses = ctx.base.get("courses", [])
 
     if "enrollments" not in ctx.base:
         ctx.base["enrollments"] = []
+
+    # Resolve the index-based TA course into the role map (index-based overrides
+    # are additive and do not affect tasks that don't set ta_course_index).
+    if ta_course_index is not None and courses:
+        _idx = int(ta_course_index) % len(courses)
+        roles = dict(roles)
+        roles[courses[_idx]["id"]] = "ta"
 
     enrollment_ids: list[str] = []
     ta_course_id: str | None = None
@@ -493,8 +524,17 @@ def _build_enrollment_set(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[s
         course_id = course_data["id"]
         role = roles.get(course_id, "student")
         status = "enrolled"
-        if include_waitlisted and i == len(courses) - 1:
+        n = len(courses)
+        # Last course -> waitlisted (when requested). The `dropped_count`
+        # courses immediately preceding the waitlisted slot become 'dropped'.
+        # Without include_waitlisted, the trailing `dropped_count` courses are
+        # dropped. Either way these are deterministic and never collide.
+        waitlisted_idx = n - 1 if include_waitlisted else None
+        dropped_start = (waitlisted_idx if waitlisted_idx is not None else n) - dropped_count
+        if include_waitlisted and i == waitlisted_idx:
             status = "waitlisted"
+        elif dropped_count > 0 and dropped_start <= i < (waitlisted_idx if waitlisted_idx is not None else n):
+            status = "dropped"
 
         enrollment = Enrollment(
             id=ctx.next_id("enrollment"),
@@ -558,6 +598,8 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     resubmit_count : int       -- how many request resubmission (default 0)
     target_assignment_status : str -- filter target selection by status
     exclude_course_id : str    -- optionally exclude a course when choosing the target assignment
+    exclude_course_ids : list  -- exclude MULTIPLE courses from target selection (additive)
+    restrict_target_course_id : str -- pin the target assignment to a single course (additive)
     """
     per_course = params.get("per_course_count", 6)
     graded_frac = params.get("graded_fraction", 0.5)
@@ -569,6 +611,17 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     vary_resubmit_attempts = params.get("vary_resubmit_attempts", False)
     target_status = params.get("target_assignment_status", None)
     exclude_course_id = params.get("exclude_course_id", "")
+    # Additional course ids to exclude from TARGET selection (the student-submit
+    # leg). Lets a dual-role task keep the student-course target out of EVERY
+    # course the student is a TA in, not just one. Additive: default empty so
+    # existing tasks that only pass `exclude_course_id` are unaffected.
+    exclude_course_ids = params.get("exclude_course_ids", []) or []
+    if isinstance(exclude_course_ids, str):
+        exclude_course_ids = [exclude_course_ids]
+    # Optionally PIN the student-submit target to a single course id so the
+    # target_* outputs resolve deterministically even as the surrounding course
+    # set grows. Additive: default None preserves the legacy rng.choice path.
+    restrict_target_course_id = params.get("restrict_target_course_id", "") or ""
     # When True, force EXACTLY ONE past-due not_submitted assignment to remain
     # inside its course's late-submission window (all other past-due missing
     # work is pushed beyond max_late_days so it is unrecoverable). Lets a task
@@ -580,6 +633,53 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     # set (size 1 once sole_recoverable_missing has run), so the standard
     # target_* outputs deterministically resolve to that single assignment.
     target_recoverable_missing = bool(params.get("target_recoverable_missing", False))
+    # When True, engineer the target course's unsubmitted set so that the
+    # "highest rubric points" decision is DECOUPLED from the displayed
+    # points_possible column (lms_review_rubric_submit hardening). Every
+    # unsubmitted assignment in the target course is pinned to an IDENTICAL
+    # points_possible (so the points column is a tie and uninformative), and
+    # each is given an explicit rubric whose criteria max_points sum to a
+    # DIFFERENT total than points_possible — so the agent MUST open and SUM
+    # every rubric to find the winner, then re-read its criteria COUNT for the
+    # filename. The pack also bakes in a two-way rubric-total tie at the top
+    # (forcing the earliest-due tie-break) AND a due-date tie within that pair
+    # (forcing the alphabetical tie-break), plus a same-course look-alike with
+    # equal points but a strictly lower rubric total. Default False so every
+    # other task sharing this builder is unaffected (additive).
+    rubric_tie_pack = bool(params.get("rubric_tie_pack", False))
+    # When > 0, turn the resubmit set into a RESUBMISSION-WINDOW eligibility
+    # problem (lms_resubmit_after_feedback hardening). The N eligible
+    # resubmit_requested assignments are pinned just past due but INSIDE their
+    # course's late-submission window (window open). In addition, this many
+    # EXPIRED resubmit_requested decoys are created whose due_at is pushed well
+    # beyond max_late_days (window CLOSED) — they share submission_status
+    # 'resubmit_requested' but must NOT be resubmitted. Their ids are exposed as
+    # ``expired_resubmit_assignment_ids`` and are intentionally NOT added to
+    # ``resubmit_assignment_ids`` so a naive status filter over-acts and trips
+    # the freeze invariant. Default 0 so every sibling task is unaffected.
+    resubmit_window_discriminator = int(params.get("resubmit_window_discriminator", 0) or 0)
+    # boundary_missing_count : int -- for the first N courses (catalog order),
+    #   place a BOUNDARY PAIR of not_submitted past-due assignments:
+    #     * one pinned to EXACTLY max_late_days days overdue  → recoverable
+    #       ("within max late days" is inclusive per the late-policy instruction)
+    #     * one pinned to EXACTLY max_late_days + 1 days overdue → unrecoverable
+    #   Because the late presets vary per course (7 / 5 / 3 max_late_days), this
+    #   forces the agent to read each course's policy and compute days-overdue
+    #   EXACTLY at the boundary — an off-by-one in the day count flips
+    #   recoverable↔unrecoverable. Default 0 so every existing task that shares
+    #   this builder is unaffected (purely additive). Whole-day offsets are used
+    #   so (now - due).days is exact and stable under the floating seed anchor
+    #   (eval session_start == seed ctx.now == derive_anchor_time(seed)).
+    boundary_missing_count = int(params.get("boundary_missing_count", 0) or 0)
+    # ── lookalike_same_days_late (lms_submit_late v2 hardening) ──
+    # When > 0 (and sole_recoverable_missing is set), force N past-due
+    # not_submitted assignments in STRICTER courses to be the SAME number of
+    # days late as the sole recoverable assignment, but UNRECOVERABLE because
+    # their course's max_late_days is smaller. This kills the "sort by days
+    # late" shortcut: days-late is uninformative, so the agent MUST read each
+    # course's late_policy.max_late_days and compute days_late <= max_late_days
+    # per course. Default 0 preserves the prior behavior for other tasks.
+    lookalike_same_days_late = int(params.get("lookalike_same_days_late", 0) or 0)
 
     courses = ctx.base.get("courses", [])
     courses_by_id = {course["id"]: course for course in courses}
@@ -939,6 +1039,140 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
                     a["max_attempts"] = _new_attempt + 1
                 break
 
+    # ── Carve out blocked (un-resubmittable) flagged assignments ──
+    # When blocked_resubmit_count > 0, take that many resubmit_requested rows and
+    # pin attempt_count == max_attempts so the /resubmit endpoint guard
+    # (attempt_count < max_attempts) returns 422. The row STILL shows
+    # submission_status == "resubmit_requested" (it looks resubmittable in the
+    # UI / feedback list), so the agent must discover the blocker mid-task,
+    # abandon that row, and NOT count it — genuine backtracking + verification.
+    # Because no mutation can change max_attempts, the FAIR resolution is to
+    # exclude the row from resubmit_assignment_ids and have the instruction say
+    # "if an assignment has no attempts remaining, leave it untouched." The
+    # excluded ids are emitted (blocked_resubmit_assignment_id[s]) so the task
+    # can freeze them as a critical invariant. We carve from the END of
+    # resubmit_ids so the per-row attempt-count cycle on the leading
+    # (resubmittable) rows is unchanged and deterministic.
+    blocked_resubmit_count = int(params.get("blocked_resubmit_count", 0) or 0)
+    blocked_resubmit_ids: list[str] = []
+    if blocked_resubmit_count > 0 and len(resubmit_ids) > blocked_resubmit_count:
+        for _ in range(blocked_resubmit_count):
+            _bid = resubmit_ids.pop()  # take the trailing flagged row
+            for a in all_assignments:
+                if a["id"] != _bid:
+                    continue
+                # Pin to no remaining attempts: attempt_count == max_attempts.
+                _maxed = max(2, int(a.get("attempt_count", 1) or 1))
+                a["attempt_count"] = _maxed
+                a["max_attempts"] = _maxed
+                a["submission_status"] = "resubmit_requested"
+                # Carry feedback so it is indistinguishable from a real flagged
+                # row until the agent inspects attempts / tries to resubmit.
+                if not a.get("feedback"):
+                    a["feedback"] = ctx.rng.choice(_RESUBMIT_FEEDBACK)
+                break
+            blocked_resubmit_ids.append(_bid)
+
+    # ── Near-identical resubmit look-alike decoy (grounding pressure) ──
+    # When add_resubmit_lookalike is set, take a still-flagged assignment's
+    # exact title and stamp it onto a GRADED assignment in a DIFFERENT course.
+    # The submit endpoint accepts "graded" status, so the look-alike appears
+    # resubmittable; the agent must match submission_status == "resubmit_requested"
+    # EXACTLY (not the title) to avoid touching it. The look-alike id is emitted
+    # so the task can freeze it (and its grade row) as a critical invariant.
+    lookalike_decoy_assignment_id = ""
+    if bool(params.get("add_resubmit_lookalike", False)) and resubmit_ids:
+        _flag = next((a for a in all_assignments if a["id"] == resubmit_ids[0]), None)
+        if _flag is not None:
+            _look = next(
+                (
+                    a for a in all_assignments
+                    if a["course_id"] != _flag["course_id"]
+                    and a["id"] not in resubmit_ids
+                    and a["id"] not in blocked_resubmit_ids
+                    and a["submission_status"] == "graded"
+                    and a.get("score") is not None
+                ),
+                None,
+            )
+            if _look is not None:
+                _look["title"] = _flag["title"]
+                lookalike_decoy_assignment_id = _look["id"]
+
+    # ── Resubmission-window eligibility discriminator ──
+    # Pin every eligible resubmit assignment just past due but inside its
+    # course's late window (so the window is unambiguously OPEN with margin
+    # against the ±1 day seed-anchor drift), and create the requested number of
+    # EXPIRED resubmit_requested decoys whose due dates are pushed years past
+    # the window (window unambiguously CLOSED). The expired decoys share
+    # submission_status 'resubmit_requested' so a naive status filter would
+    # wrongly resubmit them, but they are excluded from resubmit_ids so doing so
+    # trips the freeze invariant. Distributed across distinct courses so
+    # eligibility must be re-derived per course's late policy.
+    expired_resubmit_ids: list[str] = []
+    if resubmit_window_discriminator > 0:
+        # 1) Pin each eligible resubmit to 1 day past due (window open: slack =
+        #    max_late_days − 1 ≥ 1 day for every preset; never year-old).
+        for rid in resubmit_ids:
+            for a in all_assignments:
+                if a["id"] != rid:
+                    continue
+                a["due_at"] = (ctx.now - timedelta(days=1)).isoformat()
+                # submitted_at must predate the (now past) due so the original
+                # attempt reads as an on-time first try awaiting resubmission.
+                a["submitted_at"] = (ctx.now - timedelta(days=2)).isoformat()
+                break
+        # 2) Build expired decoys from existing graded/late/submitted rows that
+        #    are NOT eligible targets, preferring DISTINCT courses so the
+        #    per-course window must be re-derived. Pin each years past due.
+        used_courses: set[str] = set()
+        eligible_course_ids = {
+            a["course_id"]
+            for a in all_assignments
+            if a["id"] in resubmit_ids
+        }
+        decoy_sources = [
+            a for a in all_assignments
+            if a["id"] not in resubmit_ids
+            and a["submission_status"] in ("graded", "late", "submitted")
+        ]
+        # Two passes: first prefer one-per-course in courses NOT already holding
+        # an eligible target, then fill from anywhere if short.
+        ordered_sources = (
+            [a for a in decoy_sources if a["course_id"] not in eligible_course_ids]
+            + [a for a in decoy_sources if a["course_id"] in eligible_course_ids]
+        )
+        for a in ordered_sources:
+            if len(expired_resubmit_ids) >= resubmit_window_discriminator:
+                break
+            if a["id"] in expired_resubmit_ids:
+                continue
+            # Prefer spreading across courses for the first pass.
+            if (
+                len(expired_resubmit_ids) < resubmit_window_discriminator
+                and a["course_id"] in used_courses
+                and len(used_courses) < resubmit_window_discriminator
+                and any(
+                    s["course_id"] not in used_courses
+                    for s in ordered_sources
+                    if s["id"] not in expired_resubmit_ids
+                )
+            ):
+                continue
+            course = courses_by_id.get(a["course_id"])
+            ml = int(course["syllabus"]["late_policy"]["max_late_days"]) if course else 7
+            _ensure_scored_submission(a, Decimal("0.55"))
+            a["submission_status"] = "resubmit_requested"
+            # Years past due → window closed under any preset / any drift.
+            a["due_at"] = (ctx.now - timedelta(days=ml + 400)).isoformat()
+            a["submitted_at"] = (ctx.now - timedelta(days=ml + 401)).isoformat()
+            a["feedback"] = (
+                "Resubmission window has closed; this revision can no longer be "
+                "accepted. Contact your instructor if you need an exception."
+            )
+            expired_resubmit_ids.append(a["id"])
+            used_courses.add(a["course_id"])
+
     # Guarantee late-within-grace examples when requested for grading-dispute tasks.
     needed_grace_lates = late_within_grace_count
     if needed_grace_lates > 0:
@@ -1046,6 +1280,13 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     # least slack remaining, tie-broken by highest points, then earliest due,
     # then id — deterministic for a given seed.
     sole_recoverable_id: str = ""
+    # Same-days-late look-alikes (lms_submit_late v2). Populated by the FINAL
+    # uniqueness pass when lookalike_same_days_late > 0; empty otherwise so the
+    # return-dict references are always safe.
+    lookalike_ids: list[str] = []
+    # Authoritative out-of-window (unrecoverable) past-due not_submitted ids,
+    # computed from the seed anchor after due dates are finalized.
+    out_of_window_ids: list[str] = []
     if sole_recoverable_missing:
         def _due_dt(a: dict[str, Any]) -> datetime:
             raw = a["due_at"]
@@ -1110,6 +1351,49 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
             if a["due_at"] and _due_dt(a) < ctx.now and a["id"] not in missing_ids:
                 missing_ids.append(a["id"])
 
+    # ── Boundary pairs: exact off-by-one recoverable/unrecoverable traps ──
+    # For the first `boundary_missing_count` courses, force a recoverable
+    # assignment pinned to EXACTLY max_late_days overdue (inclusive boundary)
+    # and an unrecoverable one pinned to EXACTLY max_late_days + 1 overdue. The
+    # day-count is computed against the same anchor the evaluator uses, so the
+    # classification is deterministic; the difficulty is that the agent must
+    # read each course's distinct policy and not be off by one day.
+    if boundary_missing_count > 0:
+        for course_data in courses[:boundary_missing_count]:
+            cid = course_data["id"]
+            ml = int(course_data["syllabus"]["late_policy"]["max_late_days"])
+            # Candidate slots in this course we are allowed to repurpose: prefer
+            # currently not_submitted rows, then any non-graded row (avoid
+            # clobbering graded history). Skip the sole_recoverable pin.
+            course_rows = [a for a in all_assignments if a["course_id"] == cid]
+            pref = [a for a in course_rows
+                    if a["submission_status"] == "not_submitted" and a["id"] != sole_recoverable_id]
+            if len(pref) < 2:
+                extra = [a for a in course_rows
+                         if a["submission_status"] != "graded"
+                         and a["id"] != sole_recoverable_id
+                         and a not in pref]
+                pref = pref + extra
+            if len(pref) < 2:
+                # Last resort: repurpose graded rows too (this task does not use
+                # grade_book, so no grade record depends on them).
+                extra2 = [a for a in course_rows
+                          if a["id"] != sole_recoverable_id and a not in pref]
+                pref = pref + extra2
+            if len(pref) < 2:
+                continue
+            rec_a, unr_a = pref[0], pref[1]
+            for slot, days_over in ((rec_a, ml), (unr_a, ml + 1)):
+                slot["due_at"] = (ctx.now - timedelta(days=days_over)).isoformat()
+                slot["submission_status"] = "not_submitted"
+                slot["score"] = None
+                slot["feedback"] = None
+                slot["submitted_at"] = None
+                slot["file_name"] = None
+                slot["attempt_count"] = 0
+                if slot["id"] not in missing_ids:
+                    missing_ids.append(slot["id"])
+
     # Select target and decoy assignments
     target_assignment_id: str | None = None
     target_assignment_title: str = ""
@@ -1120,6 +1404,13 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     candidates = list(all_assignments)
     if exclude_course_id:
         candidates = [a for a in candidates if a["course_id"] != exclude_course_id]
+    if exclude_course_ids:
+        _excluded = {str(cid) for cid in exclude_course_ids}
+        candidates = [a for a in candidates if a["course_id"] not in _excluded]
+    if restrict_target_course_id:
+        _restricted = [a for a in candidates if a["course_id"] == restrict_target_course_id]
+        if _restricted:
+            candidates = _restricted
     if target_status:
         candidates = [a for a in candidates if a["submission_status"] == target_status]
     if target_recoverable_missing:
@@ -1131,9 +1422,12 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
                 rec_only = [a for a in rec_only if a["id"] == sole_recoverable_id] or rec_only
             candidates = rec_only
     if not candidates:
-        if exclude_course_id:
+        if exclude_course_id or exclude_course_ids or restrict_target_course_id:
             raise ValueError(
-                f"assignment_battery could not find a target assignment outside excluded course {exclude_course_id!r}"
+                "assignment_battery could not find a target assignment under "
+                f"exclude_course_id={exclude_course_id!r}, "
+                f"exclude_course_ids={exclude_course_ids!r}, "
+                f"restrict_target_course_id={restrict_target_course_id!r}"
             )
         candidates = all_assignments
 
@@ -1653,7 +1947,7 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         # Skip quizzes already reserved as resubmit targets — resetting them to
         # not_submitted would silently invalidate the resubmit_assignment_ids
         # output consumed by lms_resubmit_after_feedback and siblings.
-        reset_candidate_ids = [qid for qid in quiz_ids if qid not in resubmit_ids]
+        reset_candidate_ids = [qid for qid in quiz_ids if qid not in resubmit_ids and qid not in expired_resubmit_ids]
         if reset_candidate_ids:
             target_quiz_assignment_id = reset_candidate_ids[0]
             quiz_assignment = next((a for a in all_assignments if a["id"] == target_quiz_assignment_id), None)
@@ -1677,7 +1971,7 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         )
     if not target_project_assignment_id and project_ids:
         # Skip projects already reserved as resubmit targets (see quiz case above).
-        reset_candidate_ids = [pid for pid in project_ids if pid not in resubmit_ids]
+        reset_candidate_ids = [pid for pid in project_ids if pid not in resubmit_ids and pid not in expired_resubmit_ids]
         if reset_candidate_ids:
             target_project_assignment_id = reset_candidate_ids[0]
             project_assignment = next((a for a in all_assignments if a["id"] == target_project_assignment_id), None)
@@ -1722,6 +2016,77 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
             return datetime.fromisoformat(raw)
         return raw  # type: ignore[return-value]
 
+    def _rubric_total(a: dict[str, Any]) -> Decimal:
+        return sum(
+            (Decimal(str(item.get("max_points", 0))) for item in (a.get("rubric") or [])),
+            Decimal("0"),
+        )
+
+    # ── rubric_tie_pack: decouple the decision from the points column ──
+    # Engineer the target-course unsubmitted set so EVERY row shows the SAME
+    # points_possible while carrying DIFFERENT rubric totals + criteria counts.
+    # The winner is the highest RUBRIC TOTAL (not points), with a deliberate
+    # 3-way total tie at the top → earliest-due tie-break → alphabetical
+    # tie-break. A same-course look-alike (equal points, lower total) is the
+    # critical do-not-submit decoy. All max_points are integers so the rubric
+    # totals an agent reads off the page sum cleanly.
+    rrs_same_course_decoy_id = ""
+    if rubric_tie_pack:
+        common_points = Decimal("100")
+        # (rubric_total, n_criteria, due_offset_days, title). The decision is
+        # the highest rubric TOTAL (points column is a constant tie). Rows 0,1
+        # share the MAX total (96) → the EARLIEST-DUE tie-break decides the
+        # winner. The two tied rows are deliberately separated by a 12-day due
+        # gap (row 0 at +2d, row 1 at +14d) that exceeds the ±4-day-per-row
+        # swing of the paired scramble_timestamps degradation, so the winner is
+        # ROBUST to ordering perturbation (the variant cannot make the graded
+        # answer underivable) while the agent must still SUM every rubric to
+        # discover the 96-point tie and then break it on due date. Row 0's
+        # criteria count (7) ≠ the runner-up's (4), so a wrong winner ALSO
+        # yields a wrong filename N (double penalty). Row 2 is the same-course
+        # equal-points decoy (lower total, different count). The alphabetical
+        # tertiary rule in the instruction stays correct but is not the
+        # winner's deciding step (an exact-due tie cannot survive scrambling).
+        _pack_specs = [
+            (Decimal("96"), 7, 2, "Aanalysis Capstone Portfolio"),   # WINNER (earliest of the 96-tie)
+            (Decimal("96"), 4, 14, "Zfinal Synthesis Brief"),        # 96-tie, later due → loses
+            (Decimal("80"), 3, 1, "Csame-Course Lookalike Set"),     # SAME-COURSE DECOY (equal pts)
+            (Decimal("72"), 5, 7, "Bmidterm Reflection Dossier"),
+            (Decimal("60"), 6, 5, "Dweekly Problem Compilation"),
+            (Decimal("48"), 2, 11, "Equiz Concept Check"),
+        ]
+        pack_targets = [
+            a for a in all_assignments
+            if a["course_id"] == _rrs_target_cid
+            and a["submission_status"] == "not_submitted"
+        ]
+        # Stable order so the pack is deterministic for a given seed.
+        pack_targets = sorted(pack_targets, key=lambda a: _id_num(a["id"]))
+        n_apply = min(len(pack_targets), len(_pack_specs))
+        for idx in range(n_apply):
+            total, n_crit, due_off, title = _pack_specs[idx]
+            a = pack_targets[idx]
+            a["points_possible"] = str(common_points)
+            a["title"] = title
+            a["due_at"] = (ctx.now + timedelta(days=due_off)).isoformat()
+            # Build a rubric with exactly n_crit criteria whose max_points are
+            # positive integers summing EXACTLY to `total` (≠ points_possible).
+            base = int(total) // n_crit
+            rem = int(total) - base * n_crit
+            rubric_items: list[dict[str, Any]] = []
+            for k in range(n_crit):
+                mp = base + (1 if k < rem else 0)
+                rubric_items.append(
+                    RubricItem(
+                        criterion=f"Criterion {k + 1}",
+                        max_points=Decimal(str(mp)),
+                        description=f"Rubric dimension {k + 1} for {title}.",
+                    ).model_dump()
+                )
+            a["rubric"] = rubric_items
+        if n_apply >= 3:
+            rrs_same_course_decoy_id = pack_targets[2]["id"]
+
     rrs_unsubmitted = [
         a for a in all_assignments
         if a["course_id"] == _rrs_target_cid
@@ -1730,10 +2095,12 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     highest_points_unsubmitted_id = ""
     highest_points_rubric_count = 0
     if rrs_unsubmitted:
+        # Decision metric is the RUBRIC TOTAL (sum of criteria max_points), NOT
+        # the displayed points_possible. Tie-break: earliest due, then title.
         rrs_winner = sorted(
             rrs_unsubmitted,
             key=lambda a: (
-                -Decimal(str(a["points_possible"])),
+                -_rubric_total(a),
                 _due_dt(a),
                 str(a.get("title", "")),
             ),
@@ -1786,8 +2153,89 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
             ml = int(course["syllabus"]["late_policy"]["max_late_days"])
             return (ctx.now - due).days <= ml
 
+        def _ml(cid: str) -> int:
+            return int(courses_by_id[cid]["syllabus"]["late_policy"]["max_late_days"])
+
+        # ── v2 look-alike preparation ──────────────────────────────────────
+        # When look-alikes are requested, choose the sole recoverable in the
+        # MOST-LENIENT course that has a past-due not_submitted candidate (so a
+        # stricter course is available for same-days-late look-alikes) and pin
+        # it to a days-late value that is comfortably inside the lenient window
+        # yet strictly OVER every stricter course's window. Otherwise fall back
+        # to the original "least slack" selection pinned to 2 days late.
+        #
+        # Drift robustness (the seed anchor floats ±1 day vs wall-clock; the
+        # evaluator measures days-late against wall-clock): pinning both the
+        # sole and the look-alikes to the SAME `sole_days_late` from the anchor
+        # makes them appear at the same days-late to the agent, while:
+        #   • sole_days_late <= lenient_max - 1  ⇒ sole stays recoverable even
+        #     after +1 drift (sole_days_late + 1 <= lenient_max), and
+        #   • sole_days_late >= strict_max + 2   ⇒ a look-alike in a course with
+        #     max_late_days <= sole_days_late - 2 stays unrecoverable even after
+        #     -1 drift (sole_days_late - 1 > that course's window).
+        # This requires lenient_max - strict_max >= 3.
+        lookalike_ids: list[str] = []
+        sole_days_late = 2
+        sole_override: dict[str, Any] | None = None
+        if lookalike_same_days_late > 0:
+            ns_pastdue_or_recoverable = [
+                a for a in all_assignments
+                if a["submission_status"] == "not_submitted"
+                and a["course_id"] in courses_by_id
+            ]
+            # Courses that can HOST the sole (must already have a not_submitted
+            # candidate) vs courses that can host a look-alike (any course with
+            # an assignment, since the fallback below can flip status). Compute
+            # the lenient bound over sole-hostable courses and the strict bound
+            # over ALL courses so the strict-policy course is never missed just
+            # because it currently has no not_submitted rows.
+            sole_courses = {a["course_id"] for a in ns_pastdue_or_recoverable}
+            all_courses_with_assignments = {
+                a["course_id"] for a in all_assignments if a["course_id"] in courses_by_id
+            }
+            if sole_courses and all_courses_with_assignments:
+                lenient_max = max(_ml(cid) for cid in sole_courses)
+                strict_max = min(_ml(cid) for cid in all_courses_with_assignments)
+                # Need a genuine lenient-vs-strict gap for the trap to bite.
+                if lenient_max - strict_max >= 3:
+                    # Strictly above every stricter window (with -1 drift margin)
+                    # and at least 1 day inside the lenient window (with +1 drift
+                    # margin). Bias toward the larger value for a clearer cushion.
+                    sole_days_late = lenient_max - 1
+                    if sole_days_late < strict_max + 2:
+                        sole_days_late = strict_max + 2
+                    lenient_courses = sorted(
+                        (cid for cid in sole_courses if _ml(cid) >= sole_days_late + 1),
+                        key=lambda cid: (-_ml(cid), cid),
+                    )
+                    if lenient_courses:
+                        sole_cid = lenient_courses[0]
+                        sole_pool = sorted(
+                            (a for a in ns_pastdue_or_recoverable if a["course_id"] == sole_cid),
+                            key=lambda a: (-Decimal(str(a["points_possible"])), a["id"]),
+                        )
+                        if sole_pool:
+                            sole_override = sole_pool[0]
+
         rec_now = [a for a in all_assignments if _is_rec_now(a)]
-        if rec_now:
+        if sole_override is not None:
+            sole = sole_override
+            sole_recoverable_id = sole["id"]
+            sole["due_at"] = (ctx.now - timedelta(days=sole_days_late)).isoformat()
+            sole["submission_status"] = "not_submitted"
+            sole["score"] = None
+            sole["feedback"] = None
+            sole["submitted_at"] = None
+            sole["file_name"] = None
+            sole["attempt_count"] = 0
+            target_assignment_id = sole["id"]
+            target_assignment_title = sole["title"]
+            target_course_id = sole["course_id"]
+            for c in courses:
+                if c["id"] == target_course_id:
+                    target_course_code = c["course_code"]
+                    break
+        elif rec_now:
             def _slack_now(a: dict[str, Any]) -> int:
                 ml = int(courses_by_id[a["course_id"]]["syllabus"]["late_policy"]["max_late_days"])
                 return ml - (ctx.now - _due_dt_final(a)).days
@@ -1819,8 +2267,66 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
                     target_course_code = c["course_code"]
                     break
 
+        # ── v2 look-alikes: force N past-due not_submitted assignments in
+        # STRICTER courses to the SAME days-late as the sole, but unrecoverable
+        # (days_late > that course's max_late_days). Days-late alone can no
+        # longer separate the target from these; per-course window math is
+        # required. Chosen deterministically (stricter course first, then id).
+        if lookalike_same_days_late > 0 and sole_recoverable_id and sole_override is not None:
+            def _strict_enough(cid: str) -> bool:
+                return (
+                    cid != target_course_id
+                    and cid in courses_by_id
+                    and _ml(cid) <= sole_days_late - 2
+                )
+
+            lookalike_pool = sorted(
+                (
+                    a for a in all_assignments
+                    if a["submission_status"] == "not_submitted"
+                    and a["id"] != sole_recoverable_id
+                    and _strict_enough(a["course_id"])
+                ),
+                key=lambda a: (_ml(a["course_id"]), -Decimal(str(a["points_possible"])), a["id"]),
+            )
+            # Fallback: if too few not_submitted candidates live in a strict-enough
+            # course, recruit any other-status assignment there (this task has no
+            # grade_book step, so flipping status to not_submitted is side-effect
+            # free) so the same-days-late trap is GUARANTEED present every seed.
+            if len(lookalike_pool) < lookalike_same_days_late:
+                extra = sorted(
+                    (
+                        a for a in all_assignments
+                        if a["id"] != sole_recoverable_id
+                        and a["submission_status"] != "not_submitted"
+                        and _strict_enough(a["course_id"])
+                        and a not in lookalike_pool
+                    ),
+                    key=lambda a: (_ml(a["course_id"]), -Decimal(str(a["points_possible"])), a["id"]),
+                )
+                lookalike_pool = lookalike_pool + extra
+            for a in lookalike_pool[:lookalike_same_days_late]:
+                a["due_at"] = (ctx.now - timedelta(days=sole_days_late)).isoformat()
+                a["submission_status"] = "not_submitted"
+                a["score"] = None
+                a["feedback"] = None
+                a["submitted_at"] = None
+                a["file_name"] = None
+                a["attempt_count"] = 0
+                lookalike_ids.append(a["id"])
+                if a["id"] not in missing_ids:
+                    missing_ids.append(a["id"])
+
+        # Make every OTHER not_submitted assignment unambiguous. With v2
+        # look-alikes active, force the FIRST remaining past-due one to be
+        # "just over the edge" (max_late_days + 1) so the seed contains both a
+        # "just under" (the sole) and a "just over" boundary case; the rest are
+        # clearly unrecoverable (max + 3) or comfortably future.
+        _just_over_done = False
         for a in all_assignments:
             if a["submission_status"] != "not_submitted" or a["id"] == sole_recoverable_id:
+                continue
+            if a["id"] in lookalike_ids:
                 continue
             course = courses_by_id.get(a["course_id"])
             if not course:
@@ -1828,7 +2334,13 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
             ml = int(course["syllabus"]["late_policy"]["max_late_days"])
             due = _due_dt_final(a)
             if due < ctx.now + timedelta(days=2):
-                a["due_at"] = (ctx.now - timedelta(days=ml + 3)).isoformat()
+                if lookalike_same_days_late > 0 and not _just_over_done:
+                    # "Just over": 1 day past the window (robust: with ±1 drift
+                    # it stays in [ml, ml+2] days late, never inside the window).
+                    a["due_at"] = (ctx.now - timedelta(days=ml + 2)).isoformat()
+                    _just_over_done = True
+                else:
+                    a["due_at"] = (ctx.now - timedelta(days=ml + 3)).isoformat()
             elif due < ctx.now + timedelta(days=5):
                 a["due_at"] = (ctx.now + timedelta(days=5)).isoformat()
             a["score"] = None
@@ -1841,7 +2353,12 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
 
         # Re-pick the decoy from a DIFFERENT course than the (possibly updated)
         # target so the decoy invariant/constraint references a real sibling.
-        if not decoy_assignment_id or any(
+        # Prefer the canonical same-days-late look-alike so the decoy IS the
+        # genuinely tempting wrong answer (same days-late as the target, but
+        # unrecoverable). Deterministic: always lookalike_ids[0] when present.
+        if lookalike_ids:
+            decoy_assignment_id = lookalike_ids[0]
+        elif not decoy_assignment_id or any(
             a["id"] == decoy_assignment_id and a["course_id"] == target_course_id
             for a in all_assignments
         ):
@@ -1856,21 +2373,53 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
             if decoy_pool:
                 decoy_assignment_id = decoy_pool[0]["id"]
 
+        # ── Authoritative out-of-window classification ──────────────────────
+        # Computed in the seed (where ctx.now IS the true anchor) AFTER all due
+        # dates are finalized: every past-due not_submitted assignment whose
+        # days-late exceeds its own course's max_late_days. These are the
+        # "unrecoverable" assignments the agent must NOT submit; exposing them as
+        # an explicit id list lets the canonical_diff penalize submitting any of
+        # them without re-deriving wall-clock-relative day math at eval time
+        # (the eval-time session_start is unreliable for absolute date math).
+        for a in all_assignments:
+            if a["submission_status"] != "not_submitted":
+                continue
+            course = courses_by_id.get(a["course_id"])
+            if not course:
+                continue
+            due = _due_dt_final(a)
+            if due >= ctx.now:
+                continue
+            ml = int(course["syllabus"]["late_policy"]["max_late_days"])
+            if (ctx.now - due).days > ml:
+                out_of_window_ids.append(a["id"])
+
     return {
         "assignment_ids": all_assignment_ids,
         "highest_points_unsubmitted_id": highest_points_unsubmitted_id,
         "highest_points_rubric_count": str(highest_points_rubric_count),
         "rubric_review_decoy_id": rrs_decoy_id,
+        "rubric_review_same_course_decoy_id": rrs_same_course_decoy_id,
         "missing_assignment_ids": missing_ids,
         "late_assignment_ids": late_ids,
         "late_within_grace_ids": late_within_grace_ids,
         "lowest_homework_id": lowest_homework_id or "",
         "exam_assignment_id": exam_assignment_id or "",
         "resubmit_assignment_ids": resubmit_ids,
+        "expired_resubmit_assignment_ids": ",".join(expired_resubmit_ids),
         "resubmit_filenames": ",".join(
             f"{rid}:revision_v{int(next((a['attempt_count'] for a in all_assignments if a['id'] == rid), 1) or 1) + 1}.pdf"
             for rid in resubmit_ids
         ),
+        # Flagged-but-un-resubmittable rows (attempt_count == max_attempts): the
+        # agent must detect the 422 blocker and leave them untouched.
+        "blocked_resubmit_assignment_ids": ",".join(blocked_resubmit_ids),
+        "blocked_resubmit_assignment_id": blocked_resubmit_ids[0] if blocked_resubmit_ids else "",
+        # First resubmittable flagged id (scalar handle for variant injections that
+        # target one concrete row, e.g. a concurrent_modification snapshot).
+        "first_resubmit_assignment_id": resubmit_ids[0] if resubmit_ids else "",
+        # Graded look-alike sharing a flagged assignment's title in another course.
+        "lookalike_decoy_assignment_id": lookalike_decoy_assignment_id,
         "target_assignment_id": target_assignment_id or "",
         "target_assignment_title": target_assignment_title,
         "target_course_id": target_course_id,
@@ -1881,6 +2430,14 @@ def _build_assignment_battery(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         # The unique past-due not_submitted assignment kept inside its course's
         # late window when sole_recoverable_missing is set; "" otherwise.
         "sole_recoverable_missing_id": sole_recoverable_id,
+        # ── Same-days-late look-alike(s) (lms_submit_late v2 hardening) ──
+        # Past-due not_submitted assignments forced to the SAME days-late as the
+        # sole recoverable but UNRECOVERABLE (their course's max_late_days is
+        # smaller). First one is the canonical "tempting wrong answer".
+        "lookalike_assignment_id": (lookalike_ids[0] if lookalike_ids else ""),
+        "lookalike_assignment_ids": ",".join(lookalike_ids),
+        # Authoritative unrecoverable (out-of-window) past-due not_submitted ids.
+        "out_of_window_assignment_ids": ",".join(out_of_window_ids),
         # ── New outputs ──
         "score_below_70": score_below_70,
         "feedback_assignment_id": feedback_assignment_id,
@@ -1940,11 +2497,23 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
 
     Params
     ------
-    (no params -- operates on existing assignments in ctx.base)
+    target_curve_boundary : str | None
+        When set to ``"raise"`` or ``"hold"``, the target course's graded
+        midterm + one supporting homework/quiz grade are calibrated so the
+        course's *displayed* weighted score (penalty-adjusted, as the live
+        ``GET /courses/{id}/grades`` endpoint reports it) lands at a precise
+        near-90 boundary, and adding the +5 midterm curve crosses the A-/B+
+        letter boundary (``"raise"``) or stays within the same band
+        (``"hold"``). This turns ``curve_changes_letter`` from an arbitrary
+        far-from-boundary flag into a sharp, drop-lowest- and
+        re-normalization-dependent decision the agent must recompute exactly
+        the consumer's way. Defaults to ``None`` (legacy RNG behaviour) so
+        every other task using this builder keeps byte-identical fixtures.
     """
     assignments = ctx.base.get("assignments", [])
     courses = ctx.base.get("courses", [])
     enrollments = ctx.base.get("enrollments", [])
+    target_curve_boundary = params.get("target_curve_boundary")
 
     if "grades" not in ctx.base:
         ctx.base["grades"] = []
@@ -2036,6 +2605,429 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
             for g in sorted_grades[:effective_drop]:
                 g["is_dropped"] = True
                 dropped_grade_ids.append(g["id"])
+
+    # ── Near-boundary curve calibration (optional) ──────────────────────────
+    # When the task requests it, force the target course's displayed weighted
+    # score to a sharp, deterministic value near the A-/B+ letter boundary so
+    # that the +5 midterm curve becomes a genuine boundary-crossing decision.
+    # We operate on the ACTIVE (non-dropped) graded grades of the target
+    # course, set their late_penalty_applied to 0 so the displayed
+    # (penalty-adjusted) value equals the raw value the agent can read row by
+    # row, and pin the midterm grade + one supporting grade so the
+    # re-normalized weighted score lands just below the band. The drop-lowest
+    # outcome above is preserved (the dropped grade stays dropped), so an agent
+    # that ignores drop-lowest or mishandles re-normalization computes a
+    # different number and picks the wrong branch.
+    if target_curve_boundary in ("raise", "hold", "auto"):
+        # In "auto" mode the branch is chosen deterministically from the seed
+        # so that across seeds roughly half the runs land on the curve-raises
+        # branch and half on the curve-holds branch — both branches of the
+        # downstream oneof stay reachable while every run is a sharp,
+        # near-boundary recomputation. "raise"/"hold" force a single branch.
+        if target_curve_boundary == "auto":
+            _cb_mode = "raise" if ctx.rng.random() < 0.5 else "hold"
+        else:
+            _cb_mode = target_curve_boundary
+        _cb_target_cid = ctx.outputs.get("target_course_id", "") or (
+            courses[0]["id"] if courses else ""
+        )
+        _cb_course = next((c for c in courses if c["id"] == _cb_target_cid), None)
+        if _cb_course is not None:
+            _cb_gp = _cb_course["syllabus"]["grading_policy"]
+
+            def _active(cat: str) -> list[dict[str, Any]]:
+                # The target-course FINAL exam grade (if any) is reset to
+                # not_submitted and its grade record removed later in this
+                # builder so the final stays a submittable target for other
+                # tasks. Exclude it here so the calibrated weighted score
+                # equals what the agent will actually see on the grades page.
+                if cat == "final":
+                    return []
+                return [
+                    g for g in ctx.base["grades"]
+                    if g["course_id"] == _cb_target_cid
+                    and g["weight_category"] == cat
+                    and g["score"] is not None
+                    and not g["is_dropped"]
+                ]
+
+            # Identify the single active midterm grade (curve target). If the
+            # target course's midterm was not graded by the RNG, promote its
+            # midterm assignment to graded and create a backing Grade record so
+            # the curve discriminator is always well-defined (and the +5 curve
+            # always has a midterm to apply to).
+            # First drop any target-course FINAL grade record: the final-exam
+            # guarantee block below resets the target final to not_submitted and
+            # removes its grade, so removing it now keeps the calibrated weighted
+            # score identical to what the agent will read after the reset.
+            ctx.base["grades"] = [
+                g for g in ctx.base["grades"]
+                if not (
+                    g["course_id"] == _cb_target_cid
+                    and g["weight_category"] == "final"
+                )
+            ]
+            _mid = _active("midterm")
+            if not _mid:
+                _mid_asn0 = next(
+                    (
+                        a for a in assignments
+                        if a["course_id"] == _cb_target_cid
+                        and a["weight_category"] == "midterm"
+                    ),
+                    None,
+                )
+                _enr_id = enrollment_by_course.get(_cb_target_cid, "")
+                if _mid_asn0 is not None and _enr_id:
+                    _mid_asn0["submission_status"] = "graded"
+                    _mid_asn0["score"] = str(
+                        (Decimal("0.80") * Decimal(str(_mid_asn0["points_possible"]))).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP,
+                        )
+                    )
+                    _mid_asn0["submitted_at"] = _mid_asn0.get("submitted_at") or (
+                        ctx.now - timedelta(days=7)
+                    ).isoformat()
+                    _mid_asn0["attempt_count"] = 1
+                    _new_grade = Grade(
+                        id=ctx.next_id("grade"),
+                        enrollment_id=_enr_id,
+                        course_id=_cb_target_cid,
+                        assignment_id=_mid_asn0["id"],
+                        score=Decimal(str(_mid_asn0["score"])),
+                        points_possible=Decimal(str(_mid_asn0["points_possible"])),
+                        weight_category="midterm",
+                        is_dropped=False,
+                        late_penalty_applied=Decimal("0"),
+                    )
+                    ctx.base["grades"].append(_new_grade.model_dump())
+                    grade_ids.append(_new_grade.id)
+                _mid = _active("midterm")
+            if _mid:
+                _mid_g = _mid[0]
+                # Make the target-course midterm submittable for the appeal
+                # branch (curve does NOT change the letter): allow one fresh
+                # submission over its current attempt count.
+                _mid_asn_for_attempts = next(
+                    (a for a in assignments if a["id"] == _mid_g["assignment_id"]), None
+                )
+                if _mid_asn_for_attempts is not None:
+                    _mid_asn_for_attempts["max_attempts"] = max(
+                        int(_mid_asn_for_attempts.get("max_attempts", 1)),
+                        int(_mid_asn_for_attempts.get("attempt_count", 0)) + 1,
+                    )
+                # Normalize the midterm to a 100-point scale (grade + the
+                # backing assignment) so the +5-point curve is exactly +5
+                # percentage points on the midterm category. This keeps the
+                # curve increment small enough that a "hold" outcome stays
+                # inside one letter band while a "raise" outcome cleanly
+                # crosses, and makes the arithmetic the agent must reproduce
+                # unambiguous.
+                _mid_pp = Decimal("100")
+                _mid_g["points_possible"] = _mid_pp
+                _mid_asn = next(
+                    (a for a in assignments if a["id"] == _mid_g["assignment_id"]), None
+                )
+                if _mid_asn is not None:
+                    _mid_asn["points_possible"] = _mid_pp
+                # Zero late penalty on every active target-course grade so the
+                # displayed (penalty-adjusted) weighted score equals the raw
+                # value the agent can read row by row.
+                for _cat in _cb_gp:
+                    for _g in _active(_cat):
+                        _g["late_penalty_applied"] = Decimal("0")
+
+                # Local mirror of the live weighted-score normalization: average
+                # the active (non-dropped, penalty-zeroed) grades per graded
+                # category, then re-normalize over graded categories only. This
+                # is exactly GET /courses/{id}/grades' weighted_score, so the
+                # value we calibrate to equals what the agent reads.
+                def _cb_cat_pct(cat: str) -> Decimal | None:
+                    gs = _active(cat)
+                    if not gs:
+                        return None
+                    tot = Decimal("0")
+                    for g in gs:
+                        tot += (Decimal(str(g["score"])) / Decimal(str(g["points_possible"]))) * Decimal("100")
+                    return tot / Decimal(str(len(gs)))
+
+                def _cb_weighted() -> Decimal:
+                    gw = Decimal("0"); ws = Decimal("0")
+                    for cat in _cb_gp:
+                        w = Decimal(str(
+                            _cb_gp[cat]["weight"] if isinstance(_cb_gp[cat], dict)
+                            else _cb_gp[cat].weight
+                        ))
+                        pct = _cb_cat_pct(cat)
+                        if pct is None:
+                            continue
+                        gw += w; ws += w * pct
+                    return (ws / gw) if gw > 0 else Decimal("0")
+
+                # Step 1: pin every active NON-midterm grade to a fixed high
+                # anchor (92%) so those categories' averages are deterministic.
+                _ANCHOR = Decimal("92")
+                _other_cats = [c for c in _cb_gp if c != "midterm" and _active(c)]
+                for cat in _other_cats:
+                    for _g in _active(cat):
+                        _g_pp = Decimal(str(_g["points_possible"]))
+                        _g["score"] = str(
+                            (_ANCHOR / Decimal("100") * _g_pp).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP,
+                            )
+                        )
+
+                # Step 2: derive the curve delta D directly from the actual
+                # graded weights and pick a pre-curve target weighted score so
+                # the 5-band relation is guaranteed:
+                #   raise: pre in [87,90)  and  pre + D >= 90  (B -> A)
+                #   hold : pre in [83,87)  and  pre + D < 90   (stays B)
+                _w_mid = Decimal(str(
+                    _cb_gp["midterm"]["weight"] if isinstance(_cb_gp.get("midterm"), dict)
+                    else _cb_gp["midterm"].weight
+                )) if "midterm" in _cb_gp else Decimal("0.20")
+                _w_graded = Decimal("0")
+                for cat in _cb_gp:
+                    if _active(cat) or cat == "midterm":
+                        _w_graded += Decimal(str(
+                            _cb_gp[cat]["weight"] if isinstance(_cb_gp[cat], dict)
+                            else _cb_gp[cat].weight
+                        ))
+                _D = (_w_mid / _w_graded) * Decimal("5") if _w_graded > 0 else Decimal("0")
+                if _cb_mode == "raise":
+                    _pre_ws = Decimal("90") - (_D / Decimal("2"))
+                    if _pre_ws >= Decimal("90"):
+                        _pre_ws = Decimal("89.50")
+                    if _pre_ws < Decimal("87"):
+                        _pre_ws = Decimal("87.50")
+                else:  # hold: leave a full point of margin below 90 after curve
+                    _pre_ws = Decimal("90") - _D - Decimal("1")
+                    if _pre_ws >= Decimal("87"):
+                        _pre_ws = Decimal("86.00")
+                    if _pre_ws < Decimal("83"):
+                        _pre_ws = Decimal("83.50")
+
+                # Step 3: solve the midterm percentage so _cb_weighted() == _pre_ws.
+                #   pre = (w_mid*M + Σ_other w*anchor) / w_graded
+                #   M = (pre*w_graded - Σ_other w*anchor) / w_mid
+                _sum_other = Decimal("0")
+                for cat in _other_cats:
+                    _sum_other += Decimal(str(
+                        _cb_gp[cat]["weight"] if isinstance(_cb_gp[cat], dict)
+                        else _cb_gp[cat].weight
+                    )) * _ANCHOR
+                _M = (
+                    (_pre_ws * _w_graded - _sum_other) / _w_mid
+                    if _w_mid > 0 else _pre_ws
+                )
+                # The midterm must have at least 5 percentage points of headroom
+                # so the +5 curve is fully applied (not clipped at 100).
+                if _M < Decimal("0"):
+                    _M = Decimal("0")
+                if _M > Decimal("90"):
+                    _M = Decimal("90")
+                _mid_pp = Decimal(str(_mid_g["points_possible"]))
+                _mid_g["score"] = str(
+                    (_M / Decimal("100") * _mid_pp).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP,
+                    )
+                )
+
+                # Step 4: re-run drop-lowest on the TARGET course from the
+                # calibrated scores so the static is_dropped flags match what
+                # the live GET /grades endpoint recomputes dynamically. Without
+                # this, raising the active grades could change which grade is
+                # the category minimum and desync the seed's curve discriminator
+                # from the value the agent reads. We mirror the live policy:
+                # drop the lowest N by score/points ratio; if graded_count <=
+                # drop_lowest, drop max(0, count-1) so >= 1 remains.
+                for _cat, _cp in _cb_gp.items():
+                    _drop_n = int(
+                        _cp["drop_lowest"] if isinstance(_cp, dict) else _cp.drop_lowest
+                    )
+                    _cat_grades = [
+                        g for g in ctx.base["grades"]
+                        if g["course_id"] == _cb_target_cid
+                        and g["weight_category"] == _cat
+                        and g["score"] is not None
+                    ]
+                    if not _cat_grades:
+                        continue
+                    for g in _cat_grades:
+                        g["is_dropped"] = False
+                    if _drop_n <= 0:
+                        continue
+                    _eff = _drop_n
+                    if len(_cat_grades) <= _eff:
+                        _eff = max(0, len(_cat_grades) - 1)
+                    _sorted = sorted(
+                        _cat_grades,
+                        key=lambda g: (
+                            Decimal(str(g["score"])) / Decimal(str(g["points_possible"]))
+                            if Decimal(str(g["points_possible"])) != 0 else Decimal("0")
+                        ),
+                    )
+                    for g in _sorted[:_eff]:
+                        g["is_dropped"] = True
+                        if g["id"] not in dropped_grade_ids:
+                            dropped_grade_ids.append(g["id"])
+
+    # ── KNIFE-EDGE CALIBRATION for lms_compare_course_grades (verification) ──
+    # When ``calibrate_named_pair`` is set, deterministically rebuild the
+    # assignments + grades of the two NAMED courses (compare_pair_codes) and one
+    # global-lowest DECOY course so that the displayed-weighted-grade comparison
+    # sits on a knife-edge tuned to defeat a NAIVE recompute:
+    #   • the engine's penalty-adjusted weighted score (what GET
+    #     /courses/{id}/grades displays, via category_score's
+    #     effective = score*(1 - late_penalty_applied)) makes the named-pair gap
+    #     land just ABOVE 3.00 → the DROP branch is correct;
+    #   • a NAIVE raw-percentage recompute (ignoring the visible
+    #     late_penalty_applied column — the LMS-8 divergence) makes the gap land
+    #     just BELOW 3.00 → the no-op branch, which is WRONG.
+    # Every number is on the visible Grades page (each grade row carries score,
+    # points_possible AND late_penalty_applied), so the answer is fully
+    # re-derivable; it only punishes the agent that skips the penalty column.
+    # A global-lowest DECOY course is calibrated ~1 point below the named-pair
+    # lower so an agent that conflates "global lowest" with "named-pair lower"
+    # drops the wrong enrollment.
+    if params.get("calibrate_named_pair"):
+        _cal_pair = params.get("compare_pair_codes") or []
+        if len(_cal_pair) == 2:
+            _code_lo, _code_hi = _cal_pair[0], _cal_pair[1]
+            _course_by_code = {c["course_code"]: c for c in courses}
+            _lo_course = _course_by_code.get(_code_lo)
+            _hi_course = _course_by_code.get(_code_hi)
+            # Pick a decoy course: first enrolled course NOT in the named pair.
+            _enrolled_cids = {e["course_id"] for e in enrollments}
+            _decoy_course = next(
+                (c for c in courses
+                 if c["id"] in _enrolled_cids
+                 and c["course_code"] not in (_code_lo, _code_hi)),
+                None,
+            )
+
+            # Calibrated grade specs: (category, score, points, late_penalty).
+            # LOWER named course (CS101-shape, template idx 3: no drops):
+            #   engine 84.09 / raw 84.90 vs HIGHER 87.50 → engine gap 3.41 (>3,
+            #   DROP) but raw gap 2.60 (<=3, naive NO-OP).
+            _lo_spec = [
+                ("homework", "86", "100", "0"),
+                ("essays", "85", "100", "0"),
+                ("quizzes", "84", "100", "0"),
+                ("midterm", "81", "100", "0.05"),   # 1-day-late midterm penalty
+                ("final", "87", "100", "0"),
+            ]
+            # HIGHER named course (MATH201-shape, template idx 1: hw drop2, quiz drop1):
+            _hi_spec = [
+                ("homework", "92", "100", "0"),
+                ("homework", "74", "100", "0"),   # dropped (drop_lowest=2)
+                ("homework", "90", "100", "0"),
+                ("homework", "80", "100", "0"),   # dropped (drop_lowest=2)
+                ("quizzes", "82", "100", "0"),
+                ("quizzes", "64", "100", "0"),    # dropped (drop_lowest=1)
+                ("midterm", "88", "100", "0"),
+                ("final", "87", "100", "0"),
+            ]
+            # DECOY global-lowest course (~83.0, ~1pt below LOWER's 84.09 engine):
+            # flat single-grade categories so its weighted score is exactly 83.
+            _decoy_spec = [
+                ("homework", "83", "100", "0"),
+                ("midterm", "83", "100", "0"),
+                ("final", "83", "100", "0"),
+            ]
+
+            def _calibrate_course(course: dict[str, Any], spec: list[tuple[str, str, str, str]]) -> None:
+                cid = course["id"]
+                enr_id = enrollment_by_course.get(cid, "")
+                gp = course["syllabus"]["grading_policy"]
+                # Drop existing assignments + grades for this course.
+                ctx.base["assignments"] = [
+                    a for a in ctx.base.get("assignments", []) if a["course_id"] != cid
+                ]
+                ctx.base["grades"] = [
+                    g for g in ctx.base["grades"] if g["course_id"] != cid
+                ]
+                _due = ctx.now - timedelta(days=10)
+                for (cat, score, pts, pen) in spec:
+                    if cat not in gp:
+                        continue
+                    aid = ctx.next_id("assignment")
+                    atype = _cat_to_type_cal.get(cat, "homework")
+                    is_late = Decimal(pen) > Decimal("0")
+                    asg = Assignment(
+                        id=aid,
+                        course_id=cid,
+                        title=f"{cat.title()} ({course['course_code']})",
+                        type=atype,
+                        due_at=_due,
+                        points_possible=Decimal(pts),
+                        submission_status="late" if is_late else "graded",
+                        score=Decimal(score),
+                        feedback="Graded.",
+                        attempt_count=1,
+                        max_attempts=2,
+                        rubric=[],
+                        weight_category=cat,
+                        submitted_at=_due + timedelta(days=1) if is_late else _due - timedelta(hours=2),
+                        file_name="submission.pdf",
+                    )
+                    ctx.base["assignments"].append(asg.model_dump())
+                    gid_obj = ctx.next_id("grade")
+                    grd = Grade(
+                        id=gid_obj,
+                        enrollment_id=enr_id,
+                        course_id=cid,
+                        assignment_id=aid,
+                        score=Decimal(score),
+                        points_possible=Decimal(pts),
+                        weight_category=cat,
+                        is_dropped=False,
+                        late_penalty_applied=Decimal(pen),
+                    )
+                    ctx.base["grades"].append(grd.model_dump())
+
+            _cat_to_type_cal = {
+                "homework": "homework", "quizzes": "quiz", "midterm": "exam",
+                "final": "exam", "project": "project", "participation": "participation",
+                "essays": "essay",
+            }
+            if _lo_course is not None:
+                _calibrate_course(_lo_course, _lo_spec)
+            if _hi_course is not None:
+                _calibrate_course(_hi_course, _hi_spec)
+            if _decoy_course is not None:
+                _calibrate_course(_decoy_course, _decoy_spec)
+
+            # Re-apply drop-lowest over the freshly-calibrated grades so the
+            # engine's category_score / weighted_score match the spec above.
+            for c in courses:
+                cid = c["id"]
+                gp = c["syllabus"]["grading_policy"]
+                for cat_name, cat_policy_raw in gp.items():
+                    drop_lowest = cat_policy_raw["drop_lowest"] if isinstance(cat_policy_raw, dict) else cat_policy_raw.drop_lowest
+                    if drop_lowest == 0:
+                        continue
+                    cat_grades = [
+                        g for g in ctx.base["grades"]
+                        if g["course_id"] == cid and g["weight_category"] == cat_name
+                        and g["score"] is not None
+                    ]
+                    if not cat_grades:
+                        continue
+                    eff_drop = drop_lowest
+                    if len(cat_grades) <= eff_drop:
+                        eff_drop = max(0, len(cat_grades) - 1)
+                    sorted_g = sorted(
+                        cat_grades,
+                        key=lambda g: Decimal(str(g["score"])) / Decimal(str(g["points_possible"]))
+                        if Decimal(str(g["points_possible"])) != 0 else Decimal("0"),
+                    )
+                    for g in sorted_g[:eff_drop]:
+                        g["is_dropped"] = True
+
+            # Refresh the assignment-derived locals so downstream outputs stay
+            # internally consistent with the rebuilt assignment list.
+            assignments = ctx.base.get("assignments", [])
 
     # Compute current weighted scores per course
     current_weighted_scores: dict[str, str] = {}
@@ -2230,6 +3222,36 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
         if score >= 60: return Decimal("0.7")
         return Decimal("0.0")
 
+    # ── force_drop_letter_flip: deterministically sculpt the HARD branch ──
+    # lms_drop_lowest_letter_change v2: the random grade distribution almost
+    # never lands on the demanding "submit" branch (drop_changes_letter_grounded
+    # == 'true'), so both frontier models trivially took the one-click "mark
+    # announcement" branch. When this flag is set we overwrite the TARGET
+    # course's homework grades with a fully deterministic, re-derivable
+    # configuration that GUARANTEES three compounding, fair traps on the
+    # verification primitive:
+    #   (1) THRESHOLD/LATE-PENALTY trap -- the engine applies a (1 - penalty)
+    #       factor to a graded homework. WITH the penalty the without-drop
+    #       weighted score is a B (<90) and the with-drop score is an A (>=90)
+    #       => the letter genuinely flips => grounded branch 1 (submit). An
+    #       agent that forgets the late penalty computes the without-drop score
+    #       as an A too, sees NO flip, and wrongly takes branch 2 (mark read).
+    #   (2) RATIO trap -- the homework the engine actually drops (lowest
+    #       score-to-POINTS ratio) is NOT the homework with the lowest raw
+    #       earned points. A naive "lowest raw points" agent submits the wrong
+    #       assignment.
+    #   (3) The flip lives in the 87-94 band so a 1-point recomputation error
+    #       lands on the wrong coarse letter.
+    # The configuration is re-derivable entirely from the visible Grades page
+    # (per-grade score / points_possible / late_penalty_applied, and the coarse
+    # A>=90 scale named in the instruction). Additive + opt-in: every other task
+    # that shares this builder is unaffected. The actual sculpting runs LATE
+    # (just before the final recompute below) so it lands AFTER every other
+    # grade-mutation pass in this builder (e.g. the impossible-B "victim" pass
+    # that rewrites active grade scores to 25%), which would otherwise clobber
+    # the forced grades whenever the target course is also picked as a victim.
+    _forced_lowest_raw_points_hw_id = ""
+
     # ── has_discrepancy: displayed vs computed > 1pt ──
     # We compare current_weighted_scores (computed with drops) vs without drops
     has_discrepancy = "false"
@@ -2323,6 +3345,74 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
             mg["score"] = str(orig_score)  # Restore
             if _letter(curved_score) != original_letter:
                 curve_changes_letter = "true"
+
+    # When near-boundary calibration is active, the discriminator MUST be
+    # judged on the SAME 5-band letter scale the task instruction defines
+    # (A>=90, B>=80, C>=70, D>=60, F<60), not the finer A-/B+ scale used by the
+    # GPA-facing _letter helper. We recompute the flag on the calibrated target
+    # course with the instruction's coarse bands so the seed truth and the
+    # value the agent re-derives from the live grades page agree exactly. Late
+    # penalties were zeroed on the active target-course grades during
+    # calibration, so the raw _weighted_score equals the displayed
+    # (penalty-adjusted) weighted_score the agent reads.
+    if target_curve_boundary in ("raise", "hold", "auto") and target_cid:
+        def _letter5(score: Decimal) -> str:
+            if score >= Decimal("90"):
+                return "A"
+            if score >= Decimal("80"):
+                return "B"
+            if score >= Decimal("70"):
+                return "C"
+            if score >= Decimal("60"):
+                return "D"
+            return "F"
+
+        # Faithful replica of the LIVE GET /courses/{id}/grades weighted score
+        # (LMSState.category_score + weighted_score_for_course): per-category
+        # average is rounded to 0.01 BEFORE weighting, and the final weighted
+        # mean is rounded to 0.01 — matching exactly what the agent reads.
+        _cb_course2 = next((c for c in courses if c["id"] == target_cid), None)
+        _cb_gp2 = _cb_course2["syllabus"]["grading_policy"] if _cb_course2 else {}
+
+        def _live_weighted(boost_midterm: Decimal = Decimal("0")) -> Decimal | None:
+            gw = Decimal("0")
+            wsum = Decimal("0")
+            for cat_name, pol in _cb_gp2.items():
+                weight = Decimal(str(pol["weight"] if isinstance(pol, dict) else pol.weight))
+                gs = [
+                    g for g in ctx.base["grades"]
+                    if g["course_id"] == target_cid
+                    and g["weight_category"] == cat_name
+                    and g["score"] is not None
+                    and not g["is_dropped"]
+                ]
+                if not gs:
+                    continue
+                tot = Decimal("0")
+                for g in gs:
+                    sc = Decimal(str(g["score"]))
+                    if cat_name == "midterm":
+                        sc = min(sc + boost_midterm, Decimal(str(g["points_possible"])))
+                    pen = Decimal(str(g.get("late_penalty_applied", 0)))
+                    eff = sc * (Decimal("1") - pen)
+                    tot += (eff / Decimal(str(g["points_possible"]))) * Decimal("100")
+                cat_avg = (tot / Decimal(str(len(gs)))).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP,
+                )
+                gw += weight
+                wsum += cat_avg * weight
+            if gw == Decimal("0"):
+                return None
+            return (wsum / gw).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+        _cb_base = _live_weighted(Decimal("0"))
+        _cb_curved = _live_weighted(Decimal("5"))
+        if _cb_base is not None and _cb_curved is not None:
+            curve_changes_letter = (
+                "true" if _letter5(_cb_curved) != _letter5(_cb_base) else "false"
+            )
+        else:
+            curve_changes_letter = "false"
 
     # ── min_score_achievable: recomputed below after final exam target selection ──
     min_score_achievable = "false"
@@ -2579,6 +3669,13 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
     achievable_course_ids: list[str] = []
     impossible_b_course_ids: list[str] = []
     next_unsubmitted_ids: list[str] = []
+    # The near-threshold confuser engineered by near_threshold_b (A-impossible but
+    # B-achievable). Exposed so paired intervention variants can attack a REAL
+    # B-achievable course with a misleading-low-grade decoy. Empty unless
+    # near_threshold_b is set and a confuser was found.
+    confuser_course_id: str = ""
+    confuser_course_code: str = ""
+    confuser_enrollment_id: str = ""
 
     def _compute_need(cid: str, gp: dict) -> tuple[Decimal, Decimal, Decimal]:
         """Return (need, tw, xc) for a course. need=Decimal('inf') if xc==0."""
@@ -2645,7 +3742,17 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
     if not impossible_course_ids and len(achievable_course_ids) >= 2:
         # Find first achievable course with remaining assignments AND existing grades
         victim_cid = None
+        # Never sacrifice the boundary-calibrated target course: overwriting its
+        # grades to 25% would desync the displayed weighted score from the
+        # curve_changes_letter discriminator computed above.
+        _cb_protected_cid = (
+            ctx.outputs.get("target_course_id", "")
+            if target_curve_boundary in ("raise", "hold", "auto")
+            else None
+        )
         for cid in achievable_course_ids:
+            if _cb_protected_cid and cid == _cb_protected_cid:
+                continue
             rem = [a for a in assignments if a["course_id"] == cid and a["score"] is None]
             cid_grades = [g for g in ctx.base["grades"]
                           if g["course_id"] == cid and g["score"] is not None and not g["is_dropped"]]
@@ -2683,6 +3790,15 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
             # Update current_weighted_scores for the victim course (matches the
             # 25% per-grade score set above).
             current_weighted_scores[victim_cid] = "25.00"
+
+    # ── near_threshold_b is applied AFTER the final drop-lowest recompute below
+    # (search "near_threshold_b close-call") so that grade rescaling is not undone
+    # by the late _recompute_dropped_grade_ids() pass. The classification lists
+    # (impossible_course_ids / achievable_course_ids) computed above are the
+    # PRE-rescale baseline; the post-recompute block re-derives them from the
+    # truly-final state. ──
+
+
 
     impossible_b_enrollment_ids: list[str] = []
     for cid in impossible_b_course_ids:
@@ -2733,10 +3849,31 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
     priority_sorted = sorted(unsubmitted_all, key=_prio)
     priority_order_ids = [a["id"] for a in priority_sorted]
 
+    # ── enrolled-scoped decision support (opt-in, additive) ──
+    # When enrolled_scoped_decision is set, the credit-weighted course-load
+    # decision and the lowest-performing-course pick are computed over ONLY
+    # the courses the student is actively enrolled in (status == "enrolled"),
+    # NOT every catalog/visible course. This lets a task seed a non-enrolled
+    # (waitlisted/completed) decoy course whose credits/grade an agent that
+    # naively sums or mins "over all visible courses" would wrongly include —
+    # flipping the safe/not-safe branch or the drop target. Default False so
+    # the 64 other tasks that share grade_book are unaffected.
+    enrolled_scoped_decision = bool(params.get("enrolled_scoped_decision", False))
+    _enrolled_cids = {
+        e["course_id"] for e in enrollments if e.get("status") == "enrolled"
+    }
+
+    def _course_in_scope(cid: str) -> bool:
+        if not enrolled_scoped_decision:
+            return True
+        return cid in _enrolled_cids
+
     # ── lowest_performing_course_id ──
     lowest_performing_course_id = ""
     lowest_score_val: Decimal | None = None
     for cid, sc_str in current_weighted_scores.items():
+        if not _course_in_scope(cid):
+            continue
         sc = Decimal(sc_str)
         if lowest_score_val is None or sc < lowest_score_val:
             lowest_score_val = sc
@@ -2744,7 +3881,13 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
 
     # ── can_add_course: GPA stays above 3.0 with C in new 3-credit course ──
     student_gpa = Decimal(str(ctx.base.get("student", {}).get("gpa", "3.0")))
-    total_credits = sum(c.get("credits", 3) for c in courses)
+    # Authoritative current credit load = sum of credits over IN-SCOPE courses
+    # (enrolled-only when enrolled_scoped_decision is set). all_courses_total
+    # is the naive "sum over every visible course" trap value an agent reaches
+    # if it forgets to filter out the non-enrolled decoy.
+    _scoped_courses = [c for c in courses if _course_in_scope(c["id"])]
+    total_credits = sum(c.get("credits", 3) for c in _scoped_courses)
+    all_courses_total_credits = sum(c.get("credits", 3) for c in courses)
     current_quality_pts = student_gpa * Decimal(str(total_credits))
     # A C = 2.0 quality points per credit; new course = 3 credits
     new_quality_pts = current_quality_pts + Decimal("2.0") * Decimal("3")
@@ -2858,6 +4001,46 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
                 _gb_unsubmitted_hw_id = a["id"]
                 break
 
+    # ── earliest_unsubmitted_hw_id: the unsubmitted homework with the EARLIEST
+    # due date in the TARGET course (tie-break: lowest numeric id). ──
+    # This is a deterministic, course-scoped, computed discriminator. Tasks that
+    # tell the agent to act on "the next/earliest-due unsubmitted homework in
+    # {course_code}" bind to it so the canonical answer is unambiguous even when
+    # decoy unsubmitted homeworks (different due dates) are injected into the
+    # same course by a degradation variant — the agent must re-derive the
+    # earliest due date, not just grab "the unsubmitted one". When set, the param
+    # ``target_unsubmitted_hw_earliest`` re-points ``unsubmitted_hw_id`` at this
+    # scoped earliest target so the standard YAML output resolves to it. Both are
+    # additive: default behaviour (and every other consumer) is byte-identical.
+    _earliest_unsubmitted_hw_id = ""
+    _eu_target_cid = ctx.outputs.get("target_course_id", "") or (target_cid or "")
+    if _eu_target_cid:
+        _scoped_unsub_hw = [
+            a for a in assignments
+            if a["course_id"] == _eu_target_cid
+            and a["submission_status"] == "not_submitted"
+            and a["type"] == "homework"
+        ]
+
+        def _eu_due(a: dict[str, Any]) -> datetime:
+            raw = a["due_at"]
+            return datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+
+        def _eu_id_num(a: dict[str, Any]) -> int:
+            try:
+                return int(str(a["id"]).rsplit("_", 1)[-1])
+            except (ValueError, IndexError):
+                return 0
+
+        if _scoped_unsub_hw:
+            _earliest = sorted(
+                _scoped_unsub_hw,
+                key=lambda a: (_eu_due(a), _eu_id_num(a)),
+            )[0]
+            _earliest_unsubmitted_hw_id = _earliest["id"]
+    if params.get("target_unsubmitted_hw_earliest", False) and _earliest_unsubmitted_hw_id:
+        _gb_unsubmitted_hw_id = _earliest_unsubmitted_hw_id
+
     # ── latest_announcement_id (from announcements if available) ──
     # Scope to target_course_id when set so course-specific tasks ("the latest
     # announcement in your course") match what the agent sees in the course's
@@ -2880,6 +4063,136 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
         )
         latest_announcement_id = sorted_ann[0]["id"]
 
+    # ── force_drop_letter_flip sculpting (runs LATE, see comment above) ──
+    # Deterministically overwrite the TARGET course's homework grades so the
+    # demanding "submit" branch is always live and three compounding,
+    # re-derivable verification traps fire. Placed here -- after every other
+    # grade-mutation pass (notably the impossible-B "victim" pass that rewrites
+    # active grade scores to 25%) -- so nothing downstream clobbers it.
+    if params.get("force_drop_letter_flip"):
+        _flip_cid = ctx.outputs.get("target_course_id", "") or (
+            courses[0]["id"] if courses else ""
+        )
+        _flip_course = next((c for c in courses if c["id"] == _flip_cid), None)
+        if _flip_course is not None:
+            # Pin homework drop_lowest=1 on the target course so exactly the
+            # single lowest-ratio homework is dropped.
+            _gp = _flip_course["syllabus"]["grading_policy"]
+            if "homework" not in _gp:
+                _gp["homework"] = {"weight": "0.30", "drop_lowest": 1}
+            else:
+                _hwpol = _gp["homework"]
+                if isinstance(_hwpol, dict):
+                    _hwpol["drop_lowest"] = 1
+                else:
+                    _hwpol.drop_lowest = 1
+
+            # Make homework the SOLE graded category in the target course so the
+            # weighted score equals the homework category average -- this keeps
+            # the flip math deterministic regardless of the random template.
+            # Drop every non-homework grade record in the target course and
+            # reset those assignments to ungraded/not_submitted.
+            _nonhw_assign_ids = {
+                a["id"] for a in assignments
+                if a["course_id"] == _flip_cid and a["weight_category"] != "homework"
+            }
+            for a in assignments:
+                if a["id"] in _nonhw_assign_ids and a["submission_status"] in (
+                    "graded", "late", "resubmit_requested",
+                ):
+                    a["submission_status"] = "not_submitted"
+                    a["score"] = None
+                    a["submitted_at"] = None
+                    a["attempt_count"] = 0
+            # Drop ALL existing grades in the target course (any category) so the
+            # only grades that remain are the four homework grades we build next.
+            ctx.base["grades"] = [
+                g for g in ctx.base["grades"]
+                if g["course_id"] != _flip_cid
+            ]
+
+            # Collect / create EXACTLY four homework assignments in the target
+            # course to carry the deterministic grade roles below.
+            _hw_assigns = [
+                a for a in assignments
+                if a["course_id"] == _flip_cid and a["weight_category"] == "homework"
+            ]
+            _enr_id = enrollment_by_course.get(_flip_cid, "")
+            while len(_hw_assigns) < 4:
+                _new = Assignment(
+                    id=ctx.next_id("assignment"),
+                    course_id=_flip_cid,
+                    title=f"Homework {len(_hw_assigns) + 1}",
+                    type="homework",
+                    due_at=ctx.now - timedelta(days=10),
+                    points_possible=Decimal("100"),
+                    submission_status="graded",
+                    score=Decimal("0"),
+                    attempt_count=1,
+                    max_attempts=2,
+                    weight_category="homework",
+                )
+                _nd = _new.model_dump()
+                # ctx.base["assignments"] and the local `assignments` alias the
+                # same list -- append once only.
+                ctx.base["assignments"].append(_nd)
+                _hw_assigns.append(_nd)
+
+            # Deterministic role config. Each tuple is
+            # (points_possible, raw_score, late_penalty). Engine drops the
+            # lowest RAW RATIO grade (X, ratio 0.80). The late penalty sits on
+            # X (the dropped grade) so a naive un-penalized recompute reads the
+            # WITHOUT-drop score as an A and kills the flip.
+            #   X: 80/100 ratio 0.80, penalty 0.15  -> dropped (lowest ratio)
+            #   P: 92/100 ratio 0.92
+            #   A: 99/100 ratio 0.99
+            #   Z:  9/10  ratio 0.90 -> LOWEST raw earned points (the ratio trap)
+            # CORRECT (penalty applied): with-drop 93.67 (A), without-drop 87.25 (B) -> flip.
+            # NAIVE (penalty ignored):  without-drop 90.25 (A) -> no flip -> wrong branch.
+            _roles = [
+                (Decimal("100"), Decimal("80"), Decimal("0.15")),  # X dropped+late
+                (Decimal("100"), Decimal("92"), Decimal("0")),     # P
+                (Decimal("100"), Decimal("99"), Decimal("0")),     # A
+                (Decimal("10"), Decimal("9"), Decimal("0")),       # Z lowest points
+            ]
+            _used = _hw_assigns[:4]
+            for a in _hw_assigns[4:]:
+                # Surplus homework -> ungraded so they never enter the average.
+                if a["submission_status"] in ("graded", "late", "resubmit_requested"):
+                    a["submission_status"] = "not_submitted"
+                    a["score"] = None
+                    a["submitted_at"] = None
+                    a["attempt_count"] = 0
+
+            _z_assign_id = ""
+            for _a, (_pts, _raw, _pen) in zip(_used, _roles):
+                _a["points_possible"] = _pts
+                _a["score"] = _raw
+                _a["weight_category"] = "homework"
+                _a["type"] = "homework"
+                _a["max_attempts"] = max(2, int(_a.get("max_attempts", 1)))
+                _a["attempt_count"] = 1
+                _a["submission_status"] = "late" if _pen > 0 else "graded"
+                if _pen > 0 and not _a.get("submitted_at"):
+                    _a["submitted_at"] = (ctx.now - timedelta(days=5)).isoformat()
+                _g = Grade(
+                    id=ctx.next_id("grade"),
+                    enrollment_id=_enr_id,
+                    course_id=_flip_cid,
+                    assignment_id=_a["id"],
+                    score=_raw,
+                    points_possible=_pts,
+                    weight_category="homework",
+                    is_dropped=False,
+                    late_penalty_applied=_pen,
+                )
+                ctx.base["grades"].append(_g.model_dump())
+                if _pts == Decimal("10"):
+                    _z_assign_id = _a["id"]
+            # The naive "lowest raw earned points" pick (the ratio trap target)
+            # is the 10-point homework (Z), NOT the dropped lowest-ratio one.
+            _forced_lowest_raw_points_hw_id = _z_assign_id
+
     # Late seed adjustments can change grade scores after the first drop-lowest
     # pass. Recompute stored flags and derived targets once more so the UI,
     # task target, and LMSState.dropped_grades_for_category() agree.
@@ -2889,10 +4202,234 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
         for c in courses
         if _weighted_score(c["id"]) != Decimal("0")
     }
-    # Recompute grade_below_80 against the FINAL weighted score so the flag the
-    # oneof discriminator reads agrees with what the agent computes from the
-    # grades page (state.weighted_score_for_course). The earlier pass that set
-    # grade_below_80 ran before this final recompute and could be stale.
+
+    # ── near_threshold_b close-call (difficulty lever for the drop task) ──
+    #
+    # Runs AFTER the final drop-lowest recompute so grade rescaling is not undone.
+    # The default classification (and the 25% force-impossible fallback) tends to
+    # produce a STARK OUTLIER: the impossible course reads as a very low current
+    # weighted score (~25) next to achievable courses near 80, so an agent can
+    # pick the right course by eyeballing the lowest current grade WITHOUT running
+    # the per-category weighted "need a final >100% to still reach a B" solve.
+    #
+    # A course is impossible-for-a-B precisely because a large slice of its weight
+    # is still ungraded and its graded work is weak, so its CURRENT (graded-only)
+    # score is intrinsically low — we cannot make it high without making it
+    # achievable. Instead we make EYEBALLING ACTIVELY MISFIRE: engineer one
+    # ACHIEVABLE confuser (A-impossible but B-achievable, need ~94) whose CURRENT
+    # score is the LOWEST of all courses, so "drop the lowest current grade" picks
+    # the wrong (still-B-achievable) course, tripping the critical
+    # "dropped == impossible" + high "every achievable stays enrolled" checks.
+    # Only the per-category need>100 solve distinguishes them.
+    #
+    # Rescale is exact: need = (80*tw - fp)/xc and fp is linear in active grade
+    # scores, so scaling every active grade by k yields need_new =
+    # (80*tw - k*fp)/xc; we solve for k, then re-run drop-lowest and re-verify
+    # because drop-lowest selection can shift after a rescale.
+    if params.get("near_threshold_b"):
+        # Deterministic construction. For a course, if we set EVERY active graded
+        # item to the same percentage p (and zero its late penalty so eff=score),
+        # then for each graded category fp_cat = w * (g*p) / n and the per-category
+        # average is p, so drop-lowest (which drops equal-ratio items) does not
+        # change the result. Then:
+        #   fp = p * G   where G = sum_cats( w * g_graded / n )
+        #   need = (80*tw - p*G) / xc
+        # Solving for a target need N:  p = (80*tw - N*xc) / G.
+        # This hits the target need EXACTLY (modulo cent rounding) and is immune
+        # to drop-lowest reshuffling, so it is stable across all seeds.
+        def _course(cid):
+            return next((c for c in courses if c["id"] == cid), None)
+
+        def _category_stats(cid):
+            """Return (tw, xc, G, has_grades) for course cid, where G is the
+            graded-weight factor used by the uniform-percentage solve."""
+            c = _course(cid)
+            if c is None:
+                return None
+            gp = c["syllabus"]["grading_policy"]
+            rem = [a for a in assignments if a["course_id"] == cid and a["score"] is None]
+            tw = Decimal("0"); xc = Decimal("0"); G = Decimal("0")
+            has_grades = False
+            for cn, cp in gp.items():
+                w = Decimal(str(cp["weight"] if isinstance(cp, dict) else cp.weight))
+                ag = [g for g in ctx.base["grades"]
+                      if g["course_id"] == cid and g["weight_category"] == cn
+                      and g["score"] is not None and not g["is_dropped"]]
+                rc = [r for r in rem if r["weight_category"] == cn]
+                n = len(ag) + len(rc)
+                if n == 0:
+                    continue
+                tw += w
+                xc += w * Decimal(str(len(rc))) / Decimal(str(n))
+                if ag:
+                    has_grades = True
+                    G += w * Decimal(str(len(ag))) / Decimal(str(n))
+            return tw, xc, G, has_grades
+
+        def _set_to_need(cid, target_need: Decimal) -> Decimal | None:  # noqa: ARG001 (retained helper)
+            """Set every active grade in ``cid`` to the uniform percentage that
+            yields ``target_need``. Returns the achieved need (clamped if p had to
+            be bounded into [0, 100]). Retained for completeness; the construction
+            below uses _p_for_need + _apply_p directly for feasibility control."""
+            stats = _category_stats(cid)
+            if stats is None:
+                return None
+            tw, xc, G, has_grades = stats
+            if tw <= 0 or xc <= 0 or G <= 0 or not has_grades:
+                return None
+            p = (Decimal("80") * tw - target_need * xc) / G
+            p = max(Decimal("0"), min(Decimal("100"), p))
+            _apply_p(cid, p)
+            achieved, _, _ = _compute_need(cid, _course(cid)["syllabus"]["grading_policy"])
+            return achieved
+
+
+        def _final_classify():
+            imp = []; ach = []
+            for c in courses:
+                cid = c["id"]
+                rem = [a for a in assignments if a["course_id"] == cid and a["score"] is None]
+                if not rem:
+                    ach.append(cid)
+                    continue
+                need, tw, xc = _compute_need(cid, c["syllabus"]["grading_policy"])
+                if tw > 0 and xc > 0 and need != Decimal("inf") and need > Decimal("100"):
+                    imp.append(cid)
+                else:
+                    ach.append(cid)
+            return imp, ach
+
+        def _p_for_need(stats, target_need: Decimal) -> Decimal | None:
+            """Uniform percentage required for ``target_need``; None if infeasible
+            (would need p outside a realistic [5, 100] band)."""
+            tw, xc, G, has_grades = stats
+            if tw <= 0 or xc <= 0 or G <= 0 or not has_grades:
+                return None
+            p = (Decimal("80") * tw - target_need * xc) / G
+            if p < Decimal("5") or p > Decimal("100"):
+                return None
+            return p
+
+        def _disable_drops(cid) -> None:
+            """Turn off drop-lowest for every category of ``cid`` so a uniform
+            percentage maps to an EXACT weighted need (drop-lowest of equal grades
+            would otherwise silently change the active count and skew the solve)."""
+            gp = _course(cid)["syllabus"]["grading_policy"]
+            for cn, cp in gp.items():
+                if isinstance(cp, dict):
+                    cp["drop_lowest"] = 0
+                else:
+                    cp.drop_lowest = 0
+
+        def _apply_p(cid, p: Decimal) -> None:
+            _disable_drops(cid)
+            for g in ctx.base["grades"]:
+                if (g["course_id"] == cid and g["score"] is not None
+                        and not g["is_dropped"]):
+                    pts = Decimal(str(g["points_possible"]))
+                    g["score"] = float((pts * p / Decimal("100")).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP))
+                    g["late_penalty_applied"] = 0.0
+            _recompute_dropped_grade_ids()
+
+        # Courses that can be deterministically tuned (remaining work AND at least
+        # one graded category so the uniform-percentage solve has leverage), with
+        # their feasible percentages for the impossible (104) and confuser (94)
+        # targets precomputed. We disable drop-lowest first so _category_stats
+        # reflects the exact active set used by the solve.
+        IMP_NEED = Decimal("104")
+        CONF_NEED = Decimal("94")
+        EASY_NEED = Decimal("70")
+        for c in courses:
+            _disable_drops(c["id"])
+        _recompute_dropped_grade_ids()
+        tunable = []
+        for c in courses:
+            cid = c["id"]
+            stats = _category_stats(cid)
+            if stats is None:
+                continue
+            tw, xc, G, has_grades = stats
+            if tw > 0 and xc > 0 and G > 0 and has_grades:
+                tunable.append({
+                    "cid": cid,
+                    "p_imp": _p_for_need(stats, IMP_NEED),
+                    "p_conf": _p_for_need(stats, CONF_NEED),
+                })
+
+        imp_candidates = [t for t in tunable if t["p_imp"] is not None]
+        if imp_candidates:
+            # Impossible course: pick the one whose required percentage for need
+            # 104 is HIGHEST, so its current (graded-only) score lands as high as
+            # possible — it reads as a normal mid-band course, NOT a 25% outlier,
+            # so it can no longer be spotted by eyeballing the lowest grade.
+            imp = max(imp_candidates, key=lambda t: t["p_imp"])
+            primary_imp = imp["cid"]
+            p_imp = imp["p_imp"]
+
+            # Confuser: a DIFFERENT course tuned to need 94 (A-impossible but
+            # B-achievable). Prefer the confuser whose resulting current is CLOSEST
+            # to the impossible course's current, so the two sit in a tight visual
+            # band and only the per-category need-solve separates them.
+            conf_candidates = [
+                t for t in tunable
+                if t["cid"] != primary_imp and t["p_conf"] is not None
+            ]
+            confuser_cid = None
+            if conf_candidates:
+                conf = min(conf_candidates, key=lambda t: abs(t["p_conf"] - p_imp))
+                confuser_cid = conf["cid"]
+                p_conf = conf["p_conf"]
+                # Expose the confuser as a target so the paired variant can plant
+                # a misleading-low-grade decoy on this REAL B-achievable course.
+                confuser_course_id = confuser_cid
+                _conf_course = _course(confuser_cid)
+                if isinstance(_conf_course, dict):
+                    confuser_course_code = _conf_course.get("course_code", "")
+                elif _conf_course is not None:
+                    confuser_course_code = getattr(_conf_course, "course_code", "")
+                confuser_enrollment_id = enrollment_by_course.get(confuser_cid, "")
+
+            # Apply: impossible → 104, confuser → 94, every other tunable → 70.
+            _apply_p(primary_imp, p_imp)
+            if confuser_cid is not None:
+                _apply_p(confuser_cid, p_conf)
+            for t in tunable:
+                if t["cid"] in (primary_imp, confuser_cid):
+                    continue
+                p_easy = _p_for_need(_category_stats(t["cid"]), EASY_NEED)
+                if p_easy is None:
+                    # Fall back to a high-but-valid percentage that is safely
+                    # achievable (need well under 80).
+                    p_easy = Decimal("95")
+                _apply_p(t["cid"], p_easy)
+
+            # Final reconciliation against the FINAL persisted grades.
+            dropped_grade_ids = _recompute_dropped_grade_ids()
+            current_weighted_scores = {
+                c["id"]: str(_weighted_score(c["id"]))
+                for c in courses
+                if _weighted_score(c["id"]) != Decimal("0")
+            }
+            impossible_course_ids, achievable_course_ids = _final_classify()
+            impossible_b_course_ids = list(impossible_course_ids)
+            impossible_b_enrollment_ids = [
+                enrollment_by_course[cid]
+                for cid in impossible_b_course_ids
+                if cid in enrollment_by_course
+            ]
+            achievable_final_exam_assignment_ids = []
+            for cid in achievable_course_ids:
+                fa = next(
+                    (a for a in assignments if a["course_id"] == cid and a["type"] == "exam" and a["weight_category"] == "final"),
+                    None,
+                )
+                if not fa:
+                    fa = next((a for a in assignments if a["course_id"] == cid and a["type"] == "exam"), None)
+                if fa:
+                    achievable_final_exam_assignment_ids.append(fa["id"])
+
+
     grade_below_80 = "false"
     if target_cid:
         _final_sc = current_weighted_scores.get(target_cid)
@@ -3015,6 +4552,14 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
             )
             lowest_dropped_hw_id = _lowest_dropped.assignment_id
 
+    # When the hard branch was forced, expose the RATIO-trap decoy as
+    # lowest_hw_id: the homework with the lowest raw EARNED points, which the
+    # engine does NOT drop (the dropped one is lowest by score-to-points ratio).
+    # This is the "naive lowest raw points" pick the instruction warns against,
+    # and the solvability proof asserts lowest_hw_id != lowest_dropped_hw_id.
+    if _forced_lowest_raw_points_hw_id:
+        lowest_hw_id = _forced_lowest_raw_points_hw_id
+
     return {
         "grade_ids": grade_ids,
         "dropped_grade_ids": dropped_grade_ids,
@@ -3052,6 +4597,9 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
         "impossible_course_ids": ",".join(impossible_course_ids),
         "achievable_course_ids": ",".join(achievable_course_ids),
         "impossible_b_course_ids": ",".join(impossible_b_course_ids),
+        "confuser_course_id": confuser_course_id,
+        "confuser_course_code": confuser_course_code,
+        "confuser_enrollment_id": confuser_enrollment_id,
         "gpa_risk_course_ids": ",".join(gpa_risk_course_ids),
         "improvement_assignment_ids": ",".join(improvement_assignment_ids),
         "no_risk_flag": no_risk_flag,
@@ -3063,10 +4611,16 @@ def _build_grade_book(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[str, 
         "priority_order_ids": ",".join(priority_order_ids),
         "lowest_performing_course_id": lowest_performing_course_id,
         "can_add_course": can_add_course,
+        # ── enrolled-scoped course-load decision support (additive) ──
+        "current_total_credits": str(total_credits),
+        "all_courses_total_credits": str(all_courses_total_credits),
+        "projected_gpa": str(new_gpa),
+        "projected_total_credits": str(new_total_credits),
         "latest_announcement_id": latest_announcement_id,
         # ── Forwarded from earlier builders ──
         "score_below_70": _gb_score_below_70,
         "unsubmitted_hw_id": _gb_unsubmitted_hw_id,
+        "earliest_unsubmitted_hw_id": _earliest_unsubmitted_hw_id,
     }
 
 
@@ -3087,6 +4641,10 @@ def _build_module_sequence(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
     content_items_per_module : int -- total content items per module (default 2,
                                       min effectively 2; values >2 append
                                       quiz/reading/external_link content)
+    decoy_count : int        -- off-chain "available" look-alike modules
+    decoy_positions : list[int] -- explicit positions for decoys (interleave /
+                                   precede the chain instead of tailing it)
+    decoy_title_style : str  -- "optional" (default) or "chain" (no lexical tell)
     """
     course_id = params.get("course_id", "")
     count = params.get("count", 5)
@@ -3209,17 +4767,40 @@ def _build_module_sequence(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
     # of the prerequisite chain. They share the course (and a similar title
     # style) so the agent cannot identify the real chain by "available" status
     # alone — it must follow the prerequisite links.
+    #
+    # Two knobs let a task make the decoys actively misleading instead of
+    # merely cluttering the tail:
+    #   decoy_positions : explicit list of positions for each decoy. When the
+    #       positions are interleaved with (and *precede*) the first available
+    #       chain module, ``modules_for_course`` sorts the decoys BETWEEN /
+    #       BEFORE the chain modules, so "take the first available module" or
+    #       "take the contiguous first-three-by-position" both yield the wrong
+    #       answer. Falls back to tail positions (count + j) when unset.
+    #   decoy_title_style : "optional" (default — titled "Optional ...", a
+    #       lexical tell) or "chain" (titled identically to chain modules so
+    #       status / unlock_condition is the only discriminator).
+    decoy_positions = list(params.get("decoy_positions", []) or [])
+    decoy_title_style = params.get("decoy_title_style", "optional")
     decoy_module_ids: list[str] = []
     for j in range(decoy_count):
         decoy_id = ctx.next_id("module")
         decoy_module_ids.append(decoy_id)
+        if j < len(decoy_positions):
+            decoy_position = int(decoy_positions[j])
+        else:
+            decoy_position = count + j
+        if decoy_title_style == "chain":
+            # No "Optional" lexical tell — looks exactly like a chain module.
+            decoy_title = f"Module {decoy_position + 1}: {ctx.rng.choice(_TOPICS)}"
+        else:
+            decoy_title = f"Module {count + j + 1}: Optional {ctx.rng.choice(_TOPICS)}"
         decoy = Module(
             id=decoy_id,
             course_id=course_id,
             # Interleave decoy positions among the real chain so display order
             # does not separate them from the chain modules.
-            title=f"Module {count + j + 1}: Optional {ctx.rng.choice(_TOPICS)}",
-            position=count + j,
+            title=decoy_title,
+            position=decoy_position,
             unlock_condition="none",
             unlock_value=[],
             status="available",
@@ -3264,6 +4845,13 @@ def _build_module_sequence(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
         "next_chain_module_ids": next_chain_module_ids,
         "cascade_unlocked_module_id": cascade_unlocked_id,
         "decoy_module_ids": decoy_module_ids,
+        # Already-completed (off-segment) chain modules. ``last_completed_module_id``
+        # is the most recent completed module — a convenient, real, completed
+        # prerequisite target that a variant can point a misleading "available"
+        # decoy at (so the decoy genuinely passes is_module_unlocked and looks
+        # completable) without inventing a value outside the seeded state.
+        "completed_module_ids": module_ids[:completed_count],
+        "last_completed_module_id": module_ids[completed_count - 1] if completed_count > 0 else "",
     }
     if linked_assignment_id:
         result["linked_assignment_id"] = linked_assignment_id
@@ -3474,6 +5062,53 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     # with no tie-break ambiguity. Defaults False so every other task that uses
     # this builder keeps byte-identical fixtures.
     distinct_urgent_recency = params.get("distinct_urgent_recency", False)
+    # ── Contested-recency decoy knobs (only consulted when distinct_urgent_recency
+    # is on; default 0 so every other consumer keeps byte-identical fixtures). ──
+    # urgent_read_decoy_count: the LAST N urgent indices become is_read=True AND
+    # are posted *more recently* than the genuine urgent-unread target. They are
+    # the "newest urgent, but already read" trap — an agent that reads
+    # "most recently posted urgent" and DROPS the unread qualifier lands on one
+    # of these wrong, already-read records. Because they are is_read=True they
+    # are NOT in the urgent-unread pool, so the critical "exactly N-1 urgent left
+    # unread" constraint is unaffected.
+    urgent_read_decoy_count = int(params.get("urgent_read_decoy_count", 0))
+    # normal_late_decoy_count: the FIRST N normal indices become unread AND are
+    # posted even later than everything else. They are the "latest by ANY
+    # timestamp, but not urgent" trap — an agent that drops the urgent qualifier
+    # (sorts the whole unread feed by recency) lands here. Normal priority keeps
+    # them out of the urgent-unread count constraint.
+    normal_late_decoy_count = int(params.get("normal_late_decoy_count", 0))
+    # tight_recency: when on, the genuine urgent-unread pool is spread by SECONDS
+    # (not minutes) and the most salient urgent (feed-order index 0, the literal
+    # first "URGENT:" the agent encounters) is a near-tie runner-up only seconds
+    # behind the true target, forcing an exact posted_at comparison rather than a
+    # position/coarse-time heuristic.
+    tight_recency = bool(params.get("tight_recency", False)) and distinct_urgent_recency
+    # When True, urgent announcements do NOT carry an "URGENT: " title prefix, so
+    # urgency is ONLY discoverable by reading the per-announcement `priority`
+    # field — not by skimming title strings. Removing this tell forces the agent
+    # to ground every priority decision in the structured field. Defaults False
+    # so every other consumer of this builder keeps byte-identical titles.
+    plain_urgent_titles = params.get("plain_urgent_titles", False)
+    # read_urgent_count: how many ALREADY-READ urgent announcements to seed
+    # (the read+urgent cell of the priority×is_read cross-product). These are
+    # urgent-priority lookalikes that are already read, so they tempt an agent
+    # to re-mark / over-count them while the "preserve already-read" invariant
+    # would fire if it touched them. Implemented by promoting the first
+    # read_urgent_count read+normal announcements (indices >= unread_count) to
+    # urgent priority WITHOUT changing their read state. Defaults to 0 so every
+    # other consumer keeps byte-identical fixtures.
+    read_urgent_count = int(params.get("read_urgent_count", 0))
+    # exclude_ta_course: when True, this builder treats urgent+unread
+    # announcements posted in a course where the student's enrollment role is
+    # "ta" as DECOYS that must stay unread, and exposes
+    # unread_urgent_enrolled_announcement_ids = the urgent+unread set restricted
+    # to courses where the student is enrolled as a *student* (role != "ta").
+    # To make the discriminator load-bearing it also guarantees that at least
+    # one urgent+unread announcement actually lands in the TA course (relocating
+    # one if the round-robin distribution placed none there). Defaults False so
+    # existing tasks are unaffected.
+    exclude_ta_course = params.get("exclude_ta_course", False)
     # target_course_unread_min: guarantee at least this many unread announcements
     # land in the catalog-level target course so course-scoped bijection tasks
     # (e.g. "mark every unread announcement in your course as read") are non-vacuous.
@@ -3511,17 +5146,45 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         # RNG draw unconditionally to keep the stream identical.
         posted_at = ctx.now - timedelta(days=ctx.rng.randint(0, 14))
         if distinct_urgent_recency and is_urgent:
-            # Deterministic, distinct timestamps for urgent announcements.
-            # Rotate the "most recent" off the first urgent index: index 1 is
-            # newest (0 minutes back), then 0, then 2, 3, ... — so the latest
-            # urgent unread is NOT the first urgent the agent encounters.
-            rank = 0 if i == 1 else (1 if i == 0 else i)
-            posted_at = ctx.now - timedelta(hours=12) - timedelta(minutes=rank)
+            # Number of urgent records that are genuine (unread) targets; the
+            # last `urgent_read_decoy_count` urgent indices are read decoys.
+            genuine_urgent = max(1, urgent_count - urgent_read_decoy_count)
+            if i >= genuine_urgent and urgent_read_decoy_count > 0:
+                # READ urgent decoy posted MORE RECENTLY than the true target:
+                # the globally-newest *urgent* record, but already read. An agent
+                # that drops the unread qualifier picks this and fails the
+                # where.id expr. Stagger by minutes near `now` (well after the
+                # ~12h-old genuine pool) so it is unambiguously the latest urgent.
+                is_read = True
+                decoy_rank = i - genuine_urgent  # 0,1,...
+                posted_at = ctx.now - timedelta(minutes=30 + decoy_rank)
+            else:
+                # Genuine urgent-unread pool. index 1 is newest (true target);
+                # index 0 (the literal first "URGENT:" the agent sees) is the
+                # near-tie runner-up. With tight_recency the gap is SECONDS so a
+                # position/coarse-time heuristic cannot resolve it.
+                is_read = False
+                unit = (
+                    timedelta(seconds=1) if tight_recency else timedelta(minutes=1)
+                )
+                rank = 0 if i == 1 else (1 if i == 0 else i)
+                posted_at = ctx.now - timedelta(hours=12) - rank * unit
+        elif distinct_urgent_recency and normal_late_decoy_count > 0 and not is_urgent:
+            # NORMAL-priority late decoys: the first `normal_late_decoy_count`
+            # normal announcements become unread and are posted later than every
+            # urgent record (the genuine pool, the read-urgent decoys, and each
+            # other). An agent that drops the *urgent* qualifier and grabs the
+            # globally-newest unread announcement lands on one of these.
+            normal_index = i - urgent_count  # 0,1,... among normal records
+            if 0 <= normal_index < normal_late_decoy_count:
+                is_read = False
+                posted_at = ctx.now - timedelta(minutes=normal_index)
 
+        _urgent_prefix = "" if (plain_urgent_titles or not is_urgent) else "URGENT: "
         announcement = Announcement(
             id=ann_id,
             course_id=course_id,
-            title=f"{'URGENT: ' if is_urgent else ''}Announcement {i + 1}",
+            title=f"{_urgent_prefix}Announcement {i + 1}",
             body=body,
             posted_at=posted_at,
             is_read=is_read,
@@ -3544,6 +5207,24 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     # ── latest_announcement_id: most recent UNREAD by posted_at (fallback to any) ──
     latest_announcement_id = ""
     all_announcements = ctx.base.get("announcements", [])
+
+    # ── read+urgent cross-product cell ──
+    # Promote the first `read_urgent_count` ALREADY-READ announcements to urgent
+    # priority. This populates the read+urgent quadrant: urgent-looking decoys
+    # that are already read. They must NOT appear in unread_urgent_ids (they are
+    # read), so they are deliberately tempting over-mark targets. We only touch
+    # read announcements not already urgent, and we never flip is_read.
+    if read_urgent_count > 0:
+        _promoted = 0
+        for a in all_announcements:
+            if _promoted >= read_urgent_count:
+                break
+            if a.get("is_read", False) and a.get("priority") != "urgent":
+                a["priority"] = "urgent"
+                if not str(a.get("title", "")).startswith("URGENT: "):
+                    a["title"] = f"URGENT: {a.get('title', '')}"
+                _promoted += 1
+
 
     # ── Guarantee target-course unread coverage for course-scoped bijection tasks ──
     # If the catalog target course has fewer than target_course_unread_min unread
@@ -3588,6 +5269,39 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
     non_enrolled_course_ids = {
         e["course_id"] for e in enrollments if e.get("status") != "enrolled"
     }
+    # Courses where the student is a TA (role == "ta"). When exclude_ta_course
+    # is set, urgent+unread announcements in these courses are decoys that must
+    # stay unread, and the agent must JOIN announcement.course_id against the
+    # enrollment role to drop them from the target set.
+    ta_course_ids = {
+        e["course_id"] for e in enrollments if e.get("role") == "ta"
+    }
+    # Courses where the student is enrolled specifically as a STUDENT (the only
+    # courses whose urgent+unread announcements are real targets when scoping).
+    student_role_course_ids = {
+        e["course_id"]
+        for e in enrollments
+        if e.get("status") == "enrolled" and e.get("role") != "ta"
+    }
+
+    # When the TA-course discriminator is active, guarantee that at least one
+    # urgent+unread announcement actually lands in a TA course so the JOIN is
+    # load-bearing (an agent that ignores enrollment role would over-mark it).
+    # Relocate exactly one urgent+unread announcement from a student-role course
+    # into the TA course, but only while >=2 urgent+unread remain in
+    # student-role courses (keeps the positive target set non-empty).
+    if exclude_ta_course and ta_course_ids:
+        _ta_cid = sorted(ta_course_ids)[0]
+        urgent_unread_now = [
+            a for a in all_announcements
+            if a["priority"] == "urgent" and not a.get("is_read", True)
+        ]
+        already_in_ta = any(a["course_id"] in ta_course_ids for a in urgent_unread_now)
+        in_student = [
+            a for a in urgent_unread_now if a["course_id"] in student_role_course_ids
+        ]
+        if not already_in_ta and len(in_student) >= 2:
+            in_student[-1]["course_id"] = _ta_cid
 
     # Guarantee (when requested) that at least one unread+urgent announcement
     # lands in a NON-enrolled (e.g. waitlisted) course so the enrollment
@@ -3621,6 +5335,37 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         a["id"] for a in all_announcements
         if not a.get("is_read", True)
         and a["id"] not in set(enrolled_unread_urgent_ids)
+    ]
+
+    # ── Role-scoped urgent+unread target/decoy sets (TA discriminator) ──
+    # Recomputed over the FINAL state (after read_urgent promotion + TA
+    # relocation) so it is the authoritative load-bearing target set:
+    #   unread_urgent_enrolled_announcement_ids = urgent AND unread AND posted in
+    #     a course the student is enrolled in as a *student* (role != "ta").
+    #   unread_urgent_ta_course_announcement_ids = urgent AND unread but posted in
+    #     a TA-role course — these are decoys that MUST stay unread.
+    # When exclude_ta_course is off (or there is no TA course), the enrolled set
+    # equals the full unread+urgent set, so this output is a safe superset key
+    # that callers can bind to regardless of the discriminator being active.
+    unread_urgent_ta_course_ids = [
+        a["id"] for a in all_announcements
+        if a["priority"] == "urgent"
+        and not a.get("is_read", True)
+        and a["course_id"] in ta_course_ids
+    ]
+    if exclude_ta_course and ta_course_ids:
+        unread_urgent_enrolled_ids = [
+            a["id"] for a in all_announcements
+            if a["priority"] == "urgent"
+            and not a.get("is_read", True)
+            and a["course_id"] in student_role_course_ids
+        ]
+    else:
+        unread_urgent_enrolled_ids = list(unread_urgent_ids)
+    # read+urgent decoys: urgent priority but already read (must NOT be touched).
+    read_urgent_ids = [
+        a["id"] for a in all_announcements
+        if a["priority"] == "urgent" and a.get("is_read", False)
     ]
 
     if all_announcements:
@@ -3730,6 +5475,11 @@ def _build_announcements_feed(ctx: LMSSeedContext, params: dict[str, Any]) -> di
         "enrolled_unread_urgent_announcement_ids": ",".join(enrolled_unread_urgent_ids),
         "preserved_unread_announcement_ids": ",".join(preserved_unread_ids),
         "non_enrolled_course_ids": ",".join(sorted(non_enrolled_course_ids)),
+        # ── Role-scoped urgent target/decoy sets (TA discriminator) ──
+        "unread_urgent_enrolled_announcement_ids": ",".join(unread_urgent_enrolled_ids),
+        "unread_urgent_ta_course_announcement_ids": ",".join(unread_urgent_ta_course_ids),
+        "read_urgent_announcement_ids": ",".join(read_urgent_ids),
+        "ta_course_ids": ",".join(sorted(ta_course_ids)),
         # ── New computed outputs (exam-prep tasks) ──
         "unread_in_exam_courses_ids": ",".join(unread_in_exam_courses),
         "unread_in_non_exam_courses_ids": ",".join(unread_in_non_exam_courses),
@@ -3751,6 +5501,13 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
     weeks : int              -- how many weeks of recurrences (default 4)
     near_exam_courses : int  -- how many courses get exams within 14 days (default 0)
     force_exam_conflict : bool -- force two courses to share an exam day (default False)
+    structured_exam_conflict : bool -- stage a primary cluster + decoy cluster(s) on
+        distinct days (default False)
+    primary_conflict_size : int -- courses sharing the primary (answer) exam day (default 3)
+    decoy_conflict_size : int -- courses sharing each decoy exam day (default 2)
+    decoy_cluster_count : int -- number of separate decoy clusters/days (default 1)
+    tight_min_gap : bool -- anchor the primary cluster's two lowest grades on the
+        closest-scored adjacent pair so exact weighted-grade math is required (default False)
     """
     include_recurring = params.get("include_recurring", True)
     weeks = params.get("weeks", 4)
@@ -3855,7 +5612,45 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
                 next_exam_id = event_id
 
     # Move some exams to within 14 days if near_exam_courses > 0
-    if near_exam_courses > 0:
+    #
+    # boundary_spread (default False): instead of scattering the moved exams
+    # randomly across days 3-13 (all comfortably inside the 14-day window), pin
+    # them to deterministic offsets that STRADDLE the 14-day cutoff. The first
+    # ``near_exam_courses`` exams are pulled JUST INSIDE the window (days 12-13)
+    # and a further ``boundary_out_courses`` exams are pulled JUST OUTSIDE it
+    # (days 15-17). This forces the agent to hold each course's exam date AND the
+    # 14-day cutoff and re-evaluate per course — "the first exam in the next two
+    # weeks" heuristics and eyeballing both fail when in-window (day 13) and
+    # out-of-window (day 15) exams are interleaved one day apart. The exact
+    # cutoff used by the public courses_with_upcoming_exams output below is
+    # ``ctx.now + 14 days`` (start_dt must satisfy now < start_dt <= cutoff), so
+    # day-13 09:00 is in and day-15 09:00 is out, unambiguously and on every run.
+    boundary_spread = bool(params.get("boundary_spread", False))
+    boundary_out_courses = int(params.get("boundary_out_courses", 0))
+    if near_exam_courses > 0 and boundary_spread:
+        # Deterministic in-window offsets (<= day 13) and out-of-window offsets
+        # (>= day 15) cycled so the moved exams interleave around the boundary.
+        in_offsets = [13, 12, 13, 12, 11, 13]
+        out_offsets = [15, 16, 15, 17, 16, 15]
+        moved_in = 0
+        moved_out = 0
+        for ev in ctx.base["calendar_events"]:
+            if ev["event_type"] != "exam":
+                continue
+            if moved_in < near_exam_courses:
+                offset = in_offsets[moved_in % len(in_offsets)]
+                moved_in += 1
+            elif moved_out < boundary_out_courses:
+                offset = out_offsets[moved_out % len(out_offsets)]
+                moved_out += 1
+            else:
+                continue
+            near_dt = (ctx.now + timedelta(days=offset)).replace(
+                hour=9, minute=0, second=0,
+            )
+            ev["start_datetime"] = near_dt.isoformat() if isinstance(ev["start_datetime"], str) else near_dt
+            ev["end_datetime"] = (near_dt + timedelta(hours=3)).isoformat() if isinstance(ev["end_datetime"], str) else near_dt + timedelta(hours=3)
+    elif near_exam_courses > 0:
         moved = 0
         for ev in ctx.base["calendar_events"]:
             if ev["event_type"] != "exam" or moved >= near_exam_courses:
@@ -3898,6 +5693,21 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
             if ev["course_id"] not in courses_with_exams:
                 courses_with_exams.append(ev["course_id"])
     courses_without_exams = [cid for cid in all_course_ids if cid not in courses_with_exams]
+
+    # ── Stale-calendar decoy anchors (for the paired intervention variant) ──
+    # Expose two real NON-exam course IDs plus an IN-WINDOW exam datetime so the
+    # intervention variant can inject a plausible-but-false calendar read that
+    # claims these currently-non-exam courses have an exam inside the 14-day
+    # window. The dates are computed relative to the seed anchor (now+6 days,
+    # 09:00) so they fall strictly inside the cutoff and stay solvable as the
+    # wall clock floats. These are PURELY for the browser-side stale read — the
+    # backend state and therefore the canonical answer are unchanged, so a
+    # correct agent that re-reads the live calendar still produces the seeded
+    # courses_with_upcoming_exams set.
+    stale_dt = (ctx.now + timedelta(days=6)).replace(hour=9, minute=0, second=0, microsecond=0)
+    stale_dt_end = stale_dt + timedelta(hours=3)
+    first_non_exam_cid = courses_without_exams[0] if courses_without_exams else ""
+    second_non_exam_cid = courses_without_exams[1] if len(courses_without_exams) > 1 else ""
 
     # ── conflicting_course_ids: courses with exams on the same day ──
     # Group exam events by date
@@ -3958,11 +5768,26 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
     structured = params.get("structured_exam_conflict", False)
     primary_conflict_course_ids: list[str] = []
     decoy_conflict_course_ids: list[str] = []
+    second_decoy_conflict_course_ids: list[str] = []
     primary_conflict_day = ""
+    decoy_conflict_day = ""
+    second_decoy_conflict_day = ""
     second_lowest_primary_conflict_course_id = ""
+    primary_min_gap = ""
     if structured:
         primary_size = int(params.get("primary_conflict_size", 3))
         decoy_size = int(params.get("decoy_conflict_size", 2))
+        # decoy_cluster_count: how many SEPARATE decoy exam-day clusters to stage,
+        # each of size decoy_size on its own distinct day (default 1 — backward
+        # compatible). With >1 the agent can no longer eyeball "the busy day"; it
+        # must enumerate exam dates across several near-equal clusters and confirm
+        # the single most-conflicted one before reasoning about grades.
+        decoy_cluster_count = int(params.get("decoy_cluster_count", 1))
+        # tight_min_gap: when True, choose the primary cluster so its two LOWEST
+        # weighted grades are the closest-scored adjacent pair (strictly > 0 apart)
+        # in the eligible pool, forcing exact weighted-grade math — eyeballing the
+        # gradebook can no longer separate the two bottom courses.
+        tight_min_gap = bool(params.get("tight_min_gap", False))
         current_scores = ctx.outputs.get("current_weighted_scores", {})
         # Only courses with a real (non-zero, present) weighted grade are eligible
         # for the primary cluster — the discriminator must be well-defined.
@@ -3974,34 +5799,74 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
             ),
             key=lambda x: (x[1], x[0]),
         )
-        if len(scored) < primary_size + decoy_size:
+        total_decoy_needed = decoy_size * max(1, decoy_cluster_count)
+        if len(scored) < primary_size + total_decoy_needed:
             raise ValueError(
                 "structured_exam_conflict needs at least "
-                f"{primary_size + decoy_size} scored courses, found {len(scored)}"
+                f"{primary_size + total_decoy_needed} scored courses, found {len(scored)}"
             )
-        # Choose the primary cluster as the lowest-scored courses, then GUARANTEE
-        # a strictly-unique minimum: if the two lowest tie, swap the 2nd member
-        # for the next distinct-scored course so the bottom is unambiguous.
-        primary = scored[:primary_size]
-        if primary_size >= 2 and primary[0][1] == primary[1][1]:
-            replacement = next(
-                (entry for entry in scored[primary_size:] if entry[1] != primary[0][1]),
-                None,
-            )
-            if replacement is not None:
-                primary[1] = replacement
-                primary.sort(key=lambda x: (x[1], x[0]))
-            else:
-                raise ValueError("structured_exam_conflict: cannot break tie at cluster minimum")
+        if tight_min_gap and primary_size >= 2:
+            # Pick the primary cluster so its TWO LOWEST weighted grades are the
+            # closest-scored adjacent pair (strictly > 0 apart) in the eligible
+            # pool, and fill the remaining slots with strictly HIGHER-scored
+            # courses. Result: the bottom two are genuinely close (must be
+            # separated by exact weighted-grade math) while the rest of the
+            # cluster sits clearly above them. We search candidate low-pairs from
+            # the bottom up and require enough higher-scored courses to fill the
+            # cluster AND the decoy pools below them is irrelevant (decoys are
+            # drawn from whatever is left).
+            anchor = None
+            best_gap: Decimal | None = None
+            n = len(scored)
+            higher_needed = max(0, primary_size - 2)
+            for i in range(n - 1):
+                # The pair (i, i+1) are the two lowest of the cluster; we need at
+                # least `higher_needed` strictly-higher-scored courses above i+1.
+                higher_above = [e for e in scored[i + 2:] if e[1] > scored[i + 1][1]]
+                if len(higher_above) < higher_needed:
+                    continue
+                gap = scored[i + 1][1] - scored[i][1]
+                if gap > Decimal("0") and (best_gap is None or gap < best_gap):
+                    best_gap = gap
+                    anchor = (scored[i], scored[i + 1], higher_above[:higher_needed])
+            if anchor is None:
+                raise ValueError("structured_exam_conflict: no valid tight_min_gap low-pair")
+            lo_pair = [anchor[0], anchor[1]]
+            filler = list(anchor[2])
+            primary = sorted(lo_pair + filler, key=lambda x: (x[1], x[0]))
+        else:
+            # Choose the primary cluster as the lowest-scored courses, then GUARANTEE
+            # a strictly-unique minimum: if the two lowest tie, swap the 2nd member
+            # for the next distinct-scored course so the bottom is unambiguous.
+            primary = scored[:primary_size]
+            if primary_size >= 2 and primary[0][1] == primary[1][1]:
+                replacement = next(
+                    (entry for entry in scored[primary_size:] if entry[1] != primary[0][1]),
+                    None,
+                )
+                if replacement is not None:
+                    primary[1] = replacement
+                    primary.sort(key=lambda x: (x[1], x[0]))
+                else:
+                    raise ValueError("structured_exam_conflict: cannot break tie at cluster minimum")
         if primary[0][1] == primary[1][1]:
             raise ValueError("structured_exam_conflict: primary cluster minimum is not unique")
+        primary_min_gap = str((primary[1][1] - primary[0][1]).quantize(Decimal("0.01")))
         primary_ids = [cid for cid, _ in primary]
-        # Decoy cluster: distinct courses NOT in the primary cluster (any scores).
+        # Decoy clusters: distinct courses NOT in the primary cluster (any scores).
         decoy_pool = [c["id"] for c in courses if c["id"] not in primary_ids]
+        if len(decoy_pool) < total_decoy_needed:
+            raise ValueError("structured_exam_conflict: not enough courses for decoy clusters")
         decoy_ids = decoy_pool[:decoy_size]
+        # Second decoy cluster (only populated when decoy_cluster_count >= 2).
+        second_decoy_ids = (
+            decoy_pool[decoy_size : decoy_size * 2]
+            if decoy_cluster_count >= 2
+            else []
+        )
         if len(decoy_ids) < decoy_size:
             raise ValueError("structured_exam_conflict: not enough courses for decoy cluster")
-        # The primary cluster MUST be strictly larger than the decoy cluster so
+        # The primary cluster MUST be strictly larger than every decoy cluster so
         # "the day with the most overlapping exams" is unambiguous.
         if not (len(primary_ids) > len(decoy_ids)):
             raise ValueError("structured_exam_conflict: primary cluster must exceed decoy cluster")
@@ -4014,6 +5879,7 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
             if ev["event_type"] == "exam"
         }
         base_day = (ctx.now + timedelta(days=30)).replace(hour=9, minute=0, second=0, microsecond=0)
+        cluster_member_ids = set(primary_ids) | set(decoy_ids) | set(second_decoy_ids)
         # Distinct days for non-cluster courses (offset each by a unique week).
         spread_offset = 0
         for c in courses:
@@ -4021,9 +5887,9 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
             ev = exam_events.get(cid)
             if ev is None:
                 continue
-            if cid in primary_ids or cid in decoy_ids:
+            if cid in cluster_member_ids:
                 continue
-            day = base_day + timedelta(days=14 + spread_offset * 5)
+            day = base_day + timedelta(days=21 + spread_offset * 5)
             spread_offset += 1
             ev["start_datetime"] = day.isoformat() if isinstance(ev["start_datetime"], str) else day
             ev["end_datetime"] = (day + timedelta(hours=3)).isoformat() if isinstance(ev["end_datetime"], str) else day + timedelta(hours=3)
@@ -4036,7 +5902,7 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
             start = primary_day_dt.replace(hour=9 + offset * 3)
             ev["start_datetime"] = start.isoformat() if isinstance(ev["start_datetime"], str) else start
             ev["end_datetime"] = (start + timedelta(hours=2)).isoformat() if isinstance(ev["end_datetime"], str) else start + timedelta(hours=2)
-        # Decoy shared day (7 days after primary).
+        # First decoy shared day (7 days after primary).
         decoy_day_dt = base_day + timedelta(days=7)
         for offset, cid in enumerate(decoy_ids):
             ev = exam_events.get(cid)
@@ -4045,10 +5911,27 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
             start = decoy_day_dt.replace(hour=9 + offset * 3)
             ev["start_datetime"] = start.isoformat() if isinstance(ev["start_datetime"], str) else start
             ev["end_datetime"] = (start + timedelta(hours=2)).isoformat() if isinstance(ev["end_datetime"], str) else start + timedelta(hours=2)
+        # Second decoy shared day (14 days after primary) — same size as the first
+        # decoy cluster, so the agent sees TWO equal-sized runner-up exam days and
+        # cannot pick the most-conflicted day without enumerating all of them.
+        if second_decoy_ids:
+            second_decoy_day_dt = base_day + timedelta(days=14)
+            for offset, cid in enumerate(second_decoy_ids):
+                ev = exam_events.get(cid)
+                if ev is None:
+                    continue
+                start = second_decoy_day_dt.replace(hour=9 + offset * 3)
+                ev["start_datetime"] = start.isoformat() if isinstance(ev["start_datetime"], str) else start
+                ev["end_datetime"] = (start + timedelta(hours=2)).isoformat() if isinstance(ev["end_datetime"], str) else start + timedelta(hours=2)
 
         primary_conflict_course_ids = primary_ids
         decoy_conflict_course_ids = decoy_ids
+        second_decoy_conflict_course_ids = second_decoy_ids
         primary_conflict_day = primary_day_dt.strftime("%Y-%m-%d")
+        decoy_conflict_day = decoy_day_dt.strftime("%Y-%m-%d")
+        second_decoy_conflict_day = (
+            (base_day + timedelta(days=14)).strftime("%Y-%m-%d") if second_decoy_ids else ""
+        )
         second_lowest_primary_conflict_course_id = primary[1][0]
         # Recompute conflicting_cids from the freshly-staged exam dates so the
         # public output reflects ONLY the primary cluster the agent acts on.
@@ -4086,8 +5969,20 @@ def _build_calendar_events(ctx: LMSSeedContext, params: dict[str, Any]) -> dict[
         # ── structured_exam_conflict outputs (precomputed scalars/lists) ──
         "primary_conflict_course_ids": ",".join(primary_conflict_course_ids),
         "decoy_conflict_course_ids": ",".join(decoy_conflict_course_ids),
+        "second_decoy_conflict_course_ids": ",".join(second_decoy_conflict_course_ids),
+        "decoy_conflict_course_id": (decoy_conflict_course_ids[0] if decoy_conflict_course_ids else ""),
+        "second_decoy_conflict_course_id": (second_decoy_conflict_course_ids[0] if second_decoy_conflict_course_ids else ""),
         "primary_conflict_day": primary_conflict_day,
+        "decoy_conflict_day": decoy_conflict_day,
+        "second_decoy_conflict_day": second_decoy_conflict_day,
         "second_lowest_primary_conflict_course_id": second_lowest_primary_conflict_course_id,
+        "primary_conflict_min_gap": primary_min_gap,
+        # ── Stale-calendar decoy anchors (intervention variant) ──
+        "first_non_exam_course_id": first_non_exam_cid,
+        "second_non_exam_course_id": second_non_exam_cid,
+        "stale_exam_datetime": stale_dt.isoformat(),
+        "stale_exam_end_datetime": stale_dt_end.isoformat(),
+        "upcoming_exam_cutoff_date": cutoff.strftime("%Y-%m-%d"),
     }
 
 
@@ -4120,6 +6015,32 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
     # "returned" review, breaking a "find the single returned review" framing.
     # Default False preserves head-placement for all existing tasks.
     returned_at_end = bool(params.get("returned_at_end", False))
+    # Optional per-returned-review previous-score profiles. When supplied this is
+    # a list of {criterion: prev_score} dicts, one per returned review IN ORDER of
+    # creation. It lets a task seed DISTINCT prior scores across the returned
+    # subset so a rule-derived correction (prev+2 capped at 5, else 3) yields a
+    # DIFFERENT exact target vector per review — forcing the agent to read each
+    # review's authoritative detail page rather than apply one uniform vector.
+    # Default None preserves the legacy uniform profile (clarity=2, depth=1) so
+    # every other task that calls this builder is unaffected.
+    returned_prev_profiles = params.get("returned_prev_profiles") or None
+    # returned_prev_variation: controls the previous_rubric_scores carried by
+    # the returned-for-revision reviews.
+    #   "uniform"    (default) -> every returned review shares {clarity:2,depth:1}
+    #                 so the redo rule collapses to one constant triple.
+    #   "per_review" -> each returned review carries a DISTINCT previous-score
+    #                 map that exercises a different mix of rule branches
+    #                 (the +2 cap-at-5 branch and the unscored->3 branch), so
+    #                 the rule-derived answer differs per review and cannot be
+    #                 replayed. Used by the v2 hardened redo task.
+    returned_prev_variation = str(params.get("returned_prev_variation", "uniform"))
+    # Optional suffix appended to every RETURNED output key (not the seeded
+    # entities). Lets a task call this builder twice — once for the primary
+    # in-scope reviews and once for an out-of-scope sibling-course batch — and
+    # capture the second batch's ids under distinct target names (e.g.
+    # `pending_review_ids_sibling`) without colliding with the first batch's
+    # outputs. Additive: default "" preserves every existing call's key names.
+    result_key_suffix = str(params.get("result_key_suffix", "") or "")
     assignments = ctx.base.get("assignments", [])
 
     if not assignment_id:
@@ -4155,6 +6076,32 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
     pending_review_ids: list[str] = []
     completed_review_ids: list[str] = []
     returned_review_ids: list[str] = []
+    # Tracks how many returned-for-revision reviews we have emitted so far so we
+    # can index into returned_prev_profiles in creation order.
+    _returned_emitted = 0
+
+    # Per-returned-review previous-score profiles (v2 hardening). Each profile
+    # is keyed by (criterion -> previous score) and is chosen so the published
+    # redo rule (prev + 2 capped at 5; unscored -> 3) yields a DISTINCT corrected
+    # triple per review, and so every review exercises BOTH rule branches: it
+    # leaves exactly one criterion unscored (must become 3) and pushes at least
+    # one scored criterion to the 5 cap (prev + 2 > 5). The resulting required
+    # triples are clarity/depth/originality:
+    #   slot 0 {clarity:3, depth:1}      -> (5, 3, 3)   clarity hits cap
+    #   slot 1 {clarity:2, originality:4}-> (4, 3, 5)   originality hits cap
+    #   slot 2 {depth:4, originality:1}  -> (3, 5, 3)   depth hits cap
+    # This defeats the v1 "re-derive once, replay three times" shortcut: the
+    # agent must read each review's own previous_rubric_scores and apply the
+    # rule per review. Profiles only reference criteria that exist in the rubric.
+    _crit = [it.criterion for it in rubric_items]
+    _per_review_prev_profiles: list[dict[str, int]] = []
+    if len(_crit) >= 3:
+        _per_review_prev_profiles = [
+            {_crit[0]: 3, _crit[1]: 1},
+            {_crit[0]: 2, _crit[2]: 4},
+            {_crit[1]: 4, _crit[2]: 1},
+        ]
+    returned_slot = 0
 
     for i in range(count):
         review_id = ctx.next_id("review")
@@ -4184,10 +6131,32 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
 
         if returned_for_revision:
             status = "in_progress"
-            previous_rubric_scores = {
-                rubric_items[0].criterion: 2,
-                rubric_items[1].criterion: 1 if len(rubric_items) > 1 else 2,
-            }
+            if (
+                returned_prev_variation == "per_review"
+                and _per_review_prev_profiles
+            ):
+                profile = _per_review_prev_profiles[
+                    returned_slot % len(_per_review_prev_profiles)
+                ]
+                previous_rubric_scores = dict(profile)
+            elif returned_prev_profiles:
+                # Pick this returned review's profile by creation order; clamp to
+                # the last profile if fewer profiles than returned reviews were
+                # supplied. Keys are normalised to known rubric criteria.
+                _profile = returned_prev_profiles[
+                    min(_returned_emitted, len(returned_prev_profiles) - 1)
+                ]
+                previous_rubric_scores = {
+                    str(k): int(v)
+                    for k, v in dict(_profile).items()
+                    if str(k) in {item.criterion for item in rubric_items}
+                }
+            else:
+                previous_rubric_scores = {
+                    rubric_items[0].criterion: 2,
+                    rubric_items[1].criterion: 1 if len(rubric_items) > 1 else 2,
+                }
+            returned_slot += 1
             previous_comments = (
                 "This review was returned because not all rubric categories were scored "
                 "and the explanation was too brief."
@@ -4196,6 +6165,7 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
                 rubric_scores = previous_rubric_scores.copy()
             if review_id not in returned_review_ids:
                 returned_review_ids.append(review_id)
+            _returned_emitted += 1
 
         review = PeerReview(
             id=review_id,
@@ -4243,6 +6213,7 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
     # the eval having to introspect read-only proxy dicts at scoring time.
     returned_review_target_id = ""
     returned_review_reviewee_name = ""
+    returned_review_reviewee_first = ""
     returned_prev_clarity = ""
     returned_prev_depth = ""
     returned_prev_originality = ""
@@ -4254,6 +6225,11 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
         )
         if _rt is not None:
             returned_review_reviewee_name = _rt.get("reviewee_name", "")
+            # First-name token of the reviewee, so a redo task can require the
+            # comment to address the reviewee by their exact first name (a
+            # narrower grounding check than substring-of-full-name).
+            _rname = str(returned_review_reviewee_name).strip()
+            returned_review_reviewee_first = _rname.split()[0] if _rname else ""
             _prev = _rt.get("previous_rubric_scores", {}) or {}
             if "clarity" in _prev:
                 returned_prev_clarity = str(_prev["clarity"])
@@ -4305,12 +6281,26 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
     _pending_lookup = {pr["id"]: pr for pr in ctx.base["peer_reviews"]}
     min_score_entries: list[str] = []
     name_token_entries: list[str] = []
+    # ── EXACT rule-derived corrected scores (the load-bearing discriminator) ──
+    # The published correction rule (mirrors lms_peer_review_redo):
+    #   * a criterion that ALREADY has a previous score  -> previous + 2, capped at 5
+    #   * a criterion with NO previous score              -> exactly 3
+    # For a returned-for-revision review this yields a per-review EXACT vector
+    # (different reviews carry different previous scores, so different exacts);
+    # for a fresh pending review every criterion is unscored so the vector is
+    # 3~3~3. Exposed keyed by review id so the canonical_diff can demand the
+    # exact integers per review — "any valid 1-5" no longer passes.
+    req_score_entries: list[str] = []
+    # ── Lowest-corrected-criterion per review (a per-review computed assertion
+    # the comment must name). Ties broken by canonical order clarity<depth<orig.
+    low_crit_entries: list[str] = []
     for rid in pending_review_ids:
         pr = _pending_lookup.get(rid)
         if pr is None:
             continue
         prev = pr.get("previous_rubric_scores", {}) or {}
         mins: list[str] = []
+        reqs: list[int] = []
         for crit in _criteria_order:
             prev_val = prev.get(crit)
             if prev_val is None:
@@ -4318,14 +6308,57 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
                 prev_val = prev.get(crit.replace(" ", "_"))
             if prev_val is not None:
                 required = min(int(prev_val) + 1, 5)
+                exact = min(int(prev_val) + 2, 5)
             else:
                 required = 1
+                exact = 3
             mins.append(str(required))
+            reqs.append(exact)
         min_score_entries.append(f"{rid}={'~'.join(mins)}")
+        req_score_entries.append(f"{rid}={'~'.join(str(r) for r in reqs)}")
+        # Lowest corrected criterion (first index of the min value -> canonical
+        # tie-break, since _criteria_order is clarity, depth, originality).
+        low_idx = min(range(len(reqs)), key=lambda i: reqs[i])
+        low_crit_entries.append(f"{rid}:{_criteria_order[low_idx]}")
         first_name = str(pr.get("reviewee_name", "")).split()[0] if pr.get("reviewee_name") else ""
         name_token_entries.append(f"{rid}:{first_name}")
 
-    return {
+    # ── Per-RETURNED-review EXACT redo discriminators (v2 hardening) ──
+    # For every returned-for-revision review the canonical_diff bijects over,
+    # precompute the EXACT corrected rubric triple via the published rule
+    # (previous + 2 capped at 5; unscored -> 3) keyed by the review id, plus the
+    # reviewee first name the comment for that review must mention. Because the
+    # v2 builder gives each returned review a DISTINCT previous_rubric_scores,
+    # these per-rid entries are no longer uniform — the bijection's
+    # changes.rubric_scores predicate parses the entry for the slot id ``v`` and
+    # checks the agent landed exactly that review's own triple. Format:
+    #   returned_req_scores       : "<rid>=<clarity>~<depth>~<originality>|..."
+    #   returned_review_name_tokens: "<rid>:<reviewee_first_name>|..."
+    # These are precomputed scalars exposed as targets (rule 6); the
+    # canonical_diff only parses the per-review entry keyed by ``v`` and never
+    # recomputes a set inside a filter.
+    returned_req_entries: list[str] = []
+    returned_name_entries: list[str] = []
+    for rid in returned_review_ids:
+        pr = _pending_lookup.get(rid)
+        if pr is None:
+            continue
+        prev = pr.get("previous_rubric_scores", {}) or {}
+        reqs: list[str] = []
+        for crit in _criteria_order:
+            prev_val = prev.get(crit)
+            if prev_val is None:
+                prev_val = prev.get(crit.replace(" ", "_"))
+            if prev_val is not None:
+                required = min(int(prev_val) + 2, 5)
+            else:
+                required = 3
+            reqs.append(str(required))
+        returned_req_entries.append(f"{rid}={'~'.join(reqs)}")
+        first_name = str(pr.get("reviewee_name", "")).split()[0] if pr.get("reviewee_name") else ""
+        returned_name_entries.append(f"{rid}:{first_name}")
+
+    _result = {
         "review_ids": review_ids,
         "pending_review_ids": pending_review_ids,
         "completed_review_ids": completed_review_ids,
@@ -4334,6 +6367,7 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
         "peer_review_assignment_ids": peer_review_assignment_id_list,
         "returned_review_target_id": returned_review_target_id,
         "returned_review_reviewee_name": returned_review_reviewee_name,
+        "returned_review_reviewee_first": returned_review_reviewee_first,
         "returned_prev_clarity": returned_prev_clarity,
         "returned_prev_depth": returned_prev_depth,
         "returned_prev_originality": returned_prev_originality,
@@ -4342,6 +6376,14 @@ def _build_peer_review_assignments(ctx: LMSSeedContext, params: dict[str, Any]) 
         "req_score_depth": required_redo_scores.get("depth", 3),
         "req_score_originality": required_redo_scores.get("originality", 3),
         "pending_review_min_scores": "|".join(min_score_entries),
+        "pending_review_req_scores": "|".join(req_score_entries),
+        "pending_review_low_crit": "|".join(low_crit_entries),
         "pending_review_name_tokens": "|".join(name_token_entries),
         "pending_review_count": str(len(pending_review_ids)),
+        "returned_req_scores": "|".join(returned_req_entries),
+        "returned_review_name_tokens": "|".join(returned_name_entries),
+        "returned_review_count": str(len(returned_review_ids)),
     }
+    if result_key_suffix:
+        return {f"{k}{result_key_suffix}": v for k, v in _result.items()}
+    return _result

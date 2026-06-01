@@ -133,6 +133,17 @@ _MEDICATIONS: list[dict[str, Any]] = [
     {"name": "Levothyroxine 75mcg", "dosage": "75mcg", "frequency": "once daily on empty stomach"},
     {"name": "Gabapentin 300mg", "dosage": "300mg", "frequency": "three times daily"},
     {"name": "Sertraline 50mg", "dosage": "50mg", "frequency": "once daily"},
+    # Extra non-interacting maintenance meds. Additive: every existing task pins
+    # by name or uses a smaller active_count, so widening the pool only matters
+    # for tasks that explicitly request a larger active/expired cabinet (e.g.
+    # pp_check_interactions, which needs enough distinct meds to seat 11 active +
+    # 3 expired prescriptions plus the interaction-pair members).
+    {"name": "Hydrochlorothiazide 25mg", "dosage": "25mg", "frequency": "once daily"},
+    {"name": "Pantoprazole 40mg", "dosage": "40mg", "frequency": "once daily before breakfast"},
+    {"name": "Montelukast 10mg", "dosage": "10mg", "frequency": "once daily at bedtime"},
+    {"name": "Escitalopram 10mg", "dosage": "10mg", "frequency": "once daily"},
+    {"name": "Rosuvastatin 10mg", "dosage": "10mg", "frequency": "once daily at bedtime"},
+    {"name": "Cetirizine 10mg", "dosage": "10mg", "frequency": "once daily"},
 ]
 
 # Known drug interaction pairs
@@ -191,6 +202,7 @@ _BODY_CONTEXT_SUBJECTS: dict[str, str] = {
     "generic_alternative": "Generic Alternative Recommendation",
     "bp_medication_adjustment": "Blood Pressure Medication Adjustment",
     "referral_details": "Specialist Referral Information",
+    "pharmacy_closure_notice": "Mail-Order Pharmacy Closing — Action Needed",
 }
 
 # Denial reason pool for EOB claims
@@ -392,6 +404,29 @@ def build_patient_profile(ctx: PatientPortalSeedContext, params: dict[str, Any])
     ec_phone = f"(555) {ctx.rng.randint(100, 999)}-{ctx.rng.randint(1000, 9999)}"
     ec_rel = ctx.rng.choice(["Spouse", "Parent", "Sibling", "Child", "Friend"])
 
+    # --- Deterministic on-file overrides (verification-difficulty lever) ---
+    # Verification tasks like pp_update_phone need the value already ON FILE to
+    # be a VISUAL LOOKALIKE of the new target (e.g. transposed last two digits),
+    # so an agent that "trusts the displayed value" and re-saves what it sees,
+    # or hallucinates a near-identical number, trips the high/critical
+    # "phone != initial.phone" disambiguation constraints. These params let a
+    # task pin the on-file phone/email and the OLD emergency-contact identity
+    # to deterministic lookalikes instead of random values. They never change
+    # the mutation surface; they only make the seeded baseline a deliberate
+    # near-miss of the target the agent must write.
+    if params.get("phone") is not None:
+        phone = str(params["phone"])
+    if params.get("email") is not None:
+        email = str(params["email"])
+    _ec_override = params.get("emergency_contact")
+    if isinstance(_ec_override, dict):
+        if _ec_override.get("name") is not None:
+            ec_name = str(_ec_override["name"])
+        if _ec_override.get("phone") is not None:
+            ec_phone = str(_ec_override["phone"])
+        if _ec_override.get("relationship") is not None:
+            ec_rel = str(_ec_override["relationship"])
+
     # Insurance plan
     plan_name = f"{tier['plan_prefix']} {ctx.rng.choice(['PPO', 'HMO', 'EPO'])} Plan"
     member_id = f"MBR-{ctx.rng.randint(1000000, 9999999)}"
@@ -507,6 +542,14 @@ def build_patient_profile(ctx: PatientPortalSeedContext, params: dict[str, Any])
         "allergies_list": allergies,
         "applicable_screening_names": [s["screening_name"] for s in screening_models],
         "overdue_screening_names": overdue_screening_names,
+        # On-file (pre-task) contact values. Exposed so verification tasks can
+        # reference the deliberate near-miss baseline as exact-value lookalikes
+        # in canonical_diff constraints without re-reading the seed.
+        "on_file_phone": phone,
+        "on_file_email": email,
+        "on_file_ec_name": ec_name,
+        "on_file_ec_phone": ec_phone,
+        "on_file_ec_relationship": ec_rel,
     }
 
 
@@ -548,6 +591,19 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         existing tasks are unaffected. Required by tasks whose canonical
         answer is "the earliest in-person slot of provider X", to keep that
         answer guaranteed to exist across every seed.
+      force_earlier_telehealth_specialties (list[str]): for each listed
+        specialty, every provider of that specialty is guaranteed to own a
+        TELEHEALTH slot that is STRICTLY EARLIER than its earliest in-person
+        slot. Implies the in-person guarantee (the provider is given an
+        in-person slot first if it lacks one). This converts the
+        "earliest in-person slot" answer from a passive predicate into an
+        ACTIVE modality trap: the provider's globally-earliest slot is now
+        always telehealth, so an agent that books "the earliest slot" (ignoring
+        modality) lands on a concrete wrong slot on EVERY seed (not just the
+        ~1-in-3 seeds where the RNG happened to draw an early telehealth slot).
+        The injected slot is 1 hour before the earliest in-person slot, fully
+        deterministic, applied after all RNG draws so other tasks' seed streams
+        are unchanged. No-op unless the specialty is opted in.
       non_accepting_provider_specs (dict[str, int]): mark the first N providers
         created of each named specialty as ``accepting_new=False``. Lets a task
         seed a closed-panel decoy provider in a specialty the agent must
@@ -561,17 +617,53 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         discriminator, a strictly-earlier decoy slot is injected into one
         non-accepting provider of the same specialty (when one exists), so the
         globally-earliest slot belongs to a provider the agent must reject.
+      earlier_sibling_decoy_specialty (str): inject a slot strictly EARLIER
+        (one hour before) than the canonical first provider's earliest slot
+        into the first SIBLING provider of this specialty (a provider of the
+        specialty that is NOT ``prov_1``/the canonical first). This turns a
+        same-specialty sibling into a grounding trap: the globally-earliest
+        slot belongs to a provider the agent must reject, so "book the earliest
+        visible slot" is wrong and only "book the assigned provider's OWN
+        earliest slot" is correct. Requires the specialty to have >=2 providers
+        (e.g. ``count_per_specialty {pcp: 2}``). Exposes
+        ``global_earliest_decoy_slot_dt`` / ``global_earliest_decoy_provider_id``.
     Outputs: provider_ids, providers_by_specialty, earliest_slot_dt,
-             earliest_slot_provider_ids
+             earliest_slot_provider_ids, global_earliest_decoy_slot_dt,
+             global_earliest_decoy_provider_id
     """
     specialties = params.get("specialties", ["pcp"])
     count_per_specialty = params.get("count_per_specialty", {}) or {}
     must_include = set(params.get("must_include", []))
     force_in_person_specialties = set(params.get("force_in_person_specialties", []) or [])
+    force_earlier_telehealth_specialties = set(
+        params.get("force_earlier_telehealth_specialties", []) or []
+    )
+    # Owning the earlier-telehealth trap implies the in-person guarantee, since
+    # the trap is defined relative to "the earliest in-person slot".
+    force_in_person_specialties |= force_earlier_telehealth_specialties
     non_accepting_provider_specs: dict[str, int] = {
         str(k): int(v) for k, v in (params.get("non_accepting_provider_specs", {}) or {}).items()
     }
+    # `accepting_specialties` overrides the hardcoded closed-panel default for
+    # the listed specialties so that providers of those specialties start with
+    # ``accepting_new=True`` (billing/admin are closed-panel by default). This
+    # is what makes a ``non_accepting_provider_specs`` carve-out a genuine
+    # OPEN-vs-CLOSED discriminator within an otherwise-closed specialty (e.g.
+    # admin): the first N admin providers are forced closed (the trap the agent
+    # must reject) while the remainder are explicitly open and bookable. No-op
+    # for specialties not listed, so existing tasks are byte-identical.
+    accepting_specialties = set(params.get("accepting_specialties", []) or [])
     min_slot_specialty: str | None = params.get("min_slot_specialty")
+    # tie_break_specialty: for a specialty with >= 2 providers, force the two
+    # providers' EARLIEST slots to be only minutes apart AND make the globally-
+    # earliest slot belong to the SECOND-created provider of that specialty. This
+    # turns "earliest slot across both providers" into a genuine cross-provider
+    # comparison: an agent that stops at the first provider it reads books a slot
+    # that is later (by minutes) than the true global earliest, picking the wrong
+    # owning provider. The exact (datetime, provider) is recomputed by the
+    # min_slot_by_specialty/earliest_slot_*_by_specialty outputs below, so the
+    # canonical_diff pins the correct second provider deterministically.
+    tie_break_specialty: str | None = params.get("tie_break_specialty")
     # Merge specialties + must_include, deduped. count_per_specialty controls
     # how many providers of each specialty are created (default 1).
     all_specialties = list(dict.fromkeys(specialties + list(must_include)))
@@ -610,7 +702,14 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
 
             prov_name = ctx.rng.choice(available_names)
             used.add(prov_name)
-            accepting = spec not in ("billing", "admin")
+            # billing/admin are closed-panel by default, but a task may opt a
+            # specialty back into open-panel via `accepting_specialties` so that
+            # a `non_accepting_provider_specs` carve-out becomes a real
+            # open-vs-closed discriminator instead of "everyone is closed".
+            if spec in accepting_specialties:
+                accepting = True
+            else:
+                accepting = spec not in ("billing", "admin")
             # `non_accepting_provider_specs` forces the first N created providers
             # of a specialty to be closed-panel (accepting_new=False) so a task
             # can seed a tempting-but-ineligible provider in a bookable
@@ -648,6 +747,35 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
             ):
                 slots[0]["type"] = "in-person"
 
+            # Modality trap: guarantee a TELEHEALTH slot strictly EARLIER than
+            # the earliest in-person slot. Makes "earliest slot of provider X"
+            # (ignoring modality) a concrete wrong answer on every seed, so the
+            # in-person filter in the canonical datetime expr is an active
+            # discriminator rather than an occasionally-vacuous predicate.
+            # Deterministic (1h before the earliest in-person slot), applied
+            # after RNG draws, no-op unless the specialty is opted in.
+            if spec in force_earlier_telehealth_specialties and slots:
+                inperson_dts = [
+                    s["datetime"] for s in slots if s["type"] == "in-person"
+                ]
+                if inperson_dts:
+                    earliest_inperson = min(inperson_dts)
+                    has_earlier_telehealth = any(
+                        s["type"] == "telehealth" and s["datetime"] < earliest_inperson
+                        for s in slots
+                    )
+                    if not has_earlier_telehealth:
+                        trap_dt = (
+                            datetime.fromisoformat(earliest_inperson)
+                            - timedelta(hours=1)
+                        )
+                        slots.append({
+                            "datetime": trap_dt.isoformat(),
+                            "type": "telehealth",
+                            "duration_minutes": 30,
+                        })
+                        slots.sort(key=lambda s: s["datetime"])
+
             prov_dict = {
                 "id": prov_id,
                 "name": prov_name,
@@ -668,6 +796,55 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         )
         if pcp_prov:
             ctx.outputs["pcp_name"] = pcp_prov["name"]
+        # Expose the SECOND PCP (the same-specialty decoy) by id and name so a
+        # task/variant can pin "do not book/confirm with the other PCP" and so a
+        # grounding stressor can inject a lookalike from the decoy PCP without
+        # re-deriving the id inside a filter scope. prov_1 is always the
+        # assigned PCP, so the decoy is providers_by_specialty["pcp"][1:].
+        pcp_ids_in_order = providers_by_specialty["pcp"]
+        if len(pcp_ids_in_order) > 1:
+            decoy_pid = pcp_ids_in_order[1]
+            decoy_prov = next(
+                (p for p in ctx.base["providers"] if p["id"] == decoy_pid), None
+            )
+            if decoy_prov:
+                ctx.outputs["decoy_pcp_id"] = decoy_pid
+                ctx.outputs["decoy_pcp_name"] = decoy_prov["name"]
+
+    # tie_break_specialty: make the two providers' earliest slots only minutes
+    # apart and place the globally-earliest one on the SECOND-created provider.
+    if tie_break_specialty:
+        tb_ids = providers_by_specialty.get(tie_break_specialty, [])
+        if len(tb_ids) >= 2:
+            first_prov = next(
+                (p for p in ctx.base["providers"] if p["id"] == tb_ids[0]), None
+            )
+            second_prov = next(
+                (p for p in ctx.base["providers"] if p["id"] == tb_ids[1]), None
+            )
+            if (
+                first_prov
+                and second_prov
+                and first_prov.get("available_slots")
+                and second_prov.get("available_slots")
+            ):
+                first_slots = sorted(
+                    first_prov["available_slots"], key=lambda s: s["datetime"]
+                )
+                first_earliest_dt = datetime.fromisoformat(
+                    first_slots[0]["datetime"]
+                )
+                # Place the second provider's earliest slot 15 minutes BEFORE the
+                # first provider's earliest slot, so the global earliest belongs
+                # to the second-created provider and the gap is only minutes.
+                tie_dt = first_earliest_dt - timedelta(minutes=15)
+                second_slots = sorted(
+                    second_prov["available_slots"], key=lambda s: s["datetime"]
+                )
+                second_slots[0]["datetime"] = tie_dt.isoformat()
+                second_prov["available_slots"] = sorted(
+                    second_slots, key=lambda s: s["datetime"]
+                )
 
     # Derived: for each specialty, the globally-earliest available slot across
     # ALL providers of that specialty. Tasks that ask the agent to book "the
@@ -758,10 +935,26 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
     # Tie-break is lexicographic on (datetime_iso, provider_id) so the winner
     # is deterministic when two admin providers share the earliest slot time.
     # Only in-person slots are eligible (a front-desk records visit is on-site).
+    #
+    # IMPORTANT: only ACCEPTING (open-panel) admin providers are eligible. When
+    # a task carves out closed-panel admin providers via
+    # ``non_accepting_provider_specs`` + ``accepting_specialties`` and injects a
+    # strictly-earlier decoy slot into a closed provider (via
+    # ``min_slot_specialty``), the GLOBALLY earliest in-person admin slot
+    # belongs to a provider the agent must reject — so the canonical answer is
+    # the earliest in-person slot among ACCEPTING admin providers only. When no
+    # admin specialty was opted into open-panel (legacy tasks), every admin
+    # provider is closed; in that case we fall back to considering ALL admin
+    # providers so the answer still exists (preserving prior behaviour).
     admin_provider_ids = providers_by_specialty.get("admin", [])
     admin_providers = [p for p in ctx.base["providers"] if p["id"] in admin_provider_ids]
+    _eligible_admin = [p for p in admin_providers if p.get("accepting_new")]
+    if not _eligible_admin:
+        # Legacy / all-closed admin directory: keep the historical behaviour of
+        # ranking across every admin provider so the answer is non-empty.
+        _eligible_admin = admin_providers
     _inperson_candidates: list[tuple[str, str]] = []
-    for p in admin_providers:
+    for p in _eligible_admin:
         for s in p.get("available_slots", []):
             if s.get("type") == "in-person":
                 _inperson_candidates.append((s["datetime"], p["id"]))
@@ -771,6 +964,75 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         _inperson_candidates.sort(key=lambda t: (t[0], t[1]))
         admin_earliest_inperson_slot_datetime = _inperson_candidates[0][0]
         admin_earliest_inperson_provider_id = _inperson_candidates[0][1]
+    # Expose the set of ACCEPTING (open-panel) admin provider ids so the
+    # canonical_diff can restrict its min()/membership predicates to the
+    # bookable subset without reconstructing the accepting filter inside a
+    # comprehension scope it cannot see (Class 6 filter-scope hazard).
+    accepting_admin_provider_ids = sorted(
+        p["id"] for p in admin_providers if p.get("accepting_new")
+    )
+    # A SECOND open-panel admin provider id, distinct from the canonical
+    # earliest-slot provider when one exists. Grounding-stressor variants seed a
+    # same-reason/same-type lookalike appointment onto this provider so the
+    # agent must distinguish the seeded decoy from its OWN required booking
+    # WITHOUT landing the decoy on a closed-panel provider (which would trip the
+    # open-panel constraint). Falls back to the canonical provider when only one
+    # open-panel admin exists.
+    decoy_admin_provider_id: str | None = None
+    _other_open = [
+        pid for pid in accepting_admin_provider_ids
+        if pid != admin_earliest_inperson_provider_id
+    ]
+    if _other_open:
+        decoy_admin_provider_id = _other_open[0]
+    elif accepting_admin_provider_ids:
+        decoy_admin_provider_id = accepting_admin_provider_ids[0]
+
+    # -- Earlier-sibling decoy slot (earlier_sibling_decoy_specialty) ----------
+    # Tasks that pin "book the EARLIEST slot on the ASSIGNED provider's own
+    # calendar" (where the assigned provider is the canonical first provider of
+    # a specialty — for PCP that is always ``prov_1``) need a genuine grounding
+    # discriminator: a SIBLING provider of the same specialty whose earliest
+    # slot is strictly GLOBALLY EARLIER than the assigned provider's earliest
+    # slot. An agent that naively books "the earliest visible <specialty> slot"
+    # lands on the sibling and fails the ``provider_id == assigned`` predicate;
+    # the canonical answer (the assigned provider's own earliest slot) is later
+    # in wall-clock time, so the trap is real, not cosmetic.
+    #
+    # The decoy slot is injected ONE HOUR before the assigned provider's
+    # earliest slot into the first sibling provider of the named specialty
+    # (a provider of that specialty that is NOT the canonical first provider).
+    # The injection happens after all RNG draws so the deterministic seed stream
+    # is unchanged for tasks that do not request this. We expose the resulting
+    # globally-earliest (datetime, provider_id) so a solvability proof / test
+    # can assert the trap exists without re-deriving it.
+    earlier_decoy_specialty: str | None = params.get("earlier_sibling_decoy_specialty")
+    global_earliest_decoy_slot_dt: str | None = None
+    global_earliest_decoy_provider_id: str | None = None
+    if earlier_decoy_specialty:
+        spec_ids = providers_by_specialty.get(earlier_decoy_specialty, [])
+        spec_provs = [p for p in ctx.base["providers"] if p["id"] in spec_ids]
+        # Canonical first provider of this specialty (prov_1 for PCP); the rest
+        # are siblings the agent must reject.
+        canonical = next(
+            (p for p in spec_provs if p["id"] == "prov_1"),
+            spec_provs[0] if spec_provs else None,
+        )
+        siblings = [p for p in spec_provs if canonical is not None and p["id"] != canonical["id"]]
+        if canonical is not None and siblings and canonical.get("available_slots"):
+            assigned_earliest = min(s["datetime"] for s in canonical["available_slots"])
+            decoy_dt = (
+                datetime.fromisoformat(assigned_earliest) - timedelta(hours=1)
+            )
+            decoy_provider = siblings[0]
+            decoy_provider.setdefault("available_slots", []).append({
+                "datetime": decoy_dt.isoformat(),
+                "type": "in-person",
+                "duration_minutes": 30,
+            })
+            decoy_provider["available_slots"].sort(key=lambda s: s["datetime"])
+            global_earliest_decoy_slot_dt = decoy_dt.isoformat()
+            global_earliest_decoy_provider_id = decoy_provider["id"]
 
     return {
         "provider_ids": provider_ids,
@@ -782,6 +1044,15 @@ def build_provider_directory(ctx: PatientPortalSeedContext, params: dict[str, An
         "earliest_slot_provider_ids": earliest_slot_provider_ids,
         "admin_earliest_inperson_slot_datetime": admin_earliest_inperson_slot_datetime,
         "admin_earliest_inperson_provider_id": admin_earliest_inperson_provider_id,
+        "accepting_admin_provider_ids": accepting_admin_provider_ids,
+        "decoy_admin_provider_id": decoy_admin_provider_id,
+        "global_earliest_decoy_slot_dt": global_earliest_decoy_slot_dt,
+        "global_earliest_decoy_provider_id": global_earliest_decoy_provider_id,
+        # Second same-specialty PCP (the decoy), when one exists. Used by tasks
+        # that forbid booking/confirming with the other PCP and by grounding
+        # stressors that plant a lookalike from this provider.
+        "decoy_pcp_id": ctx.outputs.get("decoy_pcp_id"),
+        "decoy_pcp_name": ctx.outputs.get("decoy_pcp_name"),
     }
 
 
@@ -803,6 +1074,10 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
             them), ``mail_order_costs`` (id → cost string), and
             ``cheapest_mail_order_pharmacy_id`` (min cost, ties broken by
             ascending pharmacy id).
+        mail_order_costs_override (list): explicit ordered
+            ``cost_per_90day_supply`` values for the mail-order pharmacies (in
+            creation order). Overrides the rng draw so the "cheapest mail-order"
+            discriminator is deterministic and can carry a deliberate near-tie.
         must_include_name (str | list[str]): case-insensitive substring(s) of
             pharmacy template names that MUST be present in the selected
             pharmacies. Each matched template is pinned before other
@@ -840,6 +1115,30 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
     count = params.get("count", 2)
     include_mail_order = params.get("include_mail_order", False)
     distinct_retail_fees_raw = params.get("distinct_retail_fees")
+    # ``retail_decoy_fees`` (list[int]): when supplied, the builder appends extra
+    # NON-DEFAULT, NON-MAIL-ORDER retail pharmacies with these dispensing fees
+    # that are deliberately NOT added to ``patient.pharmacy_ids`` (i.e. they are
+    # visible via ``GET /pharmacies`` but are NOT part of the patient's pharmacy
+    # LIST exposed on ``GET /profile``). Tasks that scope the cheapest-retail
+    # discriminator to "the retail pharmacies in your pharmacy list" use these as
+    # cheaper-fee traps: an agent that sorts every visible pharmacy by fee picks
+    # a decoy and fails, while an agent that first restricts to
+    # ``profile.pharmacy_ids`` picks the correct in-list pharmacy. The decoys are
+    # excluded from ``cheapest_retail_pharmacy_id`` (which is computed over
+    # list-members only) and exposed under ``retail_decoy_pharmacy_ids`` plus the
+    # naive-wrong answer ``cheapest_overall_retail_pharmacy_id``.
+    retail_decoy_fees_raw = params.get("retail_decoy_fees")
+    # Optional explicit, ordered ``cost_per_90day_supply`` values for the
+    # mail-order pharmacies (creation order = ``mail_order_pharmacy_ids`` order).
+    # When supplied, each mail-order pharmacy gets the corresponding cost instead
+    # of an rng draw, making the "cheapest mail-order" discriminator deterministic
+    # AND letting a cost-comparison task seed a deliberate NEAR-TIE (two options
+    # within $1 of each other) so a naive "first mail-order" / eyeball pick lands
+    # on the wrong one. Values are recycled if the list is shorter than
+    # ``mail_order_count``. The cheapest is still computed from the actual values
+    # (min cost, ties broken by ascending pharmacy id) so the canonical answer is
+    # never positional.
+    mail_order_costs_override_raw = params.get("mail_order_costs_override")
     # Number of distinct mail-order pharmacies to create, each with its own
     # rng-drawn ``cost_per_90day_supply``. Defaults to 1 when
     # ``include_mail_order`` is True (legacy single-mail-order behavior), 0
@@ -931,6 +1230,11 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
 
     mail_order_pharmacy_ids: list[str] = []
     mail_order_costs: dict[str, str] = {}
+    mail_order_costs_override: list[Decimal] | None = None
+    if mail_order_costs_override_raw:
+        mail_order_costs_override = [
+            Decimal(str(c)) for c in mail_order_costs_override_raw
+        ]
     if mail_order_count > 0:
         # Template 0 is always the legacy Express Scripts entry so existing
         # single-mail-order tasks are byte-identical; entries 1+ pull from the
@@ -940,7 +1244,12 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
         for mo_idx in range(mail_order_count):
             tmpl = mail_order_templates[mo_idx % len(mail_order_templates)]
             pharm_id = ctx.next_id("pharm")
-            cost = Decimal(str(ctx.rng.randint(15, 45)))
+            if mail_order_costs_override is not None:
+                cost = mail_order_costs_override[
+                    mo_idx % len(mail_order_costs_override)
+                ]
+            else:
+                cost = Decimal(str(ctx.rng.randint(15, 45)))
             pharm_dict = {
                 "id": pharm_id,
                 "name": tmpl["name"],
@@ -976,6 +1285,37 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
     if "patient" in ctx.base:
         ctx.base["patient"]["pharmacy_ids"] = pharmacy_ids
 
+    # Out-of-list retail decoy pharmacies. These are real Pharmacy entities in
+    # the world state (so they appear on ``GET /pharmacies`` and are valid
+    # transfer targets), but they are deliberately NOT in ``pharmacy_ids`` /
+    # ``patient.pharmacy_ids`` — they are not part of the patient's pharmacy
+    # LIST. Their fees are set BELOW the cheapest in-list retail fee so a naive
+    # agent that sorts every visible pharmacy by ``dispensing_fee`` is lured to
+    # the wrong (out-of-list) destination. The id suffix continues from the
+    # in-list pharmacies; templates recycle from the retail pool with a distinct
+    # store number so the decoy names are plausible but distinguishable.
+    retail_decoy_pharmacy_ids: list[str] = []
+    retail_decoy_fee_by_id: dict[str, str] = {}
+    if retail_decoy_fees_raw:
+        retail_decoy_fees = [int(f) for f in retail_decoy_fees_raw]
+        for d_idx, fee in enumerate(retail_decoy_fees):
+            tmpl = _PHARMACY_TEMPLATES[d_idx % len(_PHARMACY_TEMPLATES)]
+            pharm_id = ctx.next_id("pharm")
+            pharm_dict = {
+                "id": pharm_id,
+                # Suffix the store name so it is clearly a different storefront
+                # than the in-list templates of the same chain.
+                "name": f"{tmpl['name'].split('#')[0].strip()} #D{700 + d_idx}",
+                "address": tmpl["address"],
+                "phone": tmpl["phone"],
+                "is_default": False,
+                "is_mail_order": False,
+                "dispensing_fee": str(Decimal(str(fee))),
+            }
+            ctx.base["pharmacies"].append(pharm_dict)
+            retail_decoy_pharmacy_ids.append(pharm_id)
+            retail_decoy_fee_by_id[pharm_id] = str(Decimal(str(fee)))
+
     # Compute the cheapest NON-DEFAULT, NON-MAIL-ORDER retail pharmacy. This is
     # the canonical answer for tasks that ask the agent to re-derive "lowest
     # dispensing fee retail pharmacy" rather than naming the store. Tie-break by
@@ -993,9 +1333,15 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
         except (ValueError, IndexError):
             return 0
 
+    # IN-LIST retail candidates: non-default, non-mail-order pharmacies that are
+    # part of the patient's pharmacy LIST (``pharmacy_ids``). Out-of-list retail
+    # decoys are EXCLUDED here so the canonical cheapest answer respects the
+    # "retail pharmacies in your pharmacy list" scoping in the instruction.
     retail_candidates = [
         p for p in ctx.base.get("pharmacies", [])
-        if not p.get("is_mail_order") and not p.get("is_default")
+        if not p.get("is_mail_order")
+        and not p.get("is_default")
+        and p["id"] in pharmacy_ids
     ]
     lowest_fee_retail_pharmacy_id: str | None = None
     lowest_fee_retail_pharmacy_name: str | None = None
@@ -1012,6 +1358,21 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
         lowest_fee_retail_pharmacy_name = cheapest["name"]
         cheapest_retail_pharmacy_id = cheapest["id"]
 
+    # The NAIVE-WRONG answer: the cheapest non-default, non-mail-order retail
+    # pharmacy considering EVERY visible pharmacy (including out-of-list decoys).
+    # Exposed so tasks/tests can prove the decoy trap genuinely diverges from the
+    # correct, list-scoped answer. Not used by grading.
+    all_retail_candidates = [
+        p for p in ctx.base.get("pharmacies", [])
+        if not p.get("is_mail_order") and not p.get("is_default")
+    ]
+    cheapest_overall_retail_pharmacy_id: str | None = None
+    if all_retail_candidates:
+        cheapest_overall_retail_pharmacy_id = min(
+            all_retail_candidates,
+            key=lambda p: (Decimal(str(p["dispensing_fee"])), _id_suffix(p["id"])),
+        )["id"]
+
     return {
         "pharmacy_ids": pharmacy_ids,
         "default_pharmacy_id": default_pharmacy_id,
@@ -1025,6 +1386,9 @@ def build_pharmacy_list(ctx: PatientPortalSeedContext, params: dict[str, Any]) -
         "lowest_fee_retail_pharmacy_name": lowest_fee_retail_pharmacy_name,
         "retail_fee_by_id": retail_fee_by_id,
         "cheapest_retail_pharmacy_id": cheapest_retail_pharmacy_id,
+        "retail_decoy_pharmacy_ids": retail_decoy_pharmacy_ids,
+        "retail_decoy_fee_by_id": retail_decoy_fee_by_id,
+        "cheapest_overall_retail_pharmacy_id": cheapest_overall_retail_pharmacy_id,
     }
 
 
@@ -1056,6 +1420,15 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
             cluster booked_at is strictly increasing so the first is the
             unique earliest-booked (keep) and the rest are later-booked
             duplicates (cancel),
+            keeper_trap_clusters (list[int]) — cluster indices whose earliest-
+            booked keeper is placed on a specialist provider + telehealth type
+            while the later-booked duplicates sit on the PCP + in-person, so a
+            "keep the PCP/in-person one" heuristic cancels the keeper (the
+            partition stays purely booked_at, so it remains correct),
+            pseudo_conflict_count (int) — number of decoy same-datetime groups
+            with exactly one scheduled member and the rest completed; the
+            scheduled survivor (exposed as pseudo_conflict_apt_ids) must NOT be
+            cancelled, forcing a status=='scheduled' filter before partitioning,
             target_specialty (str | None) — when set, the upcoming
             appointment for that specialty is exposed as `target_apt_id`
             (PP-5). When unset, `target_apt_id` falls back to
@@ -1068,7 +1441,8 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
              later_booked_conflict_earliest_slot, later_booked_conflict_type,
              later_booked_conflict_type_matched_earliest_slot,
              pcp_apt_id, specialist_apt_id, telehealth_apt_id, target_apt_id,
-             cluster_all_apt_ids, cluster_cancel_apt_ids, cluster_keep_apt_ids
+             cluster_all_apt_ids, cluster_cancel_apt_ids, cluster_keep_apt_ids,
+             pseudo_conflict_apt_ids
     """
     upcoming_count = params.get("upcoming_count", 2)
     completed_count = params.get("completed_count", 2)
@@ -1083,6 +1457,44 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
     # than ground on the provider. Defaults False to preserve the existing
     # two-different-providers behaviour for tasks that rely on it.
     conflict_same_provider: bool = bool(params.get("conflict_same_provider", False))
+    # PP-CD v2: decouple booked_at ordering from id / creation order for the
+    # `conflict_pair` cluster. When False (default) booked_at is strictly
+    # increasing with the loop index j, so the earliest-booked member is also
+    # the FIRST-created / lowest-id member — an agent can "keep the first
+    # same-time appointment" and pass without ever reading booked_at. The two
+    # other cluster consumers (pp_resolve_schedule_conflicts /
+    # pp_resolve_specialist_conflicts) bind `later_booked_apt_id` to
+    # `conflict_apt_ids.1` and freeze everything except that slot, so they
+    # REQUIRE slot 1 to remain the most-recently-booked member — they must NOT
+    # opt into the shuffle. When True the per-member booked_at values are
+    # assigned by a seed-deterministic permutation of the day offsets, so the
+    # earliest-booked member is no longer systematically the lowest id / first
+    # listed. The keep/cancel partition (and every later_booked_* discriminator)
+    # is recomputed by sorting on (booked_at, id) AFTER assignment, so outputs
+    # stay correct; only the SELECTION challenge gets harder (the agent must
+    # actually compare timestamps). Opt-in keeps full back-compat.
+    conflict_shuffle_booked_at: bool = bool(
+        params.get("conflict_shuffle_booked_at", False)
+    )
+    # PP-CD v2: a SECOND same-datetime group of scheduled appointments that are
+    # legitimately distinct visits (NOT duplicates) and must be left untouched.
+    # This converts "find the one same-time trio" into "identify WHICH same-time
+    # group is the duplicate set" — a real grounding step. These appointments
+    # sit at their own (distinct) datetime, are flagged with a clearly
+    # non-duplicate reason, and are frozen by the existing
+    # `a.id not in conflict_cancel_apt_ids` invariant. Default 0 = off.
+    conflict_decoy_same_time_count: int = max(
+        0, int(params.get("conflict_decoy_same_time_count", 0) or 0)
+    )
+    # PP-CD v2: already-cancelled appointment(s) sharing the LIVE cluster's
+    # exact datetime. A content-blind agent might treat one of these as a live
+    # duplicate (and try to re-cancel it — a 422) or, worse, conclude the
+    # duplicate set is already partially resolved. They are pinned (status !=
+    # 'scheduled' so the cancel endpoint rejects them, and excluded from the
+    # cancel set) but they widen the same-time confusion surface. Default 0.
+    conflict_cancelled_same_time_count: int = max(
+        0, int(params.get("conflict_cancelled_same_time_count", 0) or 0)
+    )
     # B-1: per-specialty list of specialties whose upcoming appointments
     # should be created with `requires_confirmation=True`. Default empty
     # list preserves backward compatibility — existing tasks remain
@@ -1290,6 +1702,12 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
     # cluster was built or no same-type slot exists.
     later_booked_conflict_type_matched_earliest_slot: str | None = None
     later_booked_conflict_type: str | None = None
+    # PP-CC-TRAP: id of a non-cluster upcoming appointment booked with the
+    # SAME provider as the later-booked conflict but at a DIFFERENT
+    # (non-overlapping) datetime — a provider-grounding decoy so an agent that
+    # shortcuts on "move the appointment with provider X" touches the wrong
+    # row. None unless `conflict_provider_grounding_decoy` is set.
+    conflict_provider_decoy_apt_id: str | None = None
     if conflict_pair and len(providers) >= 2 and conflict_count >= 2:
         conflict_dt = ctx.now.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=ctx.rng.randint(3, 10))
         conflict_apt_date = conflict_dt.strftime("%B %-d %Y at %H:%M")
@@ -1299,6 +1717,30 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         # conflict_count-1) is the most-recently-booked.
         first_booked_at = ctx.now - timedelta(days=ctx.rng.randint(conflict_count, conflict_count + 5))
         conflict_booked_ats = [first_booked_at + timedelta(days=j) for j in range(conflict_count)]
+        # PP-CD v2: when shuffle is requested, permute which member receives
+        # which booked_at timestamp. The set of timestamps is unchanged (still
+        # distinct, still spanning `conflict_count` days), but the EARLIEST
+        # booked_at is no longer guaranteed to land on j==0 / the lowest id.
+        # The keep/cancel partition is computed by sorting on (booked_at, id)
+        # below, so the answer stays correct regardless of permutation — the
+        # agent simply can no longer shortcut on id order. The permutation is
+        # drawn from the seed RNG so it is deterministic per seed, and we reject
+        # the identity permutation (for conflict_count >= 2) so the earliest is
+        # provably NOT the first-created member.
+        if conflict_shuffle_booked_at and conflict_count >= 2:
+            perm = list(range(conflict_count))
+            for _attempt in range(16):
+                ctx.rng.shuffle(perm)
+                # Reject identity: require the earliest booked_at (perm index
+                # pointing at conflict_booked_ats[0]) to NOT be member j==0.
+                if perm.index(0) != 0:
+                    break
+            else:
+                # Fallback: rotate so member 0 is never the earliest.
+                perm = perm[1:] + perm[:1]
+                if perm.index(0) == 0:
+                    perm = list(reversed(range(conflict_count)))
+            conflict_booked_ats = [conflict_booked_ats[perm[j]] for j in range(conflict_count)]
         cluster: list[dict[str, Any]] = []
         for j in range(conflict_count):
             apt_id = ctx.next_id("apt")
@@ -1358,6 +1800,50 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         later_prov = next(
             (p for p in providers if p["id"] == later_apt["provider_id"]), None
         )
+        # PP-CC-TRAP: when `conflict_guarantee_type_trap` is set, GUARANTEE the
+        # type-matched-slot discriminator is non-trivial in EVERY seed. The
+        # cluster appointments are `type: in-person`, so the canonical
+        # destination is the provider's earliest IN-PERSON slot. Without this
+        # guarantee the provider's globally-earliest slot is in-person in a
+        # large fraction of seeds (3-6 random slots, 50/50 type coin flip), so
+        # the "earliest type-matched slot" collapses to the bare-earliest slot
+        # and the trap is a no-op. We force the trap by injecting a strictly-
+        # EARLIER telehealth decoy slot one hour before the provider's earliest
+        # in-person slot. The bare-earliest slot is then ALWAYS the wrong
+        # (telehealth) visit type, so the agent MUST filter slots by visit type
+        # before taking min() — a pure backtracking/verification discriminator.
+        # (Mirrors the min_slot_specialty closed-panel decoy at lines 726-739.)
+        if later_prov and bool(params.get("conflict_guarantee_type_trap", False)):
+            later_prov.setdefault("available_slots", [])
+            _inperson_dts = [
+                s["datetime"]
+                for s in later_prov["available_slots"]
+                if s.get("type") == "in-person"
+            ]
+            if not _inperson_dts:
+                # The provider has no in-person slot to match the in-person
+                # cluster appointment — fabricate one in the future so the
+                # destination exists at all, then trap it with an earlier
+                # telehealth decoy below.
+                _anchor_inperson = conflict_dt + timedelta(days=1)
+                later_prov["available_slots"].append({
+                    "datetime": _anchor_inperson.isoformat(),
+                    "type": "in-person",
+                    "duration_minutes": 30,
+                })
+                _inperson_dts = [_anchor_inperson.isoformat()]
+            _earliest_inperson = min(_inperson_dts)
+            _decoy_dt = datetime.fromisoformat(_earliest_inperson) - timedelta(hours=1)
+            # Avoid colliding with an existing slot datetime.
+            _existing_dts = {s["datetime"] for s in later_prov["available_slots"]}
+            while _decoy_dt.isoformat() in _existing_dts:
+                _decoy_dt -= timedelta(minutes=30)
+            later_prov["available_slots"].append({
+                "datetime": _decoy_dt.isoformat(),
+                "type": "telehealth",
+                "duration_minutes": 30,
+            })
+            later_prov["available_slots"].sort(key=lambda s: s["datetime"])
         if later_prov and later_prov.get("available_slots"):
             later_booked_conflict_earliest_slot = min(
                 s["datetime"] for s in later_prov["available_slots"]
@@ -1374,6 +1860,108 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
                 later_booked_conflict_type_matched_earliest_slot = min(
                     _same_type_slots
                 )
+
+        # PP-CC-TRAP: provider-grounding decoy. Book a 4th non-cluster upcoming
+        # appointment with the SAME provider as the later-booked conflict, at a
+        # distinct (non-overlapping) datetime well before the conflict slot, in
+        # the OPPOSITE visit type. An agent that grounds on "the appointment
+        # with provider X" (rather than re-deriving the most-recently-booked
+        # cluster member) will touch this decoy and fail — it is frozen by the
+        # critical sibling invariant. None unless opted in.
+        if later_apt is not None and bool(
+            params.get("conflict_provider_grounding_decoy", False)
+        ):
+            decoy_apt_id = ctx.next_id("apt")
+            # Two days before the conflict slot, distinct hour — no overlap.
+            decoy_dt = (conflict_dt - timedelta(days=2)).replace(hour=8)
+            decoy_type = (
+                "telehealth" if later_apt.get("type") == "in-person" else "in-person"
+            )
+            # Booked between the cluster's first-booked and now so it is neither
+            # the earliest- nor the latest-booked across the full upcoming set.
+            decoy_booked_at = first_booked_at + timedelta(hours=12)
+            decoy_apt = {
+                "id": decoy_apt_id,
+                "provider_id": later_apt["provider_id"],
+                "datetime": decoy_dt.isoformat(),
+                "type": decoy_type,
+                "status": "scheduled",
+                "reason": "Follow-up",
+                "notes": "",
+                "linked_referral_id": None,
+                "booked_at": decoy_booked_at.isoformat(),
+                "location": "Main Campus" if decoy_type == "in-person" else "Telehealth",
+                "requires_confirmation": False,
+                "confirmation_state": "not_required",
+            }
+            _link_matching_referral(decoy_apt, later_prov or {})
+            ctx.base["appointments"].append(decoy_apt)
+            upcoming_ids.append(decoy_apt_id)
+            conflict_provider_decoy_apt_id = decoy_apt_id
+
+        # PP-CD v2: DECOY same-time group — a second cluster of scheduled
+        # appointments that share THEIR OWN distinct datetime but are
+        # legitimately separate visits (different providers, an explicitly
+        # non-duplicate reason). They are NOT in conflict_cancel_apt_ids, so the
+        # `a.id not in conflict_cancel_apt_ids` invariant freezes them at
+        # critical severity: an agent that cancels a member of this group
+        # (because it, too, is "same-time") fails. This forces the agent to
+        # identify WHICH same-time group is the duplicate set rather than
+        # cancelling any overlapping pair it finds.
+        if conflict_decoy_same_time_count >= 2:
+            decoy_dt = conflict_dt + timedelta(days=ctx.rng.randint(1, 4))
+            # Guarantee the decoy datetime never equals the live cluster's.
+            while decoy_dt.isoformat() == conflict_dt.isoformat():
+                decoy_dt = decoy_dt + timedelta(days=1)
+            for d in range(conflict_decoy_same_time_count):
+                apt_id = ctx.next_id("apt")
+                prov = providers[(d + 1) % len(providers)]
+                booked_at = ctx.now - timedelta(days=ctx.rng.randint(2, 20))
+                apt_dict = {
+                    "id": apt_id,
+                    "provider_id": prov["id"],
+                    "datetime": decoy_dt.isoformat(),
+                    "type": "in-person",
+                    "status": "scheduled",
+                    # A distinct, non-duplicate reason. These are real,
+                    # separate visits that merely happen to overlap.
+                    "reason": ctx.rng.choice(
+                        ["Specialist consult", "Lab draw", "Imaging"]
+                    ),
+                    "notes": "",
+                    "linked_referral_id": None,
+                    "booked_at": booked_at.isoformat(),
+                    "location": "Main Campus",
+                }
+                _link_matching_referral(apt_dict, prov)
+                ctx.base["appointments"].append(apt_dict)
+                upcoming_ids.append(apt_id)
+
+        # PP-CD v2: already-CANCELLED appointment(s) sharing the LIVE cluster's
+        # exact datetime. A content-blind agent could mistake one of these for a
+        # live duplicate and try to re-cancel it (the endpoint 422s on a
+        # non-scheduled appointment), or assume the duplicate set is already
+        # partially resolved. They are not scheduled and not in the cancel set,
+        # so they are inert to the canonical diff but widen the confusion.
+        for _c in range(conflict_cancelled_same_time_count):
+            apt_id = ctx.next_id("apt")
+            prov = providers[_c % len(providers)]
+            booked_at = ctx.now - timedelta(days=ctx.rng.randint(7, 30))
+            apt_dict = {
+                "id": apt_id,
+                "provider_id": prov["id"],
+                "datetime": conflict_dt.isoformat(),
+                "type": "in-person",
+                "status": "cancelled",
+                "reason": "Patient requested cancellation",
+                "notes": "",
+                "linked_referral_id": None,
+                "cancellation_reason": "Patient requested cancellation",
+                "booked_at": booked_at.isoformat(),
+                "location": "Main Campus",
+            }
+            ctx.base["appointments"].append(apt_dict)
+            cancelled_ids.append(apt_id)
 
     # --- Conflict clusters: multiple groups of double/triple-booked
     # scheduled appointments. `conflict_clusters` is a list of integers, each
@@ -1395,6 +1983,28 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
     cluster_all_apt_ids: list[str] = []
     cluster_cancel_apt_ids: list[str] = []
     cluster_keep_apt_ids: list[str] = []
+    # PP-CC-2 discrimination knobs (all opt-in; default preserves v1 behaviour):
+    #   keeper_trap_clusters (list[int]) — cluster indices whose EARLIEST-booked
+    #     keeper is deliberately placed on a non-PCP specialist provider with a
+    #     `telehealth` visit type, while the later-booked duplicates sit on the
+    #     PCP with an `in-person` type. The keep/cancel partition is STILL purely
+    #     booked_at ordering (keeper is k==0, the earliest), so it stays exactly
+    #     correct — but a naive "keep the PCP one / keep the in-person one"
+    #     heuristic cancels the keeper, which trips the critical keeper-scheduled
+    #     constraint. Directly attacks the most-tempting backtracking failure.
+    #   pseudo_conflict_count (int) — number of decoy same-datetime groups where
+    #     exactly ONE member is `scheduled` and the rest are `completed`. These
+    #     share a datetime but are NOT real conflicts (only one scheduled), so
+    #     the scheduled member must NOT be cancelled. The agent must filter to
+    #     status=='scheduled' AND exact (date,time) before partitioning;
+    #     cancelling the scheduled pseudo member is the new tempting trap.
+    #     Exposed as `pseudo_conflict_apt_ids` (the scheduled survivors) so the
+    #     canonical_diff can freeze them with a critical invariant.
+    keeper_trap_clusters: set[int] = {
+        int(i) for i in (params.get("keeper_trap_clusters") or [])
+    }
+    pseudo_conflict_count: int = int(params.get("pseudo_conflict_count", 0) or 0)
+    pseudo_conflict_apt_ids: list[str] = []
     if conflict_clusters and len(providers) >= 1:
         # Spread clusters across distinct future days/hours. Day offsets are
         # drawn from a disjoint band per cluster so two clusters cannot share a
@@ -1423,6 +2033,17 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
             ) + timedelta(days=day_off)
 
             cluster_ids_local: list[str] = []
+            is_trap = c_idx in keeper_trap_clusters
+            # For a keeper-trap cluster, the earliest-booked keeper (k==0) goes
+            # on a specialist provider with a telehealth type; the later-booked
+            # duplicates (k>=1) all land on the PCP with an in-person type. This
+            # makes the keeper look like the "odd one out" to a heuristic agent
+            # that keeps the PCP / in-person appointment.
+            trap_specialist = (
+                specialist_providers[c_idx % len(specialist_providers)]
+                if (is_trap and specialist_providers)
+                else None
+            )
             for k in range(size):
                 # Advance the global booking clock by a random positive step so
                 # booked_at is strictly increasing within (and across) clusters.
@@ -1430,12 +2051,21 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
                     hours=ctx.rng.randint(6, 40)
                 )
                 apt_id = ctx.next_id("apt")
-                prov = providers[(c_idx + k) % len(providers)]
+                if is_trap and trap_specialist is not None:
+                    if k == 0:
+                        prov = trap_specialist
+                        apt_type = "telehealth"
+                    else:
+                        prov = pcp_provider
+                        apt_type = "in-person"
+                else:
+                    prov = providers[(c_idx + k) % len(providers)]
+                    apt_type = "in-person"
                 apt_dict = {
                     "id": apt_id,
                     "provider_id": prov["id"],
                     "datetime": cluster_dt.isoformat(),
-                    "type": "in-person",
+                    "type": apt_type,
                     "status": "scheduled",
                     "reason": ctx.rng.choice(
                         ["Follow-up", "Routine checkup", "Consultation"]
@@ -1443,7 +2073,7 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
                     "notes": "",
                     "linked_referral_id": None,
                     "booked_at": booking_cursor.isoformat(),
-                    "location": "Main Campus",
+                    "location": "Telehealth" if apt_type == "telehealth" else "Main Campus",
                 }
                 _link_matching_referral(apt_dict, prov)
                 ctx.base["appointments"].append(apt_dict)
@@ -1489,6 +2119,64 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
                     a["datetime"] = candidate
                     taken_dts.add(candidate)
                     break
+
+        # PP-CC-2 pseudo-conflict (status-filter) decoys. Each group puts ONE
+        # scheduled appointment and one or more `completed` appointments on the
+        # exact same datetime. They SHARE a datetime with the scheduled member
+        # but are NOT a real conflict to resolve (only one member is scheduled),
+        # so the scheduled survivor must be LEFT scheduled. An agent that groups
+        # by datetime WITHOUT first filtering to status=='scheduled' will see a
+        # spurious "conflict" and cancel the scheduled member — a critical
+        # over-cancellation error. The scheduled survivors are exposed as
+        # `pseudo_conflict_apt_ids` so the canonical_diff can freeze them.
+        # Pseudo groups sit on minute=45 so they never collide with cluster
+        # (minute=30) or distractor/upcoming (minute=0) datetimes.
+        if pseudo_conflict_count > 0:
+            for pc_idx in range(pseudo_conflict_count):
+                pc_day = 24 + pc_idx * 2  # well past the cluster day band (3-21)
+                pc_hour = ctx.rng.choice([9, 11, 13, 15])
+                pc_dt = ctx.now.replace(
+                    hour=pc_hour, minute=45, second=0, microsecond=0
+                ) + timedelta(days=pc_day)
+                # Scheduled survivor (must NOT be cancelled).
+                sched_prov = providers[pc_idx % len(providers)]
+                sched_id = ctx.next_id("apt")
+                sched_booked = ctx.now - timedelta(days=ctx.rng.randint(10, 25))
+                sched_apt = {
+                    "id": sched_id,
+                    "provider_id": sched_prov["id"],
+                    "datetime": pc_dt.isoformat(),
+                    "type": "in-person",
+                    "status": "scheduled",
+                    "reason": ctx.rng.choice(["Follow-up", "Routine checkup"]),
+                    "notes": "",
+                    "linked_referral_id": None,
+                    "booked_at": sched_booked.isoformat(),
+                    "location": "Main Campus",
+                }
+                ctx.base["appointments"].append(sched_apt)
+                upcoming_ids.append(sched_id)
+                pseudo_conflict_apt_ids.append(sched_id)
+                # A completed appointment sharing the same datetime (the decoy
+                # that makes the datetime LOOK double-booked). It is already
+                # `completed`, so it is not a conflict to resolve.
+                comp_prov = providers[(pc_idx + 1) % len(providers)]
+                comp_id = ctx.next_id("apt")
+                comp_booked = pc_dt - timedelta(days=ctx.rng.randint(7, 20))
+                comp_apt = {
+                    "id": comp_id,
+                    "provider_id": comp_prov["id"],
+                    "datetime": pc_dt.isoformat(),
+                    "type": "in-person",
+                    "status": "completed",
+                    "reason": "Lab review",
+                    "notes": "Patient doing well. Continue current treatment plan.",
+                    "linked_referral_id": None,
+                    "booked_at": comp_booked.isoformat(),
+                    "location": "Main Campus",
+                }
+                ctx.base["appointments"].append(comp_apt)
+                completed_ids.append(comp_id)
 
     # Back-compat: when `conflict_clusters` is used WITHOUT the legacy
     # `conflict_pair`, expose the first cluster's ids as `conflict_apt_ids`
@@ -1566,6 +2254,10 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         # canonical destination when a task requires preserving visit type.
         "later_booked_conflict_type": later_booked_conflict_type,
         "later_booked_conflict_type_matched_earliest_slot": later_booked_conflict_type_matched_earliest_slot,
+        # PP-CC-TRAP: provider-grounding decoy (4th upcoming appt sharing the
+        # later-booked conflict's provider at a distinct datetime). None unless
+        # `conflict_provider_grounding_decoy` was set.
+        "conflict_provider_decoy_apt_id": conflict_provider_decoy_apt_id,
         "pcp_apt_id": pcp_apt_id,
         "pcp_apt_date": pcp_apt_date,
         "specialist_apt_id": specialist_apt_id,
@@ -1575,6 +2267,10 @@ def build_appointment_history(ctx: PatientPortalSeedContext, params: dict[str, A
         "cluster_all_apt_ids": cluster_all_apt_ids,
         "cluster_cancel_apt_ids": cluster_cancel_apt_ids,
         "cluster_keep_apt_ids": cluster_keep_apt_ids,
+        # PP-CC-2 pseudo-conflict survivors (scheduled appointments that share a
+        # datetime with a COMPLETED decoy but are NOT a conflict to resolve).
+        # Empty unless `pseudo_conflict_count` > 0.
+        "pseudo_conflict_apt_ids": pseudo_conflict_apt_ids,
     }
 
 
@@ -1588,11 +2284,14 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
 
     Params: active_count (int), expired_count (int), zero_refill_count (int),
             expiring_soon_count (int), expiring_zero_refill_count (int),
+            expiring_zero_refill_days (list[int]), far_zero_refill_count (int),
+            far_zero_refill_days (list[int]),
             interaction_pair (bool), source_pharmacy_role (str),
             source_active_count (int), source_exclude_pharmacy_name (str),
             maintenance_medications (list[str])
     Outputs: active_rx_ids, zero_refill_rx_id, expiring_rx_ids,
-             expiring_zero_refill_rx_ids, interacting_rx_ids,
+             expiring_zero_refill_rx_ids, far_zero_refill_rx_ids,
+             interacting_rx_ids,
              interacting_medications, zero_refill_rx_ids,
              zero_refill_medications, rxes_at_source_pharmacy,
              non_source_active_rx_ids, source_pharmacy_id,
@@ -1627,6 +2326,30 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     zero_refill_count = params.get("zero_refill_count", 0)
     expiring_soon_count = params.get("expiring_soon_count", 0)
     expiring_zero_refill_count = params.get("expiring_zero_refill_count", 0)
+    # Near-boundary expiry computation (state_tracking lever). When supplied,
+    # ``expiring_zero_refill_days`` pins the EXACT day-offset-from-anchor of
+    # each expiring zero-refill target (instead of the legacy ``randint(5, 25)``
+    # that lands every target deep inside the window). Used to seat targets at
+    # +26/+28/+29/+30 days so the agent cannot eyeball "expiring soon" and must
+    # compute days-to-expiry against the floating seed clock. Offsets are
+    # consumed in order; if fewer offsets than ``expiring_zero_refill_count``
+    # are given, the remaining targets fall back to the legacy random window.
+    expiring_zero_refill_days_raw = params.get("expiring_zero_refill_days") or []
+    expiring_zero_refill_days = [int(d) for d in expiring_zero_refill_days_raw]
+    # FAR zero-refill traps: active prescriptions with refills_remaining == 0
+    # whose expiry lands JUST OUTSIDE the 30-day window (e.g. +31/+33/+37/+44
+    # days from the anchor). They share the "0 refills" axis with the renew
+    # targets but must be SKIPPED because they are not expiring within 30 days.
+    # Without these the 30-day cutoff is never exercised (every zero-refill rx
+    # is either deep-inside or far-outside). Exposed as ``far_zero_refill_rx_ids``
+    # so a constraint can freeze the whole set without recomputing the cutoff
+    # inside a predicate (Class 6 set-precompute hazard). Offsets are taken
+    # from ``far_zero_refill_days`` in order (recycled if shorter than the
+    # count); each must be > 30 so the rx is genuinely out-of-window across the
+    # ±24h anchor jitter (use >= 31 to stay clear of the boundary).
+    far_zero_refill_count = int(params.get("far_zero_refill_count", 0) or 0)
+    far_zero_refill_days_raw = params.get("far_zero_refill_days") or []
+    far_zero_refill_days = [int(d) for d in far_zero_refill_days_raw] or [31, 33, 37, 44]
     interaction_pair = params.get("interaction_pair", False)
     # When True, after the genuine active↔active interaction pair is wired up,
     # attach a DECOY interaction entry between an expired prescription and one
@@ -1637,9 +2360,61 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     # members are ``status == "active"``) will surface the wrong pair. Requires
     # ``interaction_pair`` and at least one expired prescription to take effect.
     expired_interaction_decoy = bool(params.get("expired_interaction_decoy", False))
+    # When True (and there are at least TWO expired prescriptions plus a spare
+    # active rx), wire a SECOND decoy interaction onto a DIFFERENT expired rx and
+    # a DIFFERENT active rx (disjoint from the genuine pair AND from the first
+    # decoy). This thickens the active/expired discrimination: the agent now has
+    # to reject TWO tempting ``interactions != []`` cross-links whose partner is
+    # not active, not one. Requires ``expired_interaction_decoy``.
+    second_expired_interaction_decoy = bool(
+        params.get("second_expired_interaction_decoy", False)
+    )
+    # When True, the EXPIRED prescriptions (created by ``expired_count``) are
+    # added to the precomputed renewable set ``renewable_rx_ids`` and exposed
+    # individually via ``expired_renewable_rx_ids`` / ``expired_renewable_rx_id``.
+    # This is the backtracking lever for pp_request_renewal: an expired rx still
+    # reports 0 refills, so an agent that naively maps "0 refills -> refill"
+    # will POST /medications/{id}/refill and hit a 422 (refill requires status
+    # == active), forcing it to discover the blocker and re-route to the
+    # renewal endpoint (which accepts status in {active, expired}). The renewal
+    # bijection then spans THREE seed sub-categories — dedicated zero-refill,
+    # expiring-AND-zero-refill, and expired — so no single literal reading
+    # ("renew the one zero-refill" / "renew everything expiring") saturates it.
+    # Default False keeps every existing prescription_cabinet consumer
+    # byte-identical (renewable_rx_ids then collapses to the two zero-refill
+    # categories, which is what pre-v2 tasks already renewed).
+    renew_expired = bool(params.get("renew_expired", False))
     target_medication_name: str | None = params.get("target_medication_name")
     target_exclude_mail_order = bool(params.get("target_exclude_mail_order", False))
     target_exclude_pharmacy_name: str | None = params.get("target_exclude_pharmacy_name")
+    # ----- Cost-optimization eligibility fixture (pp_rx_cost_optimization) -----
+    # The cost-optimization task asks the agent to transfer EXACTLY the active
+    # prescriptions that are (retail AND refills>=1) to the cheapest mail-order
+    # pharmacy. The legacy builder placed the non-target actives on a RANDOM
+    # pharmacy (mail-order included) with refills randint(2,6), so the eligible
+    # set size wobbled across seeds (3..5) and the conjunctive (retail AND
+    # refills>=1) predicate was never actually stressed at retail. These knobs
+    # make the eligibility partition DETERMINISTIC and add the two excludes the
+    # weakest models collapse on:
+    #   - ``retail_refillable_pin_count`` (int): pin the first N non-target
+    #     actives to a non-default, non-mail-order RETAIL pharmacy with >=2
+    #     refills (genuine eligible members — they MUST be transferred).
+    #   - ``mail_order_active_count`` (int): pin the next M actives to a
+    #     mail-order pharmacy with refills (honest "already at mail-order"
+    #     excludes — present at a mail-order pharmacy so they must NOT move).
+    #   - ``retail_zero_refill_count`` (int): create K *additional* active
+    #     prescriptions pinned to a RETAIL pharmacy but with refills_remaining=0
+    #     (the conjunctive trap: "currently filled at retail" is true but
+    #     refills==0 forces exclusion).
+    # The target rx (Atorvastatin) is always retail+refillable via
+    # ``target_exclude_mail_order`` and is the first eligible member.
+    retail_refillable_pin_count = int(params.get("retail_refillable_pin_count", 0) or 0)
+    mail_order_active_count = int(params.get("mail_order_active_count", 0) or 0)
+    retail_zero_refill_count = int(params.get("retail_zero_refill_count", 0) or 0)
+    # When True, the FIRST expired prescription reuses ``target_medication_name``
+    # so an agent that "transfers Atorvastatin" by medication-name match alone
+    # surfaces an expired same-name decoy it must NOT touch.
+    expired_target_decoy = bool(params.get("expired_target_decoy", False))
     # When True, every active prescription starts on the default pharmacy.
     # Used by tasks like pp_coordinate_rx_transfer where the scenario is
     # "your default pharmacy is closing — transfer all your active rxes to
@@ -1655,6 +2430,34 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     # while sibling rxes at another pharmacy act as a frozen distractor set.
     active_at_default_count = int(params.get("active_at_default_count", 0) or 0)
     active_trap_pharmacy_id: str | None = params.get("active_trap_pharmacy_id")
+    # PP grounding stressor: after the first ``active_at_default_count`` active
+    # rxes are pinned to the OLD default (the transfer set), the remaining
+    # active rxes are distributed round-robin across
+    # ``active_decoy_pharmacy_ids`` instead of a single trap. This lets a task
+    # seed a multi-pharmacy frozen distractor set — e.g. one active rx already
+    # sitting at the NEW (cheapest) default pharmacy (which must NOT be
+    # "moved"), plus actives at one or more other retail traps. When this list
+    # is empty the builder falls back to the legacy single
+    # ``active_trap_pharmacy_id`` behaviour so existing tasks are byte-identical.
+    # ``active_at_new_default_pharmacy_id`` (when set and present in the decoy
+    # list) is exposed back so a task can pin a "do not transfer the rx that is
+    # already at the destination" decoy deterministically; the id set of active
+    # rxes that landed on it is exposed as ``active_at_new_default_rx_ids``.
+    active_decoy_pharmacy_ids_raw = params.get("active_decoy_pharmacy_ids") or []
+    if isinstance(active_decoy_pharmacy_ids_raw, str):
+        active_decoy_pharmacy_ids = [active_decoy_pharmacy_ids_raw]
+    else:
+        active_decoy_pharmacy_ids = [str(p) for p in active_decoy_pharmacy_ids_raw]
+    active_at_new_default_pharmacy_id: str | None = params.get(
+        "active_at_new_default_pharmacy_id"
+    )
+    # Deterministically pin the first ``expired_at_default_count`` EXPIRED rxes
+    # onto the OLD default pharmacy. An expired rx at the closing default is a
+    # natural decoy: an agent reading "everything at my old pharmacy" might
+    # sweep it into the transfer set, but the instruction restricts transfers to
+    # ACTIVE rxes only, so it must stay frozen. Defaults to 0 (legacy random
+    # placement for expired rxes).
+    expired_at_default_count = int(params.get("expired_at_default_count", 0) or 0)
     # Force the FIRST `source_active_count` active prescriptions onto a
     # single "source" pharmacy identified by role. Used by tasks like
     # pp_transfer_prescription where the scenario is "the mail-order pharmacy
@@ -1703,6 +2506,24 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     elif source_pharmacy_role == "default":
         source_pharmacy_id = default_pharm_id if pharmacies else None
 
+    # Resolve the pharmacies the cost-optimization fixture pins onto. The
+    # "retail pin" pharmacy is a non-default, non-mail-order retail pharmacy
+    # (so the rx is genuinely "at retail" and the agent must MOVE it, rather
+    # than it already sitting at the default it would stay on). The mail-order
+    # pin target is the first mail-order pharmacy (an honest "already at
+    # mail-order" exclude). Both fall back to None, in which case the
+    # corresponding pin loop is skipped.
+    retail_pin_pharmacy_id: str | None = next(
+        (
+            p["id"] for p in pharmacies
+            if not p.get("is_mail_order") and not p.get("is_default")
+        ),
+        None,
+    )
+    mail_order_pin_pharmacy_id: str | None = next(
+        (p["id"] for p in pharmacies if p.get("is_mail_order")), None
+    )
+
     # Shuffle the medication pool, then pin target_medication_name first if specified
     med_pool = list(_MEDICATIONS)
     ctx.rng.shuffle(med_pool)
@@ -1746,6 +2567,9 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     target_rx_id: str | None = None
     expiring_rx_ids: list[str] = []
     expiring_zero_refill_rx_ids: list[str] = []
+    # FAR (out-of-window) zero-refill prescriptions — share the 0-refill axis
+    # with the renew targets but expire > 30 days out, so they must be skipped.
+    far_zero_refill_rx_ids: list[str] = []
     interacting_rx_ids: list[str] = []
     interacting_medications: list[str] = []
     # Subset of active rxes deterministically pinned to the source pharmacy
@@ -1823,6 +2647,7 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
 
     # Active prescriptions (normal refills)
     active_at_default_rx_ids: list[str] = []
+    active_at_new_default_rx_ids: list[str] = []
     for active_idx in range(active_count):
         if med_idx >= len(med_pool):
             break
@@ -1844,8 +2669,39 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         if active_at_default_count > 0:
             if active_idx < active_at_default_count:
                 pin_pharmacy_for_rx = default_pharm_id
+            elif active_decoy_pharmacy_ids:
+                # Distribute the non-transfer-set actives round-robin across the
+                # decoy pharmacies (which may include the NEW default itself, a
+                # second retail trap, etc.) so the agent faces a multi-pharmacy
+                # frozen distractor set rather than a single trap.
+                decoy_pos = active_idx - active_at_default_count
+                pin_pharmacy_for_rx = active_decoy_pharmacy_ids[
+                    decoy_pos % len(active_decoy_pharmacy_ids)
+                ]
             elif active_trap_pharmacy_id:
                 pin_pharmacy_for_rx = active_trap_pharmacy_id
+        # Cost-optimization pinning (pp_rx_cost_optimization): the target rx is
+        # slot 0 (forced retail + refillable via target_exclude_mail_order). The
+        # NEXT ``retail_refillable_pin_count`` non-target actives are pinned to a
+        # retail pharmacy with deterministic >=2 refills (genuine eligible
+        # members), then the following ``mail_order_active_count`` actives are
+        # pinned to a mail-order pharmacy (honest "already at mail-order"
+        # excludes). This freezes the eligible-set cardinality across seeds.
+        refills_override: int | None = None
+        if (retail_refillable_pin_count > 0 or mail_order_active_count > 0) and not is_target_med:
+            non_target_idx = active_idx - (1 if target_medication_name else 0)
+            if 0 <= non_target_idx < retail_refillable_pin_count:
+                if retail_pin_pharmacy_id is not None:
+                    pin_pharmacy_for_rx = retail_pin_pharmacy_id
+                    refills_override = ctx.rng.randint(2, 6)
+            elif (
+                retail_refillable_pin_count
+                <= non_target_idx
+                < retail_refillable_pin_count + mail_order_active_count
+            ):
+                if mail_order_pin_pharmacy_id is not None:
+                    pin_pharmacy_for_rx = mail_order_pin_pharmacy_id
+                    refills_override = ctx.rng.randint(2, 6)
         # Source-pharmacy pinning: the first `source_active_count` active rxes
         # land on the source pharmacy (the transfer set); the rest are pinned
         # off the source AND (optionally) off the destination so they are
@@ -1868,7 +2724,7 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         rx = _make_rx(
             med,
             "active",
-            ctx.rng.randint(2, 6),
+            refills_override if refills_override is not None else ctx.rng.randint(2, 6),
             ctx.rng.randint(90, 365),
             force_retail_pharmacy=force_retail_pharmacy,
             exclude_pharmacy_name=exclude_pharmacy_for_rx,
@@ -1885,6 +2741,11 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             and rx["pharmacy_id"] == default_pharm_id
         ):
             active_at_default_rx_ids.append(rx["id"])
+        if (
+            active_at_new_default_pharmacy_id
+            and rx["pharmacy_id"] == active_at_new_default_pharmacy_id
+        ):
+            active_at_new_default_rx_ids.append(rx["id"])
         if is_source_rx:
             rxes_at_source_pharmacy.append(rx["id"])
         # Track target rx if this medication matches the pinned target
@@ -1892,13 +2753,27 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             if target_medication_name.lower() in med["name"].lower():
                 target_rx_id = rx["id"]
 
-    # Zero-refill prescriptions
-    for _ in range(zero_refill_count):
+    # Zero-refill prescriptions. The first ``retail_zero_refill_count`` of these
+    # are pinned to a RETAIL pharmacy (the conjunctive eligibility trap for
+    # pp_rx_cost_optimization: "currently filled at retail" is true, but
+    # refills==0 must still exclude it). The remainder keep legacy random
+    # placement. When ``active_at_default_only`` is set every zero-refill rx
+    # starts on the closing default pharmacy so its transfer is never a no-op.
+    for zr_idx in range(zero_refill_count):
         if med_idx >= len(med_pool):
             break
         med = med_pool[med_idx]
         med_idx += 1
-        rx = _make_rx(med, "active", 0, ctx.rng.randint(30, 180))
+        zr_pin = (
+            retail_pin_pharmacy_id
+            if zr_idx < retail_zero_refill_count and retail_pin_pharmacy_id is not None
+            else None
+        )
+        rx = _make_rx(
+            med, "active", 0, ctx.rng.randint(30, 180),
+            force_default_pharmacy=active_at_default_only,
+            pin_pharmacy_id=zr_pin,
+        )
         ctx.base["prescriptions"].append(rx)
         active_rx_ids.append(rx["id"])
         zero_refill_rx_ids.append(rx["id"])
@@ -1913,9 +2788,12 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     # refills so they explicitly should NOT be renewed.
     n_expiring_zero = min(expiring_zero_refill_count, expiring_soon_count)
     for idx in range(expiring_soon_count):
-        if med_idx >= len(med_pool):
-            break
-        med = med_pool[med_idx]
+        # Cycle the medication pool rather than breaking when exhausted, so a
+        # task that seeds a large partition (many expiring + far zero-refill
+        # rxes) still gets every required prescription. Ids stay unique; only
+        # the display medication name repeats. Tasks that stay within the
+        # 10-med pool are unaffected (med_idx never wraps for them).
+        med = med_pool[med_idx % len(med_pool)]
         med_idx += 1
         if idx < n_expiring_zero:
             refills = 0
@@ -1925,23 +2803,82 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         else:
             # Legacy behaviour for tasks that didn't opt in to the split.
             refills = ctx.rng.randint(0, 2)
-        rx = _make_rx(med, "active", refills, ctx.rng.randint(5, 25))
+        # Near-boundary expiry for the zero-refill targets when explicit offsets
+        # are provided; otherwise keep the legacy deep-inside-window draw. The
+        # explicit offsets seat targets at +26/+28/+29/+30 days so the 30-day
+        # cutoff is a genuine per-rx computation against the floating clock.
+        if refills == 0 and idx < len(expiring_zero_refill_days):
+            expires_days = expiring_zero_refill_days[idx]
+        else:
+            expires_days = ctx.rng.randint(5, 25)
+        rx = _make_rx(
+            med, "active", refills, expires_days,
+            force_default_pharmacy=active_at_default_only,
+        )
         ctx.base["prescriptions"].append(rx)
         active_rx_ids.append(rx["id"])
         expiring_rx_ids.append(rx["id"])
         if refills == 0:
             expiring_zero_refill_rx_ids.append(rx["id"])
 
+    # FAR zero-refill traps: active, refills_remaining == 0, expiring JUST
+    # outside the 30-day window. They look like renew targets on the refill
+    # axis but must be skipped on the expiry axis. Days are taken from
+    # ``far_zero_refill_days`` in order (recycled), each > 30.
+    for far_idx in range(far_zero_refill_count):
+        med = med_pool[med_idx % len(med_pool)]
+        med_idx += 1
+        far_days = far_zero_refill_days[far_idx % len(far_zero_refill_days)]
+        rx = _make_rx(med, "active", 0, far_days)
+        ctx.base["prescriptions"].append(rx)
+        active_rx_ids.append(rx["id"])
+        far_zero_refill_rx_ids.append(rx["id"])
+
     # Expired prescriptions
     expired_rx_ids: list[str] = []
-    for _ in range(expired_count):
-        if med_idx >= len(med_pool):
-            break
-        med = med_pool[med_idx]
-        med_idx += 1
-        rx = _make_rx(med, "expired", 0, -ctx.rng.randint(1, 90))
+    expired_at_default_rx_ids: list[str] = []
+    # When expired_target_decoy is set, mint the FIRST expired rx with the target
+    # medication so a name-match-only agent surfaces an expired same-name decoy
+    # it must NOT transfer. Pinned to a retail pharmacy so it superficially looks
+    # like an eligible "retail Atorvastatin" until the agent reads status.
+    target_med_dict: dict[str, Any] | None = None
+    if expired_target_decoy and target_medication_name:
+        target_med_dict = next(
+            (
+                m for m in _MEDICATIONS
+                if target_medication_name.lower() in m["name"].lower()
+            ),
+            None,
+        )
+    for expired_idx in range(expired_count):
+        if expired_idx == 0 and target_med_dict is not None:
+            med = target_med_dict
+        else:
+            med = med_pool[med_idx % len(med_pool)]
+            med_idx += 1
+        # Pin the first ``expired_at_default_count`` expired rxes to the OLD
+        # default pharmacy so they sit alongside the active transfer set as a
+        # status-based decoy (same pharmacy, but expired → must NOT move). The
+        # rx_cost target-decoy (slot 0) instead pins to a retail pharmacy so a
+        # name-match agent is lured by an expired "retail Atorvastatin".
+        if expired_idx == 0 and target_med_dict is not None:
+            pin_expired = retail_pin_pharmacy_id
+        elif expired_idx < expired_at_default_count:
+            pin_expired = default_pharm_id
+        else:
+            pin_expired = None
+        rx = _make_rx(
+            med, "expired", 0, -ctx.rng.randint(1, 90),
+            pin_pharmacy_id=pin_expired,
+        )
         ctx.base["prescriptions"].append(rx)
         expired_rx_ids.append(rx["id"])
+        if (
+            expired_idx < expired_at_default_count
+            and not (expired_idx == 0 and target_med_dict is not None)
+            and rx["pharmacy_id"] == default_pharm_id
+        ):
+            expired_at_default_rx_ids.append(rx["id"])
 
     # Interaction pair -- two active meds with mutual conflict entries
     if interaction_pair and len(_INTERACTION_PAIRS) > 0:
@@ -2007,6 +2944,44 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
             decoy_active["interactions"] = [expired_rx["medication"]]
             decoy_interaction_rx_ids = [expired_id, decoy_active["id"]]
 
+    # Second decoy interaction trap (opt-in): a DIFFERENT expired rx cross-linked
+    # to a DIFFERENT active rx, disjoint from both the genuine active↔active pair
+    # and the first decoy. With two such traps the agent must verify member
+    # status across MORE non-empty ``interactions`` lists before it can isolate
+    # the single active↔active conflict — a deeper state-tracking demand, not an
+    # ambiguity (the instruction already says to ignore any interaction involving
+    # an expired prescription).
+    second_decoy_interaction_rx_ids: list[str] = []
+    if (
+        second_expired_interaction_decoy
+        and expired_interaction_decoy
+        and len(expired_rx_ids) >= 2
+        and decoy_interaction_rx_ids
+    ):
+        used_ids = set(interacting_rx_ids) | set(decoy_interaction_rx_ids)
+        second_expired_id = next(
+            (eid for eid in expired_rx_ids if eid not in used_ids), None
+        )
+        second_decoy_active = next(
+            (
+                r for r in ctx.base["prescriptions"]
+                if r.get("status") == "active"
+                and r["id"] not in used_ids
+            ),
+            None,
+        )
+        second_expired_rx = next(
+            (r for r in ctx.base["prescriptions"] if r["id"] == second_expired_id),
+            None,
+        )
+        if second_expired_rx is not None and second_decoy_active is not None:
+            second_expired_rx["interactions"] = [second_decoy_active["medication"]]
+            second_decoy_active["interactions"] = [second_expired_rx["medication"]]
+            second_decoy_interaction_rx_ids = [
+                second_expired_id,
+                second_decoy_active["id"],
+            ]
+
     # Provider ids that wrote the genuine active↔active interaction pair. Tasks
     # that route the agent to a prescriber (rather than the PCP) can pin this;
     # exposed unconditionally so it is available without re-scanning rx records.
@@ -2024,11 +2999,54 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         if rid not in expiring_zero_refill_rx_ids
     ]
 
+    # Precomputed canonical RENEWAL set for pp_request_renewal. Every member is
+    # a prescription that has 0 refills remaining and is renewal-eligible
+    # (status in {active, expired}), spanning up to three seed sub-categories:
+    #   * the dedicated active zero-refill rxes (``zero_refill_rx_ids``),
+    #   * the expiring-AND-zero-refill rxes (``expiring_zero_refill_rx_ids``), and
+    #   * (only when ``renew_expired`` is set) the expired rxes
+    #     (``expired_renewable_rx_ids``), which are the backtracking gate.
+    # The union is computed here — never inside a canonical_diff predicate — so
+    # the renewal bijection iterates a single deterministic scalar list (Class 6
+    # set-precompute hazard). Order is category-stable and de-duplicated while
+    # preserving first appearance so the list is fully deterministic across
+    # seeds. ``expiring_with_refills_rx_ids`` are deliberately EXCLUDED: those
+    # are expiring but still have refills, so they are refill-eligible decoys
+    # the agent must NOT renew.
+    expired_renewable_rx_ids: list[str] = list(expired_rx_ids) if renew_expired else []
+    expired_renewable_rx_id: str | None = (
+        expired_renewable_rx_ids[0] if expired_renewable_rx_ids else None
+    )
+    _renewable_seen: set[str] = set()
+    renewable_rx_ids: list[str] = []
+    for rid in [*zero_refill_rx_ids, *expiring_zero_refill_rx_ids, *expired_renewable_rx_ids]:
+        if rid not in _renewable_seen:
+            _renewable_seen.add(rid)
+            renewable_rx_ids.append(rid)
+
     # Active rxes NOT pinned to the source pharmacy. These share the "active"
     # category with the transfer set but must remain on their current
     # pharmacy — they are the decoys a filtered invariant freezes.
     non_source_active_rx_ids = [
         rid for rid in active_rx_ids if rid not in rxes_at_source_pharmacy
+    ]
+
+    # Parallel medication-name lists for the source / non-source partitions.
+    # Exposed so a misleading narrative (e.g. a "pharmacy closing" notice in a
+    # message thread) can be authored deterministically against the SEEDED med
+    # names without re-reading the cabinet, while the canonical transfer set
+    # stays keyed off the structured ``rxes_at_source_pharmacy`` ids. The names
+    # are returned in ``active_rx_ids`` order for determinism.
+    _rx_by_id_for_names = {rx["id"]: rx for rx in ctx.base["prescriptions"]}
+    source_medication_names = [
+        str(_rx_by_id_for_names[rid]["medication"])
+        for rid in rxes_at_source_pharmacy
+        if rid in _rx_by_id_for_names
+    ]
+    non_source_active_medication_names = [
+        str(_rx_by_id_for_names[rid]["medication"])
+        for rid in non_source_active_rx_ids
+        if rid in _rx_by_id_for_names
     ]
 
     # Cost-optimization eligibility set: the active prescriptions that are both
@@ -2083,6 +3101,12 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
     return {
         "active_rx_ids": active_rx_ids,
         "active_at_default_rx_ids": active_at_default_rx_ids,
+        "active_at_new_default_rx_ids": active_at_new_default_rx_ids,
+        "expired_rx_ids": expired_rx_ids,
+        "expired_at_default_rx_ids": expired_at_default_rx_ids,
+        "expired_renewable_rx_ids": expired_renewable_rx_ids,
+        "expired_renewable_rx_id": expired_renewable_rx_id,
+        "renewable_rx_ids": renewable_rx_ids,
         "zero_refill_rx_id": zero_refill_rx_id,
         "zero_refill_medication": zero_refill_medication,
         "zero_refill_rx_ids": zero_refill_rx_ids,
@@ -2090,16 +3114,31 @@ def build_prescription_cabinet(ctx: PatientPortalSeedContext, params: dict[str, 
         "target_rx_id": target_rx_id,
         "expiring_rx_ids": expiring_rx_ids,
         "expiring_zero_refill_rx_ids": expiring_zero_refill_rx_ids,
+        "far_zero_refill_rx_ids": far_zero_refill_rx_ids,
+        # Scalar single-id handles for the first two renew-targets. Variant
+        # injections render placeholders by whole-string {target.KEY} match (no
+        # list indexing), so a contradictory-message stressor that must LINK to
+        # one genuine renew-target needs a scalar id exposed here. None when the
+        # set is empty.
+        "first_expiring_zero_refill_rx_id": (
+            expiring_zero_refill_rx_ids[0] if expiring_zero_refill_rx_ids else None
+        ),
+        "second_expiring_zero_refill_rx_id": (
+            expiring_zero_refill_rx_ids[1] if len(expiring_zero_refill_rx_ids) > 1 else None
+        ),
         "expiring_with_refills_rx_ids": expiring_with_refills_rx_ids,
         "retail_refillable_active_rx_ids": retail_refillable_active_rx_ids,
         "interacting_rx_ids": interacting_rx_ids,
         "interacting_medications": interacting_medications,
         "interacting_prescriber_ids": interacting_prescriber_ids,
         "decoy_interaction_rx_ids": decoy_interaction_rx_ids,
+        "second_decoy_interaction_rx_ids": second_decoy_interaction_rx_ids,
         # Source-pharmacy transfer fixture outputs.
         "rxes_at_source_pharmacy": rxes_at_source_pharmacy,
         "non_source_active_rx_ids": non_source_active_rx_ids,
         "source_pharmacy_id": source_pharmacy_id,
+        "source_medication_names": source_medication_names,
+        "non_source_active_medication_names": non_source_active_medication_names,
         "maintenance_rx_ids": maintenance_rx_ids,
         "non_maintenance_rx_ids": non_maintenance_rx_ids,
         "maintenance_rx_medications": maintenance_rx_medications,
@@ -2268,6 +3307,55 @@ def build_lab_results_panel(ctx: PatientPortalSeedContext, params: dict[str, Any
                 # use it as the primary critical_lab_id
                 if flag == "critical" and critical_lab_id is None:
                     critical_lab_id = lab["id"]
+
+            # Adversarial same-test points that DELIBERATELY threaten the
+            # last-two-by-collected_at sort. These make eyeballing/lazy
+            # grounding fail while staying fair: the canonical discriminator
+            # expr filters on ``status == 'resulted'`` and sorts strictly by
+            # ``collected_at``, so an agent that applies that exact filter is
+            # unaffected, while one that (a) takes the raw trend-view tail
+            # without the resulted filter, or (b) mis-sorts the near-duplicate
+            # resulted point, lands the wrong row in [-1]/[-2] and may flip the
+            # branch. Each entry: {days_ago, value, status, flag?}.
+            #   - A NON-``resulted`` (e.g. ``collected``) HbA1c dated MORE
+            #     recently than the latest trend point traps agents that skip
+            #     the status filter (the /labs/trend view returns every status,
+            #     sorted ascending, so this row is the visible tail).
+            #   - A ``resulted`` near-duplicate dated one day BEFORE the true
+            #     most-recent point becomes the genuine [-2]; its value is set
+            #     so the true last pair direction is PRESERVED but only when the
+            #     agent sorts by date precisely.
+            for spec in params.get("trend_adversarial_points", []) or []:
+                if not isinstance(spec, dict):
+                    continue
+                try:
+                    d_ago = float(spec["days_ago"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                a_status = str(spec.get("status", "resulted"))
+                a_val = str(spec.get("value", ""))
+                a_flag = spec.get("flag")
+                if a_flag is None and trend_test_info is not None:
+                    a_flag = "normal"
+                    try:
+                        ref_parts = trend_test_info["ref"].split("-")
+                        if len(ref_parts) == 2:
+                            low, high = float(ref_parts[0]), float(ref_parts[1])
+                            v = float(a_val)
+                            if v > high * 1.5 or v < low * 0.5:
+                                a_flag = "critical"
+                            elif v > high or v < low:
+                                a_flag = "abnormal"
+                    except (ValueError, IndexError):
+                        pass
+                lab = _make_lab(
+                    trend_test_info,
+                    str(a_flag),
+                    a_status,
+                    d_ago,
+                    value_override=a_val,
+                )
+                ctx.base["lab_results"].append(lab)
 
     # Derived: the test_name / test_code of every out-of-range RESULTED lab
     # (flag in {"abnormal", "critical"}), ordered by collected_at descending
@@ -2587,6 +3675,64 @@ def _generate_contextual_body(ctx: PatientPortalSeedContext, body_context: dict[
             f"for prior authorization. You should receive approval within 3-5 business days. "
             f"Once approved, please call the {specialty} office to schedule your appointment."
         )
+
+    elif btype == "pharmacy_closure_notice":
+        # A "your mail-order pharmacy is closing" notice that lists the
+        # affected prescriptions BY MEDICATION NAME. The list is intentionally
+        # a DECOY that DISAGREES with the structured per-rx ``pharmacy_id``
+        # truth. Two ways to drive it:
+        #   * ``source_pharmacy_id`` (preferred): the builder derives the true
+        #     set of active rxes at that pharmacy, then renders a MISLEADING
+        #     list that (a) OMITS the last true-source medication and (b) ADDS
+        #     the first active medication NOT at the source pharmacy. The
+        #     narrative therefore names a med that should NOT move and hides one
+        #     that must — so an agent that trusts the prose transfers the wrong
+        #     set. The text never reveals the true set.
+        #   * ``affected_medications`` (literal override): the caller supplies
+        #     the exact (already-misleading) name list.
+        # The canonical answer for any consuming task must come from the
+        # structured state (which rxes have ``pharmacy_id == source``), never
+        # from this text — making the message a pure state_tracking trap.
+        pharmacy_name = str(body_context.get("pharmacy_name", "your mail-order pharmacy"))
+        destination_hint = body_context.get("destination_hint")
+        affected = [str(m) for m in (body_context.get("affected_medications") or [])]
+        if not affected:
+            source_pharmacy_id = body_context.get("source_pharmacy_id")
+            if source_pharmacy_id:
+                source_meds = [
+                    rx["medication"] for rx in prescriptions
+                    if rx.get("pharmacy_id") == source_pharmacy_id
+                ]
+                non_source_meds = [
+                    rx["medication"] for rx in prescriptions
+                    if rx.get("pharmacy_id") != source_pharmacy_id
+                ]
+                # OMIT one genuinely-affected med (drop the last true-source med)
+                # and ADD one med that is NOT at the closing pharmacy.
+                misleading = source_meds[:-1] if len(source_meds) > 1 else list(source_meds)
+                if non_source_meds:
+                    misleading = misleading + [non_source_meds[0]]
+                affected = misleading
+        lines = [
+            f"Pharmacy Service Notice: {pharmacy_name} is discontinuing service.",
+            "Our records indicate the following prescriptions are filled there and "
+            "will need to be transferred:",
+        ]
+        if affected:
+            for i, med in enumerate(affected, start=1):
+                lines.append(f"{i}. {med}")
+        else:
+            lines.append("(Please review your medication list for affected prescriptions.)")
+        if destination_hint:
+            lines.append(
+                f"You may transfer these to {destination_hint} or another in-network pharmacy."
+            )
+        lines.append(
+            "Please verify each medication's current pharmacy in your portal before "
+            "transferring; this notice is for your convenience and may not reflect "
+            "recent changes."
+        )
+        return "\n".join(lines)
 
     # Fallback — should not normally be reached
     return ctx.fake.paragraph(nb_sentences=ctx.rng.randint(2, 4))
@@ -2941,30 +4087,56 @@ _INSURANCE_CARRIERS: list[dict[str, str]] = [
 
 @_register("insurance_card_message")
 def build_insurance_card_message(ctx: PatientPortalSeedContext, params: dict[str, Any]) -> dict[str, Any]:
-    """Seed two billing messages that carry insurance-card details.
+    """Seed a thread of billing messages that carry insurance-card details.
 
-    The *current* (authoritative) message is the MOST RECENT billing message in
-    the inbox and contains the new plan name, member id, group number, and an
-    updated contact phone/email. An *older* (stale, superseded) message carries
-    DIFFERENT outdated values — a grounding decoy. Neither value set appears in
-    the task instruction, so the agent must read the inbox, disambiguate the
-    most-recent billing message from the stale one, and extract the exact
-    strings to apply.
+    This builder constructs a genuine VERIFICATION scenario (recompute /
+    reconcile / branch on discrepancy), not a single read-extract-write:
 
-    Must run AFTER ``provider_directory`` (needs a billing/PCP provider) and
-    is independent of ``message_threads`` (it appends its own messages).
+    * THREE billing card messages exist, all from the same billing department.
+      The authoritative (most recent) card and a *near-recency* decoy share the
+      **same carrier** and **near-identical subjects**, so the agent CANNOT
+      disambiguate by subject string — it must compute recency from the
+      ``timestamp`` fields. A third, older "SUPERSEDED" card from a different
+      carrier is an additional decoy.
+    * The authoritative message contains an internal CONTRADICTION the agent
+      must reconcile: the prose lists one member ID, but a "card-image
+      transcription" footer lists a different member ID, and an explicit
+      ``Correction:`` line states which value is the corrected/authoritative
+      one. Grading targets the CORRECTED member id, not the mis-transcribed
+      prose value. This forces a branch on discrepancy — the defining behavior
+      of the verification primitive.
+    * Contact details are SPLIT across the thread: the new phone is in the
+      authoritative card message, but the new email is in a linked follow-up
+      message in the SAME thread, so the agent must read the entire thread, not
+      just the first card message.
+
+    None of the answer values appear in the task instruction.
+
+    Must run AFTER ``provider_directory`` (needs a billing/PCP provider) and is
+    independent of ``message_threads`` (it appends its own messages).
 
     Params:
-        stale_offset_days (int): how many days BEFORE the authoritative message
-            the stale decoy is timestamped (default 21).
+        stale_offset_days (int): how many days BEFORE ``ctx.now`` the older
+            different-carrier "SUPERSEDED" decoy is timestamped (default 21).
+        near_offset_days (int): how many days BEFORE ``ctx.now`` the
+            same-carrier near-recency decoy is timestamped (default 3). Must be
+            strictly greater than ``current_offset_days``.
         current_offset_days (int): how many days BEFORE ``ctx.now`` the
-            authoritative message is timestamped (default 1).
-    Outputs: new_plan_name, new_member_id, new_group_number, new_phone,
-             new_email, stale_plan_name, stale_member_id, stale_group_number,
-             current_card_msg_id, stale_card_msg_id, billing_provider_id
+            authoritative card message is timestamped (default 1).
+        followup_offset_hours (int): how many hours AFTER the authoritative
+            card message the follow-up (email) message in the same thread is
+            timestamped (default 2).
+    Outputs: new_plan_name, new_member_id, new_member_id_typo,
+             new_group_number, new_phone, new_email, stale_plan_name,
+             stale_member_id, stale_group_number, near_plan_name,
+             near_member_id, near_group_number, near_phone,
+             current_card_msg_id, stale_card_msg_id, near_card_msg_id,
+             followup_msg_id, billing_provider_id
     """
     stale_offset_days = int(params.get("stale_offset_days", 21))
+    near_offset_days = int(params.get("near_offset_days", 3))
     current_offset_days = int(params.get("current_offset_days", 1))
+    followup_offset_hours = int(params.get("followup_offset_hours", 2))
 
     providers = ctx.base.get("providers", [])
     billing_prov = next(
@@ -2976,8 +4148,8 @@ def build_insurance_card_message(ctx: PatientPortalSeedContext, params: dict[str
     if "messages" not in ctx.base:
         ctx.base["messages"] = []
 
-    # Pick two DISTINCT carriers deterministically: index 0 = authoritative,
-    # index 1 = stale decoy.
+    # Pick two DISTINCT carriers deterministically: index 0 = authoritative
+    # (also reused by the near-recency decoy), index 1 = stale decoy.
     pool = list(_INSURANCE_CARRIERS)
     ctx.rng.shuffle(pool)
     current = pool[0]
@@ -2995,6 +4167,17 @@ def build_insurance_card_message(ctx: PatientPortalSeedContext, params: dict[str
     new_plan_name = _plan(current)
     new_member_id = _member(current)
     new_group_number = _group(current)
+    # Internal contradiction: the prose footer transcribes a typo member id that
+    # differs from the corrected value by a single transposed digit. The
+    # authoritative answer is ``new_member_id`` (the corrected value); the typo
+    # value is a trap that must NOT be applied.
+    _digits = new_member_id.split("-", 1)[1]
+    if len(_digits) >= 2 and _digits[-1] != _digits[-2]:
+        _typo_digits = _digits[:-2] + _digits[-1] + _digits[-2]
+    else:
+        # Fallback: bump the last digit so the typo is guaranteed distinct.
+        _typo_digits = _digits[:-1] + str((int(_digits[-1]) + 1) % 10)
+    new_member_id_typo = f"{new_member_id.split('-', 1)[0]}-{_typo_digits}"
     new_phone = f"(555) {ctx.rng.randint(200, 999)}-{ctx.rng.randint(1000, 9999)}"
     # Deterministic new contact email derived from the patient name + new
     # carrier domain so it is clearly distinct from the patient's seeded email.
@@ -3002,14 +4185,27 @@ def build_insurance_card_message(ctx: PatientPortalSeedContext, params: dict[str
     patient_name = ctx.base.get("patient", {}).get("name", "member")
     new_email = ctx.email_for_name(patient_name, domain)
 
+    # Near-recency decoy reuses the SAME carrier (so subject + plan name look
+    # almost identical) but with a different member id / group number, and is
+    # timestamped between the stale and authoritative messages.
+    near_plan_name = _plan(current)
+    near_member_id = _member(current)
+    while near_member_id in (new_member_id, new_member_id_typo):
+        near_member_id = _member(current)
+    near_group_number = _group(current)
+    near_phone = f"(555) {ctx.rng.randint(200, 999)}-{ctx.rng.randint(1000, 9999)}"
+
     stale_plan_name = _plan(stale)
     stale_member_id = _member(stale)
     stale_group_number = _group(stale)
     stale_phone = f"(555) {ctx.rng.randint(200, 999)}-{ctx.rng.randint(1000, 9999)}"
 
     current_ts = ctx.now - timedelta(days=current_offset_days)
+    near_ts = ctx.now - timedelta(days=near_offset_days)
     stale_ts = ctx.now - timedelta(days=stale_offset_days)
+    followup_ts = current_ts + timedelta(hours=followup_offset_hours)
 
+    # 1) Older, different-carrier SUPERSEDED decoy.
     stale_msg_id = ctx.next_id("msg")
     stale_thread_id = ctx.next_id("thread")
     stale_body = (
@@ -3033,18 +4229,48 @@ def build_insurance_card_message(ctx: PatientPortalSeedContext, params: dict[str
         "category": "billing",
     })
 
+    # 2) Same-carrier NEAR-RECENCY decoy with a near-identical subject. Only the
+    # timestamp distinguishes it from the authoritative card.
+    near_msg_id = ctx.next_id("msg")
+    near_thread_id = ctx.next_id("thread")
+    near_body = (
+        "Insurance Card Update — Action Required:\n"
+        f"Plan name: {near_plan_name}\n"
+        f"Member ID: {near_member_id}\n"
+        f"Group number: {near_group_number}\n"
+        f"Contact phone: {near_phone}\n"
+        "Please review your member details and confirm they are current."
+    )
+    ctx.base["messages"].append({
+        "id": near_msg_id,
+        "from_type": "provider",
+        "provider_id": billing_provider_id,
+        "subject": "Insurance Card Update — Action Required",
+        "body": near_body,
+        "thread_id": near_thread_id,
+        "timestamp": near_ts.isoformat(),
+        "is_read": True,
+        "category": "billing",
+    })
+
+    # 3) Authoritative card message (most recent) — contains the prose/footer
+    # member-id CONTRADICTION and the corrected value, plus the new phone. The
+    # email is intentionally OMITTED here and delivered in the follow-up.
     current_msg_id = ctx.next_id("msg")
     current_thread_id = ctx.next_id("thread")
     current_body = (
-        "Your New Insurance Card — Effective Immediately:\n"
+        "New Insurance Card on File:\n"
         f"Plan name: {new_plan_name}\n"
-        f"Member ID: {new_member_id}\n"
+        f"Member ID: {new_member_id_typo}\n"
         f"Group number: {new_group_number}\n"
-        "Please also update your contact details on file to the ones we have "
-        "for your new plan:\n"
         f"Contact phone: {new_phone}\n"
-        f"Contact email: {new_email}\n"
-        "Update your profile so claims route correctly under the new plan."
+        "--- card image transcription (footer) ---\n"
+        f"Member ID (as printed on card): {new_member_id}\n"
+        f"Correction: the Member ID listed in the body above ({new_member_id_typo}) "
+        f"was mis-transcribed. The correct Member ID is {new_member_id}. Please "
+        "apply the corrected Member ID.\n"
+        "Your new contact email follows in the next message in this thread; "
+        "please update both your phone and email on file."
     )
     ctx.base["messages"].append({
         "id": current_msg_id,
@@ -3058,17 +4284,44 @@ def build_insurance_card_message(ctx: PatientPortalSeedContext, params: dict[str
         "category": "billing",
     })
 
+    # 4) Follow-up in the SAME thread carrying the new contact EMAIL only.
+    followup_msg_id = ctx.next_id("msg")
+    followup_body = (
+        "Follow-up to your New Insurance Card on File:\n"
+        f"As mentioned, your updated contact email on file should be: {new_email}\n"
+        "Please make sure both your phone (from the previous message) and this "
+        "email are saved to your profile so claims route correctly."
+    )
+    ctx.base["messages"].append({
+        "id": followup_msg_id,
+        "from_type": "provider",
+        "provider_id": billing_provider_id,
+        "subject": "New Insurance Card on File",
+        "body": followup_body,
+        "thread_id": current_thread_id,
+        "timestamp": followup_ts.isoformat(),
+        "is_read": False,
+        "category": "billing",
+    })
+
     return {
         "new_plan_name": new_plan_name,
         "new_member_id": new_member_id,
+        "new_member_id_typo": new_member_id_typo,
         "new_group_number": new_group_number,
         "new_phone": new_phone,
         "new_email": new_email,
         "stale_plan_name": stale_plan_name,
         "stale_member_id": stale_member_id,
         "stale_group_number": stale_group_number,
+        "near_plan_name": near_plan_name,
+        "near_member_id": near_member_id,
+        "near_group_number": near_group_number,
+        "near_phone": near_phone,
         "current_card_msg_id": current_msg_id,
         "stale_card_msg_id": stale_msg_id,
+        "near_card_msg_id": near_msg_id,
+        "followup_msg_id": followup_msg_id,
         "billing_provider_id": billing_provider_id,
     }
 
@@ -3119,6 +4372,8 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
                to_provider_id),
              ineligible_approved_ref_ids (approved referrals blocked by an
                unapproved prior-auth — decoys the agent must NOT link),
+             ineligible_ref_id_by_specialty (specialty → first ineligible
+               approved decoy referral id, as a scalar),
              eligible_ref_id, eligible_specialty, preauth_pending_ref_ids
 
     ``eligible_ref_id`` is the single APPROVED referral whose specialty is the
@@ -3140,6 +4395,14 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         dict(item) for item in (params.get("extra_specialty_referrals") or [])
     ]
     pin_must_have_providers = bool(params.get("pin_must_have_providers", False))
+    # When True, the pinned must_have referrals name only ACCEPTING providers
+    # (skip closed-panel decoys) and successive same-specialty pinned referrals
+    # name DISTINCT providers. Lets a task seed a closed-panel endo decoy
+    # (non_accepting_provider_specs) while guaranteeing the approved referral's
+    # destination provider is bookable. Implies pin_must_have_providers.
+    pin_must_have_accepting_only = bool(params.get("pin_must_have_accepting_only", False))
+    if pin_must_have_accepting_only:
+        pin_must_have_providers = True
 
     if "referrals" not in ctx.base:
         ctx.base["referrals"] = []
@@ -3159,10 +4422,22 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
     prior_auth_ref_id: str | None = None
     expiring_ref_id: str | None = None
 
+    # When a referral pins to a specialty provider, callers may want to skip
+    # closed-panel (accepting_new=False) providers so the named destination is
+    # always bookable, and/or force a SPECIFIC provider id (so two same-specialty
+    # approved referrals can deterministically name DIFFERENT providers). These
+    # are tracked per-specialty so successive pinned referrals of the same
+    # specialty walk down the accepting-provider list instead of all collapsing
+    # onto the first one.
+    _pinned_accepting_idx_by_spec: dict[str, int] = {}
+
     def _make_ref(status: str, expires_days: int, prior_auth: bool = False,
                   specialty: str | None = None,
                   pin_to_specialty_provider: bool = False,
-                  prior_auth_status_override: str | None = None) -> dict[str, Any]:
+                  prior_auth_status_override: str | None = None,
+                  pin_accepting_only: bool = False,
+                  explicit_to_provider_id: str | None = None,
+                  pin_distinct_accepting: bool = False) -> dict[str, Any]:
         ref_id = ctx.next_id("ref")
         candidate_appointments = [
             apt for apt in appointments
@@ -3175,17 +4450,34 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
             specialty = providers_by_id[preferred_appointment["provider_id"]]["specialty"]
         if specialty is None:
             specialty = ctx.rng.choice(available_specialties)
-        if pin_to_specialty_provider:
-            # Force the referral to point at a provider that actually matches
-            # the referral specialty (deterministic: first matching provider),
-            # not an unrelated candidate appointment's provider. Required when
-            # a task pins the appointment's provider_id to the referral's
-            # to_provider_id and that provider must own the bookable slots.
+        if explicit_to_provider_id is not None:
+            # Caller forces the exact destination provider (a deterministic decoy
+            # that names a DIFFERENT same-specialty provider than the eligible
+            # referral). Do not borrow a candidate appointment's provider.
             preferred_appointment = None
-            to_prov = next(
-                (p for p in specialist_specs if p["specialty"] == specialty),
-                None,
-            )
+            to_prov = providers_by_id.get(explicit_to_provider_id)
+        elif pin_to_specialty_provider:
+            # Force the referral to point at a provider that actually matches
+            # the referral specialty, not an unrelated candidate appointment's
+            # provider. Required when a task pins the appointment's provider_id
+            # to the referral's to_provider_id and that provider must own the
+            # bookable slots. With ``pin_accepting_only`` the search skips
+            # closed-panel providers so the named destination is bookable; with
+            # ``pin_distinct_accepting`` successive pinned referrals of the same
+            # specialty walk down the accepting list so they name DIFFERENT
+            # providers (used to seed an approved-referral decoy).
+            preferred_appointment = None
+            spec_candidates = [
+                p for p in specialist_specs
+                if p["specialty"] == specialty
+                and (p.get("accepting_new") if pin_accepting_only else True)
+            ]
+            if pin_distinct_accepting and spec_candidates:
+                idx = _pinned_accepting_idx_by_spec.get(specialty, 0)
+                to_prov = spec_candidates[min(idx, len(spec_candidates) - 1)]
+                _pinned_accepting_idx_by_spec[specialty] = idx + 1
+            else:
+                to_prov = spec_candidates[0] if spec_candidates else None
         else:
             to_prov = (
                 providers_by_id.get(preferred_appointment["provider_id"])
@@ -3282,6 +4574,10 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         ref = _make_ref("approved", ctx.rng.randint(60, 180), prior_auth=needs_auth,
                         specialty=forced_specialty,
                         pin_to_specialty_provider=pin_must_have_providers
+                        and forced_specialty is not None,
+                        pin_accepting_only=pin_must_have_accepting_only
+                        and forced_specialty is not None,
+                        pin_distinct_accepting=pin_must_have_accepting_only
                         and forced_specialty is not None)
         ctx.base["referrals"].append(ref)
         approved_ref_ids.append(ref["id"])
@@ -3331,6 +4627,14 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         e_prior_auth = bool(spec_ref.get("prior_auth", False))
         e_pa_override = spec_ref.get("prior_auth_status")
         e_pin = bool(spec_ref.get("pin_to_specialty_provider", True))
+        # Decoy referrals may name a DIFFERENT accepting same-specialty provider
+        # than the eligible referral, so an agent that links the wrong approved
+        # referral books the wrong provider. ``accepting_distinct`` walks the
+        # shared accepting-provider counter (so this decoy names the NEXT
+        # accepting endo after the eligible referral's), and ``to_provider_id``
+        # forces an exact destination.
+        e_accepting_distinct = bool(spec_ref.get("accepting_distinct", False))
+        e_explicit_prov = spec_ref.get("to_provider_id")
         ref = _make_ref(
             e_status,
             ctx.rng.randint(60, 180),
@@ -3338,6 +4642,9 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
             specialty=e_specialty,
             pin_to_specialty_provider=e_pin and e_specialty is not None,
             prior_auth_status_override=e_pa_override,
+            pin_accepting_only=e_accepting_distinct,
+            pin_distinct_accepting=e_accepting_distinct,
+            explicit_to_provider_id=e_explicit_prov,
         )
         ctx.base["referrals"].append(ref)
         if e_status == "approved":
@@ -3391,6 +4698,23 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         if spec not in eligible_ref_id_by_specialty:
             eligible_ref_id_by_specialty[spec] = rid
             eligible_provider_id_by_specialty[spec] = r.get("to_provider_id")
+
+    # Mirror of the eligible map for the INELIGIBLE approved decoys (approved
+    # referrals blocked by an unapproved prior-auth). Exposes, per specialty,
+    # the first such decoy referral id as a SCALAR. Difficulty variants that
+    # forge a "wrong-referral" misleading_success body need this scalar (the
+    # `{target.X}` placeholder resolver supports only flat keys, not list
+    # indexing), so a paired intervention can advertise a fake link pointing at
+    # the preauth-pending neurology decoy and force the agent to verify the
+    # PERSISTED linked_referral_id rather than trust the response.
+    ineligible_ref_id_by_specialty: dict[str, str] = {}
+    for rid in ineligible_approved_ref_ids:
+        r = by_id[rid]
+        spec = r.get("to_specialty")
+        if spec is None:
+            continue
+        if spec not in ineligible_ref_id_by_specialty:
+            ineligible_ref_id_by_specialty[spec] = rid
 
     # Per-specialty discriminators the canonical_diff pins as scalar targets.
     # For each specialty named in must_have_specialties, locate the first
@@ -3453,6 +4777,7 @@ def build_referral_chain(ctx: PatientPortalSeedContext, params: dict[str, Any]) 
         "eligible_ref_id_by_specialty": eligible_ref_id_by_specialty,
         "eligible_provider_id_by_specialty": eligible_provider_id_by_specialty,
         "eligible_ref_ids_by_specialty": eligible_ref_ids_by_specialty,
+        "ineligible_ref_id_by_specialty": ineligible_ref_id_by_specialty,
         "eligible_ref_id": eligible_ref_id,
         "eligible_specialty": eligible_specialty,
         "preauth_pending_ref_ids": preauth_pending_ref_ids,
@@ -3503,6 +4828,37 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     near_appeal_deadline = params.get("near_appeal_deadline", False)
     approved_no_eob_count = params.get("approved_no_eob_count", 0)
     approved_zero_resp_count = params.get("approved_zero_resp_count", 0)
+    # When set, the approved-but-no-EOB decoys draw their patient_responsibility
+    # from this (lo, hi) dollar band so they OUTRANK several genuinely-payable
+    # approved claims by raw balance. This makes the EOB filter load-bearing: a
+    # naive "top-K approved by balance" picks these high decoys and fails.
+    approved_no_eob_band = params.get("approved_no_eob_band")
+    if approved_no_eob_band is not None:
+        approved_no_eob_band = (float(approved_no_eob_band[0]), float(approved_no_eob_band[1]))
+    # When set (dollars), the K-th and (K+1)-th payable claims (the boundary that
+    # decides who makes the top-K cut) are pulled to within this margin of each
+    # other so the ranking is genuinely close and careful state-tracking — not a
+    # one-glance eyeball — is required to get the boundary right.
+    payable_tie_margin = params.get("payable_tie_margin")
+    # When set, the fully-covered (zero-responsibility) approved claims are
+    # forced to a service_date strictly LATER than every positive-balance
+    # approved claim. Combined with `mra_positive_balance_only` below this turns
+    # the naive "latest approved claim" answer into a $0.00-balance decoy: the
+    # agent must hold "the latest approved claim that actually has a positive
+    # balance to review" across reads (state_tracking), not just pick the most
+    # recent approved row. Backward-compatible (defaults False).
+    approved_zero_resp_later_dated = bool(
+        params.get("approved_zero_resp_later_dated", False)
+    )
+    # When set, `most_recent_approved_claim_id` (and the derived
+    # `billing_followup_reason`) are computed over only approved claims with a
+    # strictly-positive patient_responsibility, so a later-dated fully-covered
+    # decoy is correctly excluded from the answer. Backward-compatible.
+    mra_positive_balance_only = bool(params.get("mra_positive_balance_only", False))
+    # Force N positive-balance approved claims to SHARE the latest positive
+    # service_date so the claim-id tie-break in `most_recent_approved_claim_id`
+    # actually fires (rather than being vacuously decided by a unique max date).
+    force_latest_positive_tie = int(params.get("force_latest_positive_tie", 0))
     # Optional: denied claims that look like appeal candidates but are NOT
     # eligible (deadline already passed, or no EOB issued). These are decoys
     # that force the agent to apply the full eligibility filter
@@ -3520,6 +4876,59 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     denied_no_eob_count = params.get("denied_no_eob_count", 0)
     denied_expired_count = params.get("denied_expired_count", 0)
     denied_past_deadline_count = params.get("denied_past_deadline_count", 0)
+    # ``eligible_pr_plan`` (optional list of numbers) assigns EXACT
+    # patient_responsibility values, in order, to the genuine eligible denied
+    # claims produced by ``denied_count`` (status==denied AND eob AND future
+    # deadline). This lets an author engineer DELIBERATE TIES at the top-3
+    # boundary so the ascending-claim-id tiebreaker actually decides
+    # membership — a state_tracking load that a model skipping the tiebreaker
+    # gets wrong. Any eligible claim beyond the plan keeps the random draw.
+    eligible_pr_plan = list(params.get("eligible_pr_plan", []) or [])
+    # ``ineligible_pr_floor`` narrows the random amount_billed (==PR for denied)
+    # of the INELIGIBLE denied decoys (no-EOB / expired-deadline) to
+    # [ineligible_pr_floor, ineligible_pr_ceiling] so they reliably OUTRANK the
+    # genuine eligible top-3 by patient responsibility. A model that ranks
+    # top-K-by-PR before (or without) applying the full eligibility filter then
+    # picks decoys the appeal route rejects (422). Defaults preserve the legacy
+    # [100, 2000] draw.
+    ineligible_pr_floor = params.get("ineligible_pr_floor")
+    ineligible_pr_ceiling = int(params.get("ineligible_pr_ceiling", 2000))
+    _inel_low = int(ineligible_pr_floor) if ineligible_pr_floor is not None else 100
+    _inel_high = ineligible_pr_ceiling
+    # Optional: when True, the `denied_count` eligible (denied + EOB) claims are
+    # given DETERMINISTIC, monotonically-spaced appeal deadlines instead of the
+    # default RNG-clustered 30-60d window. This removes the brittle "rank-2 vs
+    # rank-3 is a near-coin-flip on clustered RNG dates" failure mode: rank-1 and
+    # rank-2 are each unambiguously earlier than rank-3 by a comfortable margin,
+    # so the deadline-ranking discriminator is ROBUST rather than fragile. The
+    # spacing also installs exactly ONE intentional same-deadline pair among the
+    # LATEST two eligible claims (frozen siblings) so the claim-id tiebreaker is
+    # tested deliberately, not as an accidental tie on the load-bearing boundary.
+    monotonic_appealable_deadlines = bool(
+        params.get("monotonic_appealable_deadlines", False)
+    )
+    # Recency leaders + near-tie cluster. The dispute task's answer is the K most
+    # recent ELIGIBLE denied claims. To make the documented claim-id tiebreaker
+    # LOAD-BEARING (rather than a degenerate "take the whole cluster"), seed:
+    #   * `recent_lead_days`: a list of EXACT day-offsets (before now) for the
+    #     strictly-newest eligible claims (one per offset, distinct dates). These
+    #     fill the first len(recent_lead_days) recency ranks unambiguously.
+    #   * `recent_tie_count`: N fully-eligible claims that all SHARE the
+    #     `recent_tie_days_ago` service_date, which sits just BELOW the leaders.
+    #     With K = recent_appealable_n and len(recent_lead_days) == K-1, exactly
+    #     ONE of the N tied claims earns the final rank (later-numbered id wins)
+    #     and the rest are dropped — so resolving the answer REQUIRES the
+    #     tiebreaker. All leader/tie offsets are < the ordinary denied pool's
+    #     randint(7, 120) window, so they always dominate recency.
+    recent_lead_days = params.get("recent_lead_days", []) or []
+    recent_tie_count = int(params.get("recent_tie_count", 0))
+    recent_tie_days_ago = int(params.get("recent_tie_days_ago", 6))
+    # Sort-order trap: N denied + NO-EOB claims whose service_date is NEWER than
+    # every eligible claim (incl. the leaders). An agent that sorts by recency
+    # BEFORE applying the eligibility filter grabs these into its top-K and
+    # mis-fires; a correct filter-then-sort drops them. Defaults to 0.
+    newest_no_eob_trap_count = int(params.get("newest_no_eob_trap_count", 0))
+    newest_trap_days_ago = int(params.get("newest_trap_days_ago", 2))
 
     if "claims" not in ctx.base:
         ctx.base["claims"] = []
@@ -3592,9 +5001,34 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         return None
 
     def _make_claim(status: str, appeal_days: int, eob: bool = False,
-                    zero_resp: bool = False) -> dict[str, Any]:
+                    zero_resp: bool = False,
+                    service_date_override: "date | None" = None,
+                    service_days_ago: int | None = None,
+                    forced_pr: "Decimal | int | float | str | None" = None,
+                    pr_low: int = 100, pr_high: int = 2000,
+                    pr_band: tuple[float, float] | None = None) -> dict[str, Any]:
+        """Build one claim.
+
+        ``pr_band`` (lo, hi) — when set on an approved non-zero-resp claim, the
+        patient_responsibility is drawn directly from this dollar band and
+        ``amount_covered``/``amount_billed`` are derived so the three stay
+        self-consistent (billed = covered + responsibility). This lets a task
+        seed high-balance decoys (e.g. no-EOB approved claims that OUTRANK
+        several payable claims by raw balance) so the EOB/positive-balance
+        filter becomes load-bearing rather than a no-op.
+        """
         clm_id = ctx.next_id("clm")
-        service_date = (ctx.now - timedelta(days=ctx.rng.randint(7, 120))).date()
+        # ``service_date_override`` pins the date directly; ``service_days_ago``
+        # pins it to an EXACT offset from now (used to seed recency near-ties /
+        # a newest-of-all sort-order trap and date-ordered approved/zero-resp
+        # decoys so the documented tiebreakers become load-bearing). When both
+        # are None the legacy wide random window is used.
+        if service_date_override is not None:
+            service_date = service_date_override
+        elif service_days_ago is not None:
+            service_date = (ctx.now - timedelta(days=int(service_days_ago))).date()
+        else:
+            service_date = (ctx.now - timedelta(days=ctx.rng.randint(7, 120))).date()
 
         # Link to a completed appointment if available
         apt = _pick_completed_appointment(prefer_referral=(status == "denied"))
@@ -3603,13 +5037,34 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         supporting_referral_id = _find_supporting_referral(apt)
         supporting_lab_ids = labs_by_appointment.get(apt_id, [])[:2] if apt else []
 
-        amount_billed = Decimal(str(ctx.rng.randint(100, 2000)))
+        # ``forced_pr`` (denied claims only) plants an EXACT patient_responsibility
+        # so authors can engineer ties at the top-3 boundary (forcing the
+        # claim-id tiebreaker to bind) or push ineligible decoys above the
+        # genuine eligible set. ``pr_low``/``pr_high`` narrow the random draw
+        # (e.g. to the high end so ineligible decoys reliably outrank the answer).
+        # For denied claims patient_responsibility == amount_billed, so we set
+        # amount_billed from the forced/ranged value.
+        if status == "denied" and forced_pr is not None:
+            amount_billed = Decimal(str(forced_pr))
+        else:
+            amount_billed = Decimal(str(ctx.rng.randint(pr_low, pr_high)))
         if status == "approved":
             if zero_resp:
                 # Fully covered — patient owes nothing. The pay route rejects
                 # these (422), so they must never be acted on.
                 amount_covered = amount_billed
                 patient_resp = Decimal("0")
+            elif pr_band is not None:
+                # Draw the patient responsibility directly from the requested
+                # band, then derive billed/covered to stay consistent. Used to
+                # plant high-balance decoys above the payable cutoff.
+                lo, hi = pr_band
+                patient_resp = Decimal(str(round(ctx.rng.uniform(lo, hi), 2)))
+                # Keep a plausible coverage ratio (~60-90% covered) by inflating
+                # amount_billed so covered = billed - responsibility stays > 0.
+                ratio = ctx.rng.uniform(0.6, 0.9)
+                amount_billed = (patient_resp / Decimal(str(1 - ratio))).quantize(Decimal("0.01"))
+                amount_covered = amount_billed - patient_resp
             else:
                 amount_covered = Decimal(str(round(float(amount_billed) * ctx.rng.uniform(0.6, 0.9), 2)))
                 patient_resp = amount_billed - amount_covered
@@ -3653,26 +5108,69 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         return claim_dict
 
     # Approved claims
-    for _ in range(approved_count):
-        claim = _make_claim("approved", ctx.rng.randint(30, 90), eob=with_eob)
-        ctx.base["claims"].append(claim)
-        approved_claim_ids.append(claim["id"])
-        total_patient_responsibility += Decimal(claim["patient_responsibility"])
+    # Positive-balance approved claims. When `force_latest_positive_tie` >= 2,
+    # the last N of these are pinned to a single shared "latest positive"
+    # service_date so the claim-id tie-break in `most_recent_approved_claim_id`
+    # is load-bearing (two approved claims share the latest service date and the
+    # winner is decided by id). When `approved_zero_resp_later_dated` is set, all
+    # positive approved claims are kept strictly OLDER than the zero-resp decoys
+    # below by anchoring them in a 45-90 day window.
+    positive_approved_ids: list[str] = []
+    if approved_zero_resp_later_dated or force_latest_positive_tie >= 2:
+        # Latest positive service_date sits ~40 days back; the zero-resp decoys
+        # (when later-dated) land ~10 days back, strictly more recent.
+        latest_positive_date = (ctx.now - timedelta(days=40)).date()
+        n_tied = max(0, min(force_latest_positive_tie, approved_count))
+        for idx in range(approved_count):
+            if idx >= approved_count - n_tied:
+                # Tie members share the latest positive service_date.
+                sd = latest_positive_date
+            else:
+                # Strictly older than the latest positive date (50-90 days back).
+                sd = (ctx.now - timedelta(days=ctx.rng.randint(50, 90))).date()
+            claim = _make_claim(
+                "approved", ctx.rng.randint(30, 90), eob=with_eob,
+                service_date_override=sd,
+            )
+            ctx.base["claims"].append(claim)
+            approved_claim_ids.append(claim["id"])
+            positive_approved_ids.append(claim["id"])
+            total_patient_responsibility += Decimal(claim["patient_responsibility"])
+    else:
+        for _ in range(approved_count):
+            claim = _make_claim("approved", ctx.rng.randint(30, 90), eob=with_eob)
+            ctx.base["claims"].append(claim)
+            approved_claim_ids.append(claim["id"])
+            positive_approved_ids.append(claim["id"])
+            total_patient_responsibility += Decimal(claim["patient_responsibility"])
 
     # Approved claims whose EOB is NOT yet available. These carry a positive
     # balance but the EOB cannot be reviewed, so an "review EOB then pay"
     # workflow must skip them. They are still legitimate approved claims, so
     # they appear in approved_claim_ids.
     for _ in range(approved_no_eob_count):
-        claim = _make_claim("approved", ctx.rng.randint(30, 90), eob=False)
+        claim = _make_claim("approved", ctx.rng.randint(30, 90), eob=False,
+                            pr_band=approved_no_eob_band)
         ctx.base["claims"].append(claim)
         approved_claim_ids.append(claim["id"])
+        positive_approved_ids.append(claim["id"])
         total_patient_responsibility += Decimal(claim["patient_responsibility"])
 
     # Approved claims that are fully covered (patient_responsibility == 0).
-    # The pay route rejects these (422), so they must never be paid.
+    # The pay route rejects these (422), so they must never be paid. When
+    # `approved_zero_resp_later_dated` is set they are pinned to a service_date
+    # MORE RECENT than every positive approved claim, so the naive "latest
+    # approved claim" answer points at a $0.00-balance decoy and the agent must
+    # instead track the latest approved claim with an actual positive balance.
     for _ in range(approved_zero_resp_count):
-        claim = _make_claim("approved", ctx.rng.randint(30, 90), eob=with_eob, zero_resp=True)
+        if approved_zero_resp_later_dated:
+            sd_zero = (ctx.now - timedelta(days=ctx.rng.randint(5, 20))).date()
+            claim = _make_claim(
+                "approved", ctx.rng.randint(30, 90), eob=with_eob, zero_resp=True,
+                service_date_override=sd_zero,
+            )
+        else:
+            claim = _make_claim("approved", ctx.rng.randint(30, 90), eob=with_eob, zero_resp=True)
         ctx.base["claims"].append(claim)
         approved_claim_ids.append(claim["id"])
         total_patient_responsibility += Decimal(claim["patient_responsibility"])
@@ -3680,11 +5178,25 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # Denied claims
     for i in range(denied_count):
         is_near = near_appeal_deadline and appealable_claim_id is None and i == 0
-        appeal_days = ctx.rng.randint(3, 7) if is_near else ctx.rng.randint(30, 60)
-        claim = _make_claim("denied", appeal_days, eob=with_eob)
+        if monotonic_appealable_deadlines:
+            # Deterministic, comfortably-spaced deadlines so the rank-1/rank-2
+            # vs rank-3 boundary is robust. rank-1 = 4d (the urgent "near"
+            # claim), rank-2 = 18d, then +14d per step. The LAST two eligible
+            # claims deliberately SHARE a deadline (tie) so the claim-id
+            # tiebreaker is exercised on a pair that sits well past the top-2
+            # boundary (both are frozen siblings, not the answer).
+            if denied_count >= 2 and i >= denied_count - 2:
+                # Both of the last two claims get the same (latest) deadline.
+                appeal_days = 4 + 14 * (denied_count - 2)
+            else:
+                appeal_days = 4 + 14 * i
+        else:
+            appeal_days = ctx.rng.randint(3, 7) if is_near else ctx.rng.randint(30, 60)
+        forced_pr = eligible_pr_plan[i] if i < len(eligible_pr_plan) else None
+        claim = _make_claim("denied", appeal_days, eob=with_eob, forced_pr=forced_pr)
         ctx.base["claims"].append(claim)
         denied_claim_ids.append(claim["id"])
-        if is_near:
+        if is_near or (monotonic_appealable_deadlines and i == 0):
             appealable_claim_id = claim["id"]
 
     # Ineligible denied claims (decoys): denied but NOT appealable.
@@ -3694,12 +5206,14 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # the invariant that forbids touching out-of-scope denied claims.
     ineligible_denied_ids: list[str] = []
     for _ in range(expired_denied_count):
-        claim = _make_claim("denied", -ctx.rng.randint(10, 60), eob=with_eob)
+        claim = _make_claim("denied", -ctx.rng.randint(10, 60), eob=with_eob,
+                            pr_low=_inel_low, pr_high=_inel_high)
         ctx.base["claims"].append(claim)
         denied_claim_ids.append(claim["id"])
         ineligible_denied_ids.append(claim["id"])
     for _ in range(no_eob_denied_count):
-        claim = _make_claim("denied", ctx.rng.randint(30, 60), eob=False)
+        claim = _make_claim("denied", ctx.rng.randint(30, 60), eob=False,
+                            pr_low=_inel_low, pr_high=_inel_high)
         ctx.base["claims"].append(claim)
         denied_claim_ids.append(claim["id"])
         ineligible_denied_ids.append(claim["id"])
@@ -3710,7 +5224,8 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # selection that ignores the eob filter would wrongly pick them up.
     # (Also the non-appealable EOB-gate decoy used by pp_complex_claim_dispute.)
     for _ in range(denied_no_eob_count):
-        claim = _make_claim("denied", ctx.rng.randint(30, 60), eob=False)
+        claim = _make_claim("denied", ctx.rng.randint(30, 60), eob=False,
+                            pr_low=_inel_low, pr_high=_inel_high)
         ctx.base["claims"].append(claim)
         denied_claim_ids.append(claim["id"])
         ineligible_denied_ids.append(claim["id"])
@@ -3719,7 +5234,8 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # carry an EOB, so only the (negative) deadline disqualifies them; the
     # appeal route rejects them ("Appeal deadline has passed").
     for _ in range(denied_expired_count):
-        claim = _make_claim("denied", -ctx.rng.randint(5, 40), eob=True)
+        claim = _make_claim("denied", -ctx.rng.randint(5, 40), eob=True,
+                            pr_low=_inel_low, pr_high=_inel_high)
         ctx.base["claims"].append(claim)
         denied_claim_ids.append(claim["id"])
         ineligible_denied_ids.append(claim["id"])
@@ -3727,7 +5243,51 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # Non-appealable decoy: denied + EOB but the appeal deadline has passed
     # (negative appeal_days places the deadline before ctx.now -> fails deadline gate).
     for _ in range(denied_past_deadline_count):
-        claim = _make_claim("denied", -ctx.rng.randint(5, 40), eob=with_eob)
+        claim = _make_claim("denied", -ctx.rng.randint(5, 40), eob=with_eob,
+                            pr_low=_inel_low, pr_high=_inel_high)
+        ctx.base["claims"].append(claim)
+        denied_claim_ids.append(claim["id"])
+        ineligible_denied_ids.append(claim["id"])
+
+    # Recency leaders: fully-ELIGIBLE denied claims at distinct, pinned dates
+    # newer than the ordinary denied pool. They fill the top recency ranks
+    # unambiguously, leaving the tie cluster to decide only the FINAL rank.
+    for lead_days in recent_lead_days:
+        claim = _make_claim(
+            "denied",
+            ctx.rng.randint(40, 60),
+            eob=True,
+            service_days_ago=int(lead_days),
+        )
+        ctx.base["claims"].append(claim)
+        denied_claim_ids.append(claim["id"])
+
+    # Recency near-tie cluster: fully-ELIGIBLE denied claims sharing one
+    # service_date that sits just below the leaders. Appended after the leaders
+    # so they receive higher claim-id numbers; the later-numbered tied claim wins
+    # the final recency rank and the rest are dropped (tiebreaker is decisive).
+    tie_cluster_ids: list[str] = []
+    for _ in range(recent_tie_count):
+        claim = _make_claim(
+            "denied",
+            ctx.rng.randint(40, 60),
+            eob=True,
+            service_days_ago=recent_tie_days_ago,
+        )
+        ctx.base["claims"].append(claim)
+        denied_claim_ids.append(claim["id"])
+        tie_cluster_ids.append(claim["id"])
+
+    # Sort-order trap: denied + NO-EOB claims whose service_date is the NEWEST of
+    # ALL denied claims (newer than the eligible tie cluster). They are ineligible
+    # (no EOB) but a recency-before-filter agent grabs them first.
+    for _ in range(newest_no_eob_trap_count):
+        claim = _make_claim(
+            "denied",
+            ctx.rng.randint(40, 60),
+            eob=False,
+            service_days_ago=newest_trap_days_ago,
+        )
         ctx.base["claims"].append(claim)
         denied_claim_ids.append(claim["id"])
         ineligible_denied_ids.append(claim["id"])
@@ -3793,9 +5353,23 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     most_recent_approved_claim_id: str | None = None
     most_recent_approved_patient_responsibility: str = "0"
     billing_followup_reason: str = ""
-    if approved_claim_ids:
+    # When `mra_positive_balance_only` is set, restrict the "most recent
+    # approved" computation to approved claims with a strictly-positive
+    # patient_responsibility. This excludes fully-covered ($0) approved decoys —
+    # which may carry a LATER service_date (see approved_zero_resp_later_dated) —
+    # so the answer is the latest approved claim that actually has a balance to
+    # review, forcing the agent to track balance state, not just recency.
+    if mra_positive_balance_only:
+        _mra_pool = [
+            cid for cid in approved_claim_ids
+            if (c := _claim_by_id(cid)) is not None
+            and float(c.get("patient_responsibility", "0")) > 0
+        ]
+    else:
+        _mra_pool = list(approved_claim_ids)
+    if _mra_pool:
         most_recent_approved_claim_id = max(
-            approved_claim_ids,
+            _mra_pool,
             key=lambda cid: (_claim_service_date(cid), cid),
         )
         _mra = _claim_by_id(most_recent_approved_claim_id)
@@ -3841,6 +5415,35 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
             cid,
         ),
     )
+
+    # Force a near-tie at the top-K boundary: pull the (K+1)-th payable claim's
+    # balance up to within `payable_tie_margin` dollars BELOW the K-th, so the
+    # 3rd vs 4th decision is razor-thin and the agent must rank carefully rather
+    # than eyeballing. The K-th claim stays strictly the larger of the two, so
+    # the top-K membership (and id tiebreak) remains deterministic. amounts are
+    # kept self-consistent (billed = covered + responsibility).
+    if payable_tie_margin is not None and len(payable_ids_sorted) > payable_top_k:
+        kth = _claim_by_id(payable_ids_sorted[payable_top_k - 1])
+        kp1 = _claim_by_id(payable_ids_sorted[payable_top_k])
+        if kth is not None and kp1 is not None:
+            kth_pr = Decimal(str(kth["patient_responsibility"]))
+            margin = Decimal(str(payable_tie_margin))
+            # Place the (K+1)-th strictly below the K-th by `margin` (>= $0.01).
+            new_pr = (kth_pr - margin).quantize(Decimal("0.01"))
+            if new_pr <= 0:
+                new_pr = Decimal("0.01")
+            covered = Decimal(str(kp1["amount_covered"]))
+            kp1["patient_responsibility"] = str(new_pr)
+            kp1["amount_billed"] = str((covered + new_pr).quantize(Decimal("0.01")))
+            # Re-sort after the boundary nudge.
+            payable_ids_sorted = sorted(
+                payable_ids,
+                key=lambda cid: (
+                    -float(_claim_by_id(cid)["patient_responsibility"]),
+                    cid,
+                ),
+            )
+
     top_k_payable_claim_ids = payable_ids_sorted[:payable_top_k]
     # The smallest patient_responsibility among the selected top-K (the
     # inclusive cutoff). When fewer than K payable claims exist this is the
@@ -3873,9 +5476,24 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # builder so the canonical_diff bijection can target a scalar list without
     # pushing date/sort math into the where/filter scope.
     recent_appealable_n = params.get("recent_appealable_n", 2)
+
+    def _claim_id_num(cid: str) -> int:
+        """Numeric suffix of a ``clm_N`` id for instruction-faithful tiebreak.
+
+        The dispute-claim instruction breaks service_date ties by the
+        *later-numbered* claim id. A lexical string sort would mis-order ids
+        once they cross the single→double-digit boundary (``clm_9`` >
+        ``clm_13`` lexically), so the recency ordering must compare the integer
+        suffix, not the raw id string.
+        """
+        try:
+            return int(str(cid).rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            return 0
+
     recent_appealable_sorted = sorted(
         appealable_ids,
-        key=lambda cid: (_claim_by_id(cid)["service_date"], cid),
+        key=lambda cid: (_claim_by_id(cid)["service_date"], _claim_id_num(cid)),
         reverse=True,
     )
     recent_appealable_claim_ids = recent_appealable_sorted[:recent_appealable_n]
@@ -3892,6 +5510,30 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     )
     top_2_urgent_appealable_claim_ids = appealable_ids_by_deadline[:2]
 
+    # Derived: the exact appeal_deadline ISO strings of the rank-1 and rank-2
+    # urgent claims, plus deadlines positioned just INSIDE / just OUTSIDE the
+    # rank-2 boundary. These exist so a paired intervention variant can plant
+    # boundary-lookalike decoy claims whose deadlines sit within a day or two of
+    # the load-bearing rank-2 cutoff (but which are INELIGIBLE by EOB/deadline),
+    # forcing the agent to re-verify eligibility rather than grab the
+    # earliest-by-deadline row. Exposed as seed targets so the variant resolves
+    # `{target.rank2_boundary_deadline}` etc. without leaking the answer ids.
+    rank1_appeal_deadline = ""
+    rank2_appeal_deadline = ""
+    rank2_boundary_deadline = ""
+    rank1_tie_deadline = ""
+    if len(top_2_urgent_appealable_claim_ids) >= 1:
+        rank1_appeal_deadline = _claim_by_id(top_2_urgent_appealable_claim_ids[0])["appeal_deadline"]
+        rank1_tie_deadline = rank1_appeal_deadline
+    if len(top_2_urgent_appealable_claim_ids) >= 2:
+        rank2_appeal_deadline = _claim_by_id(top_2_urgent_appealable_claim_ids[1])["appeal_deadline"]
+        # One day BEFORE the rank-2 deadline: a decoy at this date would slot
+        # between rank-1 and rank-2 if it were eligible, so an agent that ranks
+        # purely by deadline (skipping the EOB/deadline re-check) is tempted to
+        # appeal it. The decoy is seeded ineligible in the variant.
+        _r2 = datetime.fromisoformat(rank2_appeal_deadline)
+        rank2_boundary_deadline = (_r2 - timedelta(days=1)).isoformat()
+
     # Derived: the FULL set of appealable denied claims (every denied claim that
     # passes all three backend appeal gates: status=='denied' AND eob_available
     # AND appeal_deadline >= ctx.now). Sorted ascending by id for a stable scalar
@@ -3900,6 +5542,16 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
     # decoys (no-EOB / past-deadline) that must be EXCLUDED.
     appealable_denied_claim_ids = sorted(appealable_ids)
     appealable_denied_count = len(appealable_denied_claim_ids)
+
+    # Recompute the approved-claim total from the FINAL claim states: the
+    # near-tie boundary nudge above may have adjusted one approved claim's
+    # patient_responsibility after the running sum was first accumulated.
+    total_patient_responsibility = sum(
+        (Decimal(str(_claim_by_id(cid)["patient_responsibility"]))
+         for cid in approved_claim_ids
+         if _claim_by_id(cid) is not None),
+        Decimal("0"),
+    )
 
     return {
         "approved_claim_ids": approved_claim_ids,
@@ -3912,6 +5564,7 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         "most_recent_approved_patient_responsibility": (
             most_recent_approved_patient_responsibility
         ),
+        "positive_approved_claim_ids": positive_approved_ids,
         "billing_followup_reason": billing_followup_reason,
         "top_3_appealable_claim_ids": top_3_appealable_claim_ids,
         "top_k_payable_claim_ids": top_k_payable_claim_ids,
@@ -3921,6 +5574,10 @@ def build_insurance_claims(ctx: PatientPortalSeedContext, params: dict[str, Any]
         "ineligible_denied_ids": ineligible_denied_ids,
         "top_2_urgent_appealable_claim_ids": top_2_urgent_appealable_claim_ids,
         "appealable_claim_ids_by_deadline": appealable_ids_by_deadline,
+        "rank1_appeal_deadline": rank1_appeal_deadline,
+        "rank2_appeal_deadline": rank2_appeal_deadline,
+        "rank2_boundary_deadline": rank2_boundary_deadline,
+        "rank1_tie_deadline": rank1_tie_deadline,
         "appealable_denied_claim_ids": appealable_denied_claim_ids,
         "appealable_denied_count": appealable_denied_count,
         "total_patient_responsibility": str(total_patient_responsibility),
