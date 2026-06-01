@@ -109,7 +109,13 @@ canonical_diff:
       rubric_scores:
         expr: 'len(x) == 3 and set(str(k) for k in x.keys()) == {''clarity'', ''depth'', ''originality''} and all(1 <= int(s) <= 5 for s in x.values())'
       comments:
-        expr: 'len(x.strip()) >= 60 and next(e.split('':'', 1)[1] for e in target[''pending_review_low_crit''].split(''|'') if e.split('':'', 1)[0] == v.strip()).lower() in x.lower() and next(e.split('':'', 1)[1] for e in target[''pending_review_name_tokens''].split(''|'') if e.split('':'', 1)[0] == v.strip()).lower() in x.lower()'
+        # Fresh reviews "take any valid 1-5 score", so the LOWEST-corrected criterion the
+        # comment must name is derived from the agent's OWN submitted scores (looked up in
+        # the final state by review id), with the canonical clarity<depth<originality
+        # tie-break. Using the static seed target pending_review_low_crit here was a bug:
+        # it always resolved to 'clarity' (argmin of the unused 3~3~3 fresh-default vector),
+        # so a correct agent that scored e.g. originality lowest and named it was failed.
+        expr: "len(x.strip()) >= 60 and next((min(['clarity','depth','originality'], key=lambda k: (int(rs[k]), ['clarity','depth','originality'].index(k))).lower() in x.lower() for rs in [next((r.rubric_scores for r in state.peer_reviews if r.id == v.strip()), None)] if rs), False) and next(e.split(':', 1)[1] for e in target['pending_review_name_tokens'].split('|') if e.split(':', 1)[0] == v.strip()).lower() in x.lower()"
       status: {eq: submitted}
   invariant:
   - collection: state.peer_reviews

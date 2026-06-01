@@ -242,3 +242,65 @@ def test_wrong_incomplete_fails():
 
     result = _evaluate(state, targets)
     assert result.get("success") is False, f"reasoning:\n{result.get('reasoning')}"
+
+
+# ---------------------------------------------------------------------------
+# Freedom path (regression for the low_crit bug): fresh reviews "take any valid
+# 1-5 score", so the comment must name the criterion lowest among the agent's
+# OWN submitted scores — NOT a seed-fixed 'clarity'. The previous canonical_diff
+# hard-required pending_review_low_crit (always 'clarity' for fresh reviews,
+# being argmin of the unused 3~3~3 default), failing a correct agent that scored
+# a different criterion lowest and named it.
+# ---------------------------------------------------------------------------
+
+_ORDER = ["clarity", "depth", "originality"]
+
+
+def _lowest_crit(scores: dict) -> str:
+    return min(_ORDER, key=lambda c: (int(scores[c]), _ORDER.index(c)))
+
+
+def _comment_naming(first_name: str, crit: str) -> str:
+    return (
+        f"{first_name}, the {crit} dimension is the weakest part of this submission "
+        f"and needs the most improvement to lift the overall quality of the work."
+    )
+
+
+def _fresh_ids(targets: dict) -> list[str]:
+    returned = {r.strip() for r in targets["returned_review_ids"].split(",") if r.strip()}
+    return [r for r in _pending_ids(targets) if r not in returned]
+
+
+def test_fresh_review_nonuniform_scores_names_true_lowest_passes():
+    sm, sid, targets, state = _make_session()
+    fresh = _fresh_ids(targets)
+    assert fresh, "expected at least one fresh (never-returned) pending review"
+    names = _name_tokens(targets)
+    returned = {r.strip() for r in targets["returned_review_ids"].split(",") if r.strip()}
+    for rid in returned:  # returned reviews still need the exact rule-derived scores
+        _submit(sm, sid, rid, _correct_scores_for(rid, targets), _correct_comment_for(rid, targets))
+    fresh_scores = {"clarity": 5, "depth": 4, "originality": 2}  # lowest = originality, NOT clarity
+    assert _lowest_crit(fresh_scores) == "originality"
+    for rid in fresh:
+        _submit(sm, sid, rid, dict(fresh_scores), _comment_naming(names[rid], "originality"))
+
+    result = _evaluate(state, targets)
+    assert result.get("success") is True, f"reasoning:\n{result.get('reasoning')}"
+    assert result.get("score", 0.0) >= 0.99, result.get("score")
+
+
+def test_fresh_review_names_nonlowest_criterion_fails():
+    sm, sid, targets, state = _make_session()
+    fresh = _fresh_ids(targets)
+    names = _name_tokens(targets)
+    returned = {r.strip() for r in targets["returned_review_ids"].split(",") if r.strip()}
+    for rid in returned:
+        _submit(sm, sid, rid, _correct_scores_for(rid, targets), _correct_comment_for(rid, targets))
+    fresh_scores = {"clarity": 5, "depth": 4, "originality": 2}  # lowest = originality
+    for rid in fresh:
+        # Names 'clarity' (the agent's HIGHEST score), not the true lowest -> must fail.
+        _submit(sm, sid, rid, dict(fresh_scores), _comment_naming(names[rid], "clarity"))
+
+    result = _evaluate(state, targets)
+    assert result.get("success") is False, f"reasoning:\n{result.get('reasoning')}"

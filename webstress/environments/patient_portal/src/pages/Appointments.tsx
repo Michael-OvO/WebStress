@@ -177,7 +177,12 @@ export function AppointmentsPage() {
         ) : (
           <table aria-label="Upcoming appointments table">
             <thead>
+              {/* Actions column is FIRST so per-row Cancel/Reschedule/Confirm controls stay
+                  within the viewport's left edge: this wide (12-column) table overflows the
+                  agent browser viewport horizontally, and the harness cannot scroll a table
+                  region sideways, so a trailing Actions column was unreachable. */}
               <tr>
+                <th>Actions</th>
                 <th>Appointment ID</th>
                 <th>Date/Time</th>
                 <th>Booked At</th>
@@ -189,34 +194,11 @@ export function AppointmentsPage() {
                 <th>Reason</th>
                 <th>Linked Referral</th>
                 <th>Location</th>
-                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               {upcoming.map((apt) => (
                 <tr key={apt.id}>
-                  <td>{apt.id}</td>
-                  <td>{formatInterval(apt)}</td>
-                  <td aria-label={`Booked at ${new Date(apt.booked_at).toLocaleString()}`} className="pp-text--muted pp-text--sm">{new Date(apt.booked_at).toLocaleString()}</td>
-                  <td>{providerName(apt.provider_id)}</td>
-                  <td>{providerSpecialty(apt.provider_id)}</td>
-                  <td>{apt.type}</td>
-                  <td>
-                    <span className={`pp-status-badge pp-status-badge--${apt.status}`}>{apt.status}</span>
-                    {apt.requires_confirmation && (
-                      <span
-                        className={`pp-status-badge pp-status-badge--confirm-${apt.confirmation_state}`}
-                        aria-label={`Confirmation status: ${apt.confirmation_state}`}
-                        style={{ marginLeft: 6 }}
-                      >
-                        {apt.confirmation_state === "confirmed" ? "Confirmed" : "Awaiting confirmation"}
-                      </span>
-                    )}
-                  </td>
-                  <td aria-label={`Pre-authorization status: ${apt.pre_auth_status}`}><span className={`pp-status-badge pp-status-badge--${apt.pre_auth_status}`}>{apt.pre_auth_status}</span></td>
-                  <td>{apt.reason}</td>
-                  <td>{apt.linked_referral_id ?? "None"}</td>
-                  <td>{apt.location}</td>
                   <td>
                     {apt.requires_confirmation && apt.confirmation_state === "pending" && (
                       <button
@@ -245,6 +227,28 @@ export function AppointmentsPage() {
                       Reschedule
                     </button>
                   </td>
+                  <td>{apt.id}</td>
+                  <td>{formatInterval(apt)}</td>
+                  <td aria-label={`Booked at ${new Date(apt.booked_at).toLocaleString()}`} className="pp-text--muted pp-text--sm">{new Date(apt.booked_at).toLocaleString()}</td>
+                  <td>{providerName(apt.provider_id)}</td>
+                  <td>{providerSpecialty(apt.provider_id)}</td>
+                  <td>{apt.type}</td>
+                  <td>
+                    <span className={`pp-status-badge pp-status-badge--${apt.status}`}>{apt.status}</span>
+                    {apt.requires_confirmation && (
+                      <span
+                        className={`pp-status-badge pp-status-badge--confirm-${apt.confirmation_state}`}
+                        aria-label={`Confirmation status: ${apt.confirmation_state}`}
+                        style={{ marginLeft: 6 }}
+                      >
+                        {apt.confirmation_state === "confirmed" ? "Confirmed" : "Awaiting confirmation"}
+                      </span>
+                    )}
+                  </td>
+                  <td aria-label={`Pre-authorization status: ${apt.pre_auth_status}`}><span className={`pp-status-badge pp-status-badge--${apt.pre_auth_status}`}>{apt.pre_auth_status}</span></td>
+                  <td>{apt.reason}</td>
+                  <td>{apt.linked_referral_id ?? "None"}</td>
+                  <td>{apt.location}</td>
                 </tr>
               ))}
             </tbody>
