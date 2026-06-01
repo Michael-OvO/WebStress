@@ -126,9 +126,54 @@ def test_branch1_correct_passes_via_evaluate_function():
     assert result.get("score", 0.0) >= 0.99
 
 
-# ---------------------------------------------------------------------------
-# Branch 2 (has_discrepancy == 'false') — mark latest announcement read
-# ---------------------------------------------------------------------------
+def test_branch1_due_date_tie_resolves_to_lowest_id():
+    """Regression: when two graded assignments tie on the (globally latest) due
+    date, the instruction's tie-break ("the one with the lowest assignment id")
+    must equal the seed's pinned most_recent_graded_id, and resubmitting it passes.
+
+    Without the tie-break a correct agent could resubmit the other equally-valid
+    tied assignment and be mis-graded. ~2.3% of branch-1 seeds carry such a tie
+    (e.g. 90, 163, 172)."""
+    from datetime import datetime, timezone
+
+    for seed in (90, 163, 172):
+        sm = SessionManager()
+        sid, targets, _ = sm.create_session(env_id="lms", task_id=TASK_ID, seed=seed)
+        state = sm.get_state(sid)
+        t = dict(targets)
+        assert t["has_discrepancy"] == "true", f"seed {seed} expected branch 1"
+
+        assignments = {a.id: a for a in state.assignments}
+        graded: list[tuple[str, object]] = []
+        for g in state.grades:
+            if getattr(g, "score", None) is None:
+                continue
+            a = assignments.get(g.assignment_id)
+            if a is not None:
+                graded.append((a.id, a.due_at))
+        assert graded, f"seed {seed} has no graded assignments"
+
+        max_due = max(d for _, d in graded)
+        tied = sorted(
+            (aid for aid, d in graded if d == max_due),
+            key=lambda i: int(i.rsplit("_", 1)[-1]),
+        )
+        assert len(tied) >= 2, f"seed {seed} expected a due-date tie, got {tied}"
+        # The instruction's lowest-id tie-break must match the seed's pinned answer.
+        assert t["most_recent_graded_id"] == tied[0], (
+            f"seed {seed}: pinned {t['most_recent_graded_id']} != lowest tied id {tied[0]}"
+        )
+
+        # Resubmitting the pinned (lowest-id) tied assignment grades as correct.
+        a = state.get_assignment(t["most_recent_graded_id"])
+        now = datetime.now(timezone.utc)
+        a.attempt_count += 1
+        a.file_name = "grade_dispute.pdf"
+        a.submitted_at = now
+        a.submission_status = "late" if now > a.due_at else "submitted"
+        result = evaluate(task=get_task(TASK_ID), server_state=state, targets=t, trajectory=[])
+        assert result.get("success") is True, f"seed {seed}: {result}"
+        assert result.get("score", 0.0) >= 0.99, f"seed {seed}: {result.get('score')}"
 
 def test_branch2_correct_mark_read_passes_via_real_endpoint():
     """seed=8 has no discrepancy; marking the latest announcement read passes."""
